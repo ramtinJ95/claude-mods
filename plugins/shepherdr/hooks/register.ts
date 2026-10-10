@@ -7,6 +7,7 @@ import { Fleet } from './fleet'
 const COMMAND = 'shepherdr'
 
 let fleet: Fleet | undefined
+const answering = new Set<string>()
 
 function requireFleet(): Fleet {
   if (!fleet) throw new Error('Shepherdr is still starting; retry')
@@ -60,19 +61,28 @@ async function handle(bridge: Bridge, cwd: string, request: AgentsRequest, signa
       return dispatchWork(bridge, current, delivery, request.message!, request.blocking ?? true, signal)
     }
     case 'answer': {
+      const askId = request.ask_id!
+      // Two callers driving one Ask UI would toggle each other's selections.
+      if (answering.has(askId)) throw new Error(`An answer to ${askId} is already being entered; wait for its result`)
+      answering.add(askId)
       const release = current.hold(request.target!)
       try {
-        const params = { target: request.target, ask_id: request.ask_id, answers: request.answers }
+        const params = { target: request.target, ask_id: askId, answers: request.answers }
         const answered = await call<AnswerResult>(bridge, 'answer', params)
-        const result = { target: answered.agent.target, ask_id: request.ask_id }
+        const result = { target: answered.agent.target, ask_id: askId }
         if (!answered.record) return JSON.stringify({ ...result, status: answered.status, input_sent: false })
         const record = current.trackAnswer(answered)
         if (request.blocking === false) return JSON.stringify({ ...result, status: 'submitted' })
         const report = await current.waitFor(bridge, record, signal)
-        const { status } = await call<{ status: string }>(bridge, 'answer_status', params)
+        // The settlement stands even when the worker has since closed or moved.
+        const status = await call<{ status: string }>(bridge, 'answer_status', { ...params, target: record.paneId }).then(
+          reply => reply.status,
+          () => 'unknown',
+        )
         return `${JSON.stringify({ ...result, status })}\n${report}`
       } finally {
         release()
+        answering.delete(askId)
       }
     }
     case 'send': {
@@ -123,6 +133,9 @@ export const register: Register = on => {
       submit: text => $.prompt.submit({ text }),
       status: text => $.ui.status(text),
       toast: text => $.ui.toast(text),
+      after: (ms, fn) => {
+        $.clock.after(ms, fn)
+      },
       readWatches: async () => ((await $.fs.exists(file)) ? JSON.parse(await $.fs.read(file)) : []),
       writeWatches: records => $.fs.write(file, JSON.stringify(records)),
     })

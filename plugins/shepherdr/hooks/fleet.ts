@@ -13,6 +13,7 @@ export type SessionIo = {
   submit: (text: string) => Promise<unknown>
   status: (text: string | undefined) => void
   toast: (text: string) => void
+  after: (ms: number, fn: () => void) => void
   /** This session's saved watches; [] when none were saved. */
   readWatches: () => Promise<unknown>
   writeWatches: (records: readonly WorkerRecord[]) => Promise<void>
@@ -133,6 +134,13 @@ export class Fleet {
     const record = this.track(answered)
     delete record.reportedAskId
     this.persist()
+    // No event may follow if the worker stays blocked; re-check once the grace ends.
+    const id = record.terminalId
+    const grace = (record.answeringUntil ?? 0) - Date.now()
+    if (grace > 0)
+      this.io.after(grace + 100, () => {
+        if (this.records.has(id)) this.reconcile(id)
+      })
     return record
   }
 
