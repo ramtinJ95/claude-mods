@@ -58,7 +58,7 @@ const machineKey = (machine: string | undefined) => machine ?? 'local'
 const keyOf = ({ machine, terminalId }: WorkerRecord) => `${machineKey(machine)}:${terminalId}`
 
 function attribute(value: string): string {
-  return value.replaceAll('&', '&amp;').replaceAll('"', '&quot;').replaceAll('<', '&lt;')
+  return value.replaceAll('&', '&amp;').replaceAll('"', '&quot;').replaceAll('<', '&lt;').replaceAll('>', '&gt;')
 }
 
 function bodyFor({ record, status, reply, ask }: Report): string[] {
