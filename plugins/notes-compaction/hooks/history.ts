@@ -1,5 +1,6 @@
 import type { SessionMessage } from 'claude-code'
-import { parseWindow } from './windows.ts'
+import { integer } from './notes.ts'
+import { windowMarker } from './windows.ts'
 
 interface HistoryItem {
   window_id: string
@@ -9,9 +10,8 @@ interface HistoryItem {
   content: string
 }
 
-function integer(value: unknown, fallback: number, max: number): number {
-  return typeof value === 'number' && Number.isInteger(value) ? Math.max(0, Math.min(value, max)) : fallback
-}
+/** Characters one read or listing answers with. */
+const RESULT_LIMIT = 8000
 
 /** FNV-1a: a short, synchronous content key. */
 function hash(text: string): string {
@@ -52,12 +52,13 @@ function answer(
   }
   // Rows before the first boundary in view belong to the window it names as previous; with no
   // boundary in view, every row belongs to the current window.
-  const firstBoundary = messages.find((m) => m.role === 'user' && parseWindow(m.text))
-  let windowId = firstBoundary ? (parseWindow(firstBoundary.text)?.previous ?? currentWindowId) : currentWindowId
+  const markers = messages.map(windowMarker)
+  const first = markers.find((marker) => marker !== undefined)
+  let windowId = first ? (first.previous ?? currentWindowId) : currentWindowId
   const windows = new Map<string, HistoryItem[]>([[windowId, []]])
   const toolNames = new Map<string, string>()
-  for (const message of messages) {
-    const boundary = message.role === 'user' ? parseWindow(message.text) : undefined
+  for (const [index, message] of messages.entries()) {
+    const boundary = markers[index]
     if (boundary) {
       windowId = boundary.current
       if (!windows.has(windowId)) windows.set(windowId, [])
@@ -102,12 +103,10 @@ function answer(
     }
   }
   if (action === 'read_item') {
-    if (typeof params['window_id'] !== 'string' || typeof params['item_id'] !== 'string')
-      throw new Error('Supply window_id and item_id unchanged from history')
-    const item = windows.get(params['window_id'])?.find((item) => item.item_id === params['item_id'])
+    const item = windows.get(String(params['window_id']))?.find((item) => item.item_id === params['item_id'])
     if (!item) return { item: null }
-    const offset = integer(params['offset_chars'], 0, item.content.length)
-    const limit = integer(params['limit_chars'], 8000, 8000)
+    const offset = integer(params['offset_chars'], 0, item.content.length, 0)
+    const limit = integer(params['limit_chars'], RESULT_LIMIT, RESULT_LIMIT)
     const content = item.content.slice(offset, offset + limit)
     return {
       item: {
@@ -118,10 +117,8 @@ function answer(
       },
     }
   }
-  if (action !== 'list_items' && action !== 'search_contents') throw new Error('Unknown history action')
-  const query = params['query']
-  if (action === 'search_contents' && (typeof query !== 'string' || !query))
-    throw new Error('Supply a nonempty search query')
+  // list_items or search_contents
+  const query = String(params['query'])
   let items = [...windows.values()]
     .flat()
     .filter(
@@ -129,7 +126,7 @@ function answer(
         (!params['window_id'] || item.window_id === params['window_id']) &&
         (!params['role'] || item.role === params['role']) &&
         (!params['tool_name'] || item.tool_name === params['tool_name']) &&
-        (action !== 'search_contents' || item.content.includes(query as string)),
+        (action !== 'search_contents' || item.content.includes(query)),
     )
   if (params['recent_first'] === true) items = items.reverse()
   const limit = integer(params['limit'], 10, 25)
@@ -140,7 +137,7 @@ function answer(
     const { content, ...metadata } = item
     const preview = { ...metadata, truncated_content: content.slice(0, previewChars), content_chars: content.length }
     const chars = JSON.stringify(preview).length
-    if (previews.length >= limit || size + chars > 8000) break
+    if (previews.length >= limit || size + chars > RESULT_LIMIT) break
     previews.push(preview)
     size += chars
   }

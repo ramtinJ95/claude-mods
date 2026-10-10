@@ -10,7 +10,7 @@ Keep working across fresh context windows. The agent saves checkpoint notes, sta
 
 ## What the agent gets
 
-- `notes`: help, list, read, search, write and append on virtual paths. `write_file` replaces; `append_to_file` adds.
+- `notes`: list, read, search, write and append on virtual paths. `write_file` replaces; `append_to_file` adds.
 - `new_context`: starts a new context window after the current turn. The new window opens with the agent name, window IDs and recent note paths, then the agent is told to continue.
 - `history`: lists, searches and reads earlier windows of this session, or a subagent's transcript. Loaded on demand.
 - `get_context_remaining`: remaining tokens in the current window. Loaded on demand.

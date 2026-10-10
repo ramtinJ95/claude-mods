@@ -18,7 +18,7 @@ Keep one checkpoint per task at a stable notes path: request, constraints, decis
 Save changed state after substantial work, before replying, and before new_context or handoff. Skip routine or unchanged state. Include checkpoint paths in handoffs. After rollover, read the checkpoint, then linked notes as needed; history only for missing details.
 </context_window_guidance>`
 
-export const WINDOW_OPEN = '<context_window>'
+const WINDOW_OPEN = '<context_window>'
 const FIRST = 'First context window id: '
 const CURRENT = 'Current context window id: '
 const PREVIOUS = 'Previous context window id: '
@@ -44,17 +44,25 @@ export function windowText(agent: string, ids: WindowIdentity, recentNotes: read
   return `${WINDOW_OPEN}\n${lines.join('\n')}\n</context_window>`
 }
 
-/** Window boundary written by windowText, read back from the transcript. */
-export function parseWindow(text: string): { first?: string; current: string; previous?: string } | undefined {
-  if (!text.startsWith(WINDOW_OPEN)) return
+/** The window boundary windowText wrote, read back from a transcript message. */
+export function windowMarker(message: {
+  role: string
+  text: string
+}): { first?: string; current: string; previous?: string } | undefined {
+  if (message.role !== 'user' || !message.text.startsWith(WINDOW_OPEN)) return
   const field = (prefix: string) =>
-    text
+    message.text
       .split('\n')
       .find((line) => line.startsWith(prefix))
       ?.slice(prefix.length)
       .trim()
   const current = field(CURRENT)
   return current ? { first: field(FIRST), current, previous: field(PREVIOUS) } : undefined
+}
+
+/** Both reminders went out in this window: nothing left to measure for. */
+export function remindersDone(state: SessionState): boolean {
+  return state.reminded.includes(`${state.window.currentWindowId}:urgent`)
 }
 
 export function reminderFor(state: SessionState, percentUsed: number | undefined): string | undefined {
