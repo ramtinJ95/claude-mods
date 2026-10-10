@@ -47,8 +47,9 @@ type Report = {
   ask?: Ask
 }
 
-// A blocking wait re-arms well inside the ten-minute process ceiling.
-const WAIT_SLICE_MS = 9 * 60_000
+// A blocking wait re-arms inside the ten-minute process ceiling, leaving
+// room for SSH setup on a remote machine (see waitFor and cli's wait).
+const WAIT_SLICE_MS = 8 * 60_000
 
 /** This machine is `local` in requests and an absent `machine` on records. */
 export const machineOf = (machine: string | undefined) => (!machine || machine === 'local' ? undefined : machine)
