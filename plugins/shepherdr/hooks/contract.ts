@@ -104,8 +104,11 @@ export type AgentsRequest = {
 const RESERVED = new Set(['tool', 'tool_use_id', 'consent', 'agentId'])
 
 export function parseRequest(input: Record<string, unknown>): AgentsRequest {
+  // Omitting machine means this one; "local" is accepted as the same.
   const request = Object.fromEntries(
-    Object.entries(input).filter(([key, value]) => !RESERVED.has(key) && value !== undefined),
+    Object.entries(input).filter(
+      ([key, value]) => !RESERVED.has(key) && value !== undefined && !(key === 'machine' && value === 'local'),
+    ),
   )
   const action = request['action'] ?? 'help'
   if (typeof action !== 'string' || !(ACTIONS as readonly string[]).includes(action))

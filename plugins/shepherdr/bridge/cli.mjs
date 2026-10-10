@@ -1,11 +1,12 @@
 // One-shot bridge operations for the Claude Code mod, which has no Node APIs.
 // Reads one JSON request on stdin and writes one JSON line: { ok, result } or
-// { ok: false, error }. The hooks side validates request fields.
+// { ok: false, error }. The hooks side validates request fields; `budgetMs`
+// is how long the caller waits, so nested work fits inside it.
 //
 // Controller operations run here, beside Claude Code: they own the sender
 // identity, profiles and preparation. Each hands its worker-side part to a
-// machine operation, run in this process for the local machine or by this
-// same file on a remote machine over SSH (`machine.*` ops, `--session`).
+// machine operation, run in this process for this machine or by this same
+// file on a remote machine over SSH (`machine.*` ops, `--session`).
 import { hostname } from "node:os";
 import {
 	agentSummary,
@@ -14,7 +15,7 @@ import {
 	request,
 	snapshot,
 } from "./herdr.mjs";
-import { catalog, isLocal, machineFor, remoteCall } from "./machines.mjs";
+import { catalog, remoteCall, resolveMachine } from "./machines.mjs";
 import {
 	listProfiles,
 	loadProfile,
@@ -27,6 +28,8 @@ import { isWorker, workerFor } from "./workers/index.mjs";
 
 const DELEGATED_WORKER_GUIDANCE =
 	"If blocked mid-run, use a question-asking tool, not peer messages. Without one, end with the blocker. Finish with an assistant reply, not a separate send report; never watch your parent.";
+// Room to return a result before the caller stops waiting.
+const MARGIN_MS = 3_000;
 
 function xml(value) {
 	return value
@@ -61,7 +64,6 @@ async function recordFor(agent, worker, pendingWork) {
 	return {
 		terminalId: agent.terminal_id,
 		paneId: agent.pane_id,
-		kind: agent.agent,
 		...(agent.name ? { name: agent.name } : {}),
 		...(path ? { sessionPath: path } : {}),
 		// Input IDs are nonempty, so "" reports the next settled reply.
@@ -69,6 +71,15 @@ async function recordFor(agent, worker, pendingWork) {
 			? ""
 			: ((await worker.view(agent)).input?.id ?? null),
 	};
+}
+
+/** Delivers a prepared message; a task also returns the record that watches its outcome. */
+async function deliver(target, message, kind) {
+	const { agent, worker } = await resolveWorker(target);
+	const record =
+		kind === "task" ? await recordFor(agent, worker, false) : undefined;
+	const receipt = await worker.deliver(agent, message);
+	return { agent: agentSummary(agent), ...(record ? { record } : {}), ...receipt };
 }
 
 /** Worker-side operations; they never touch the controller's pane. */
@@ -87,20 +98,13 @@ const MACHINE_OPS = {
 	"machine.directory"({ params, fallbackCwd }) {
 		return spawnDirectory(params, fallbackCwd);
 	},
-	async "machine.start"(request) {
-		return agentSummary(await startAgent(request));
+	/** Starts Pi and delivers its first task in one call. */
+	async "machine.start"({ message, ...start }) {
+		const agent = await startAgent(start);
+		return deliver(agent.pane_id, message, "task");
 	},
-	/** Delivers a prepared message; a task also returns the record that watches its outcome. */
-	async "machine.deliver"({ target, message, kind }) {
-		const { agent, worker } = await resolveWorker(target);
-		const record =
-			kind === "task" ? await recordFor(agent, worker, false) : undefined;
-		const receipt = await worker.deliver(agent, message);
-		return {
-			agent: agentSummary(agent),
-			...(record ? { record } : {}),
-			...receipt,
-		};
+	"machine.deliver"({ target, message, kind }) {
+		return deliver(target, message, kind);
 	},
 	async "machine.watch"({ target }) {
 		const { agent, worker } = await resolveWorker(target);
@@ -117,12 +121,14 @@ const MACHINE_OPS = {
 		const { agent, worker } = await resolveWorker(target);
 		return { agent: agentSummary(agent), commands: await worker.commands(agent) };
 	},
-	/** Enters the answers unless Pi already recorded them; the status is Pi's record. */
+	/**
+	 * Enters the answers unless Pi already recorded them; the status is Pi's
+	 * record. A record comes back only when input was sent.
+	 */
 	async "machine.answer"({ target, ask_id: askId, answers }) {
 		const { agent, worker } = await resolveWorker(target);
 		const prior = await worker.answerStatus(agent, askId, answers);
-		if (prior)
-			return { agent: agentSummary(agent), status: prior, inputSent: false };
+		if (prior) return { agent: agentSummary(agent), status: prior };
 		const [record, { status, background }] = await Promise.all([
 			recordFor(agent, worker, true),
 			worker.answer(agent, askId, answers),
@@ -130,16 +136,15 @@ const MACHINE_OPS = {
 		return {
 			agent: agentSummary(agent),
 			status: status ?? "unknown",
-			inputSent: true,
 			background,
-			record: { ...record, answeringAskId: askId },
+			record,
 		};
 	},
 	"machine.check"({ record }) {
 		return check(record);
 	},
-	"machine.wait"({ record, timeoutMs }) {
-		return wait(record, timeoutMs);
+	"machine.wait"({ record }, deadline) {
+		return wait(record, deadline - MARGIN_MS);
 	},
 	async "machine.read"({ target, source = "latest", lines = 80 }) {
 		const { agent, worker } = await resolveWorker(target);
@@ -160,18 +165,21 @@ const MACHINE_OPS = {
 	},
 };
 
-function onMachine(machine, op, params, timeoutMs = 60_000) {
-	return isLocal(machine)
-		? MACHINE_OPS[op](params)
-		: remoteCall(machine, op, params, timeoutMs);
+/**
+ * Runs a machine operation: here for this machine (`machine` undefined), over
+ * SSH for a catalog entry. A remote record comes back tagged with its machine,
+ * which keys it beside its terminal.
+ */
+async function onMachine(machine, op, params, deadline) {
+	if (!machine) return MACHINE_OPS[op](params, deadline);
+	const result = await remoteCall(machine, op, params, deadline, MARGIN_MS);
+	return result?.record
+		? { ...result, record: { ...result.record, machine: machine.id } }
+		: result;
 }
 
-/** Tags a remote result's record with its machine, which keys it beside its terminal. */
-function onRemote(machine, result) {
-	return isLocal(machine) || !result.record
-		? result
-		: { ...result, record: { ...result.record, machine } };
-}
+/** The catalog entry for a request's machine, or undefined for this one. */
+const machineEntry = (id) => (id ? resolveMachine(id) : undefined);
 
 /** This Claude Code pane and the local Herdr snapshot. */
 async function controller() {
@@ -214,133 +222,112 @@ const CONTROLLER_OPS = {
 		}));
 	},
 	/** Agents on one machine, or on this one and every enabled remote machine. */
-	async list({ machine, query, status }) {
-		const machines = machine
-			? isLocal(machine)
-				? []
-				: [await machineFor(machine)]
-			: (await catalog()).filter((entry) => entry.enabled);
-		const sources = [
-			...(!machine || isLocal(machine) ? [{ id: undefined }] : []),
-			...machines,
-		];
+	async list({ machine, query, status }, deadline) {
+		const sources = machine
+			? [await resolveMachine(machine)]
+			: [undefined, ...(await catalog()).filter((entry) => entry.enabled)];
 		const results = await Promise.allSettled(
 			sources.map((source) =>
-				onMachine(source.id, "machine.list", { status }),
+				onMachine(source, "machine.list", { status }, deadline),
 			),
 		);
 		const needle = query?.trim().toLowerCase();
-		const agents = results.flatMap((result, index) =>
-			result.status !== "fulfilled"
-				? []
-				: result.value.map((agent) => ({
-						...agent,
-						...(sources[index].id
-							? { machine: sources[index].id, machine_name: sources[index].label }
-							: {}),
-					})),
-		);
-		const unavailable = results.flatMap((result, index) =>
-			result.status === "rejected"
-				? [
-						{
-							machine: sources[index].id ?? "local",
-							...(sources[index].label ? { machine_name: sources[index].label } : {}),
-							error: result.reason.message,
-						},
-					]
-				: [],
-		);
-		return {
-			agents: agents.filter(
-				(agent) =>
-					!needle ||
-					JSON.stringify(Object.values(agent)).toLowerCase().includes(needle),
-			),
-			...(unavailable.length ? { unavailable } : {}),
-		};
+		const agents = [];
+		const unavailable = [];
+		results.forEach((result, index) => {
+			const source = sources[index];
+			const where = source ? { machine: source.id, machine_name: source.label } : {};
+			if (result.status === "rejected")
+				unavailable.push({ ...where, error: result.reason.message });
+			else
+				for (const agent of result.value)
+					if (
+						!needle ||
+						JSON.stringify(Object.values(agent)).toLowerCase().includes(needle)
+					)
+						agents.push({ ...agent, ...where });
+		});
+		return { agents, ...(unavailable.length ? { unavailable } : {}) };
 	},
-	async spawn(params) {
-		const { machine } = params;
-		const local = isLocal(machine);
+	async spawn(params, deadline) {
+		const machine = await machineEntry(params.machine);
 		const profile = await loadProfile(params.agent_type.trim());
 		const [context, cwd] = await Promise.all([
 			controller(),
-			onMachine(machine, "machine.directory", {
-				params,
-				...(local ? { fallbackCwd: params.fallbackCwd } : {}),
-			}),
+			onMachine(
+				machine,
+				"machine.directory",
+				{ params, ...(machine ? {} : { fallbackCwd: params.fallbackCwd }) },
+				deadline,
+			),
 		]);
 		const [task, args] = await Promise.all([
 			prepareMessage(profile, {
 				cwd,
 				message: params.message,
 				base: params.base,
-				local,
+				local: !machine,
 			}),
-			profileArgs(profile, local),
+			profileArgs(profile, !machine),
 		]);
-		const agent = await onMachine(
+		const delivery = await onMachine(
 			machine,
 			"machine.start",
 			{
 				params,
 				args,
 				cwd,
-				...(local ? { controllerWorkspace: context.pane.workspace_id } : {}),
+				message: attribute(context, task, "task"),
+				...(machine ? {} : { controllerWorkspace: context.pane.workspace_id }),
 			},
-			120_000,
+			deadline,
 		);
-		const delivery = await onMachine(machine, "machine.deliver", {
-			target: agent.target,
-			message: attribute(context, task, "task"),
-			kind: "task",
-		});
 		return {
-			...onRemote(machine, delivery),
+			...delivery,
 			...(profile.blocking === undefined
 				? {}
 				: { profileBlocking: profile.blocking }),
 		};
 	},
-	async deliver({ machine, target, message, kind }) {
-		const context = await controller();
-		return onRemote(
-			machine,
-			await onMachine(machine, "machine.deliver", {
-				target,
-				message: attribute(context, message, kind),
-				kind,
-			}),
+	async deliver({ machine, target, message, kind }, deadline) {
+		const [entry, context] = await Promise.all([
+			machineEntry(machine),
+			controller(),
+		]);
+		return onMachine(
+			entry,
+			"machine.deliver",
+			{ target, message: attribute(context, message, kind), kind },
+			deadline,
 		);
 	},
-	async watch({ machine, target }) {
-		return onRemote(machine, await onMachine(machine, "machine.watch", { target }));
+	async watch({ machine, target }, deadline) {
+		return onMachine(await machineEntry(machine), "machine.watch", { target }, deadline);
 	},
-	commands({ machine, target }) {
-		return onMachine(machine, "machine.commands", { target });
+	async commands({ machine, target }, deadline) {
+		return onMachine(await machineEntry(machine), "machine.commands", { target }, deadline);
 	},
-	async answer({ machine, ...params }) {
-		return onRemote(machine, await onMachine(machine, "machine.answer", params, 90_000));
+	async answer({ machine, ...params }, deadline) {
+		return onMachine(await machineEntry(machine), "machine.answer", params, deadline);
 	},
-	check({ record }) {
-		return onMachine(record.machine, "machine.check", { record });
+	async check({ record }, deadline) {
+		return onMachine(await machineEntry(record.machine), "machine.check", { record }, deadline);
 	},
-	wait({ record, timeoutMs }) {
-		return onMachine(record.machine, "machine.wait", { record, timeoutMs }, timeoutMs + 60_000);
+	async wait({ record }, deadline) {
+		return onMachine(await machineEntry(record.machine), "machine.wait", { record }, deadline);
 	},
-	read({ machine, ...params }) {
-		return onMachine(machine, "machine.read", params);
+	async read({ machine, ...params }, deadline) {
+		return onMachine(await machineEntry(machine), "machine.read", params, deadline);
 	},
 };
 
 async function main() {
 	let input = "";
 	for await (const chunk of process.stdin) input += chunk;
-	const { op, ...params } = JSON.parse(input);
+	const { op, budgetMs = 55_000, ...params } = JSON.parse(input);
 	const handler = CONTROLLER_OPS[op] ?? MACHINE_OPS[op];
 	if (!handler) throw new Error(`unknown bridge op ${op}`);
-	return handler(params);
+	return handler(params, Date.now() + budgetMs);
 }
 
 main().then(

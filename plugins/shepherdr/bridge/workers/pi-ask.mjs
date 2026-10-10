@@ -4,13 +4,15 @@
 import { readFile } from "node:fs/promises";
 import { join } from "node:path";
 import { setTimeout as sleep } from "node:timers/promises";
-import { getAgent, request } from "../herdr.mjs";
+import { getAgent, request, workerSubscriptions } from "../herdr.mjs";
 import { piAgentDir } from "../profiles.mjs";
+import { openTrigger } from "../trigger.mjs";
 import { readSessionView } from "../vendor/shepherdr-session.mjs";
-import { watchSessions } from "../vendor/shepherdr-session-watch.mjs";
 
 // Pi records the Ask's outcome in its transcript right after the final key.
 const RECORD_TIMEOUT_MS = 10_000;
+// Herdr reports the worker unblocked within moments of the Ask's UI closing.
+const UNBLOCK_TIMEOUT_MS = 15_000;
 
 const REPHRASE_REQUEST_RESPONSE =
 	"User asked for rephrase, split, or follow-up.";
@@ -268,49 +270,44 @@ export async function answerAsk(agent, sessionPath, askId, answers) {
 		throw new Error(
 			"ask UI is not ready to submit; stopped without retrying input",
 		);
-	await sendInput(agent, final);
-	await recorded(sessionPath, askId);
+	const trigger = await openTrigger({
+		subscriptions: workerSubscriptions([agent.pane_id]),
+		paths: [sessionPath],
+	});
+	try {
+		await sendInput(agent, final);
+		await settledAfterAnswer(agent, sessionPath, askId, background, trigger);
+	} finally {
+		trigger.close();
+	}
 	return ask;
 }
 
-/** Waits until Pi records the Ask's outcome, so a final key that did not take fails here. */
-async function recorded(sessionPath, askId) {
-	const deadline = Date.now() + RECORD_TIMEOUT_MS;
-	let dirty = false;
-	let failure;
-	let wake;
-	const close = watchSessions(
-		[sessionPath],
-		() => {
-			dirty = true;
-			wake?.();
-		},
-		(error) => {
-			failure = error;
-			wake?.();
-		},
-	);
-	try {
-		for (;;) {
-			if ((await readSessionView(sessionPath)).askResults?.[askId]) return;
-			const remaining = deadline - Date.now();
-			if (remaining <= 0)
-				throw new Error(
-					"The answers were submitted, but Pi recorded no result; inspect the worker with read before retrying",
-				);
-			if (!dirty && !failure)
-				await new Promise((resolve) => {
-					const timer = setTimeout(resolve, remaining);
-					wake = () => {
-						clearTimeout(timer);
-						resolve();
-					};
-				});
-			wake = undefined;
-			dirty = false;
-			if (failure) throw failure;
-		}
-	} finally {
-		close();
+/**
+ * Waits until Pi records the Ask's outcome, so a final key that did not take
+ * fails here. A blocking Ask then waits out Herdr's lag: the worker stays
+ * `blocked` while the Ask's UI closes, which must not read as a new block.
+ */
+async function settledAfterAnswer(agent, sessionPath, askId, background, trigger) {
+	const recordBy = Date.now() + RECORD_TIMEOUT_MS;
+	while (!(await readSessionView(sessionPath)).askResults?.[askId]) {
+		const remaining = recordBy - Date.now();
+		if (remaining <= 0)
+			throw new Error(
+				"The answers were submitted, but Pi recorded no result; inspect the worker with read before retrying",
+			);
+		await trigger.next(remaining);
+	}
+	if (background) return;
+	// Past the bound the worker is reported as it stands, blocked or not.
+	const unblockBy = Date.now() + UNBLOCK_TIMEOUT_MS;
+	for (;;) {
+		const current = await getAgent(agent.pane_id);
+		const live = (await readSessionView(sessionPath)).ask;
+		if (current.agent_status !== "blocked" || (live && live.toolCallId !== askId))
+			return;
+		const remaining = unblockBy - Date.now();
+		if (remaining <= 0) return;
+		await trigger.next(remaining);
 	}
 }

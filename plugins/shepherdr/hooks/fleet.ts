@@ -1,14 +1,16 @@
 // Watched workers, their settlement and its delivery to the controller.
 //
 // Records are keyed by machine and Herdr terminal ID (pane IDs change on move)
-// and persisted per Claude Code session. One watcher process streams changes
-// from every machine; each change is reconciled with a bridge `check`. A
-// blocking tool call leases its worker, so the watcher never reports what the
-// call itself returns.
+// and persisted per Claude Code session. Each machine with watched workers has
+// its own watcher process, so a change on one machine restarts only that one;
+// each change is reconciled with a bridge `check`. A blocking tool call or an
+// answer being entered leases its worker, so the watcher never reports what
+// the call itself returns.
 import {
   type Ask,
   type Bridge,
   type CheckResult,
+  LONGEST_CALL_MS,
   type Tracked,
   type WatchLine,
   type WorkerRecord,
@@ -40,6 +42,8 @@ type SavedState = { watches: Watched[]; orchestration?: Orchestration }
 /** An explicit orchestration choice and the guidance it gave. */
 type Orchestration = { enabled: boolean; guidance: string }
 
+type Machine = { id: string; label: string; enabled: boolean }
+
 type Report = {
   record: Watched
   status: 'done' | 'failed' | 'question' | 'blocked' | 'interrupted' | 'closed'
@@ -47,61 +51,62 @@ type Report = {
   ask?: Ask
 }
 
-// A blocking wait re-arms inside the ten-minute process ceiling, leaving
-// room for SSH setup on a remote machine (see waitFor and cli's wait).
-const WAIT_SLICE_MS = 8 * 60_000
+/** One machine's watcher: the targets it covers and how to stop it. */
+type Watcher = { key: string; stop?: () => void; error?: string }
 
-/** This machine is `local` in requests and an absent `machine` on records. */
-export const machineOf = (machine: string | undefined) => (!machine || machine === 'local' ? undefined : machine)
-
-const keyOf = ({ machine, terminalId }: WorkerRecord) => `${machineOf(machine) ?? 'local'}:${terminalId}`
+const machineKey = (machine: string | undefined) => machine ?? 'local'
+const keyOf = ({ machine, terminalId }: WorkerRecord) => `${machineKey(machine)}:${terminalId}`
 
 function attribute(value: string): string {
   return value.replaceAll('&', '&amp;').replaceAll('"', '&quot;').replaceAll('<', '&lt;')
 }
 
-/** Herdr CLI prefix that reaches the worker's machine. */
-function herdrCommand(record: Watched): string {
-  return record.machine ? `herdr --machine ${record.machine}` : 'herdr'
+function bodyFor({ record, status, reply, ask }: Report): string[] {
+  switch (status) {
+    case 'done':
+      return [reply || 'Finished without a reply.']
+    case 'failed':
+      return [
+        reply || 'The worker stopped with an error.',
+        'Inspect it with read source:"recent" and assess the failure. If this task was not retried yet and one corrective assign could recover it, try once; if it fails again or the setup looks broken, stop and tell the user.',
+      ]
+    case 'question':
+      return [
+        JSON.stringify({ ask_id: ask?.toolCallId, prompts: ask?.prompts ?? [] }),
+        ask?.delivery === 'steer'
+          ? 'The worker continues meanwhile. Answer with answer and this ask_id, asking the user first when the choice is theirs.'
+          : 'The worker waits. Answer with answer and this ask_id, asking the user first when the choice is theirs, or let them answer in its pane.',
+      ]
+    case 'blocked': {
+      const herdr = record.machine ? `herdr --machine ${record.machine}` : 'herdr'
+      return [
+        `Waiting on an approval or dialog. Inspect it with read source:"visible"; respond with send, or use \`${herdr} agent send-keys ${record.paneId} <keys>\` for interactive controls. Tell the user if it needs them.`,
+      ]
+    }
+    case 'interrupted':
+      return ['Its Pi session changed before the task finished; the watch continues on the new session.']
+    case 'closed':
+      return ['The pane closed; its watch ended.']
+  }
 }
 
-export function reportText({ record, status, reply, ask }: Report): string {
+export function reportText(report: Report): string {
+  const { record, status } = report
   const machine = record.machine ? ` machine="${record.machine}"` : ''
   const name = record.name ? ` name="${attribute(record.name)}"` : ''
   const task = record.task && status !== 'closed' ? [`Task: ${record.task}`] : []
-  const body =
-    status === 'done'
-      ? [reply || 'Finished without a reply.']
-      : status === 'failed'
-        ? [
-            reply || 'The worker stopped with an error.',
-            'Inspect it with read source:"recent" and assess the failure. If this task was not retried yet and one corrective assign could recover it, try once; if it fails again or the setup looks broken, stop and tell the user.',
-          ]
-        : status === 'question'
-          ? [
-              JSON.stringify({ ask_id: ask?.toolCallId, prompts: ask?.prompts ?? [] }),
-              ask?.delivery === 'steer'
-                ? 'The worker continues meanwhile. Answer with answer and this ask_id, asking the user first when the choice is theirs.'
-                : 'The worker waits. Answer with answer and this ask_id, asking the user first when the choice is theirs, or let them answer in its pane.',
-            ]
-          : status === 'blocked'
-            ? [
-                `Waiting on an approval or dialog. Inspect it with read source:"visible"; respond with send, or use \`${herdrCommand(record)} agent send-keys ${record.paneId} <keys>\` for interactive controls. Tell the user if it needs them.`,
-              ]
-            : status === 'interrupted'
-              ? ['Its Pi session changed before the task finished; the watch continues on the new session.']
-              : ['The pane closed; its watch ended.']
-  const text = [...task, ...body].join('\n').replaceAll('</agent_report>', '<\\/agent_report>')
+  const text = [...task, ...bodyFor(report)].join('\n').replaceAll('</agent_report>', '<\\/agent_report>')
   return `<agent_report target="${attribute(record.paneId)}"${machine}${name} status="${status}">\n${text}\n</agent_report>`
 }
 
 export class Fleet {
   private readonly records = new Map<string, Watched>()
-  /** Blocking calls per worker; the watcher leaves leased workers alone. */
+  /** Blocking calls and answers per worker; the watcher leaves leased workers alone. */
   private readonly leases = new Map<string, number>()
   /** Ask IDs whose answers are being entered. */
   private readonly answering = new Set<string>()
   private readonly checking = new Map<string, boolean>()
+  private readonly watchers = new Map<string, Watcher>()
   /** Reports waiting for the running turn's next tool boundary or its end. */
   private outbox: string[] = []
   /** Context lost to compaction, restored before the next model request. */
@@ -110,55 +115,48 @@ export class Fleet {
   private busy = false
   private loaded = false
   private orchestration: Orchestration | undefined
-  private stopWatch: (() => void) | undefined
-  private watchKey = ''
-  private monitorError: string | undefined
-  private readonly machineErrors = new Map<string, string>()
 
   constructor(private readonly io: SessionIo) {}
 
   async load(): Promise<void> {
-    const saved = await this.io.readState()
-    // Earlier versions saved the watch list alone.
-    const state: SavedState | undefined = Array.isArray(saved) ? { watches: saved as Watched[] } : (saved as SavedState)
+    const state = (await this.io.readState()) as SavedState | undefined
     if (state !== undefined && !Array.isArray(state?.watches)) throw new Error('saved Shepherdr state is malformed')
     for (const record of state?.watches ?? []) this.records.set(keyOf(record), record)
     this.orchestration = state?.orchestration
     this.loaded = true
-    this.ensureWatcher()
+    this.ensureWatchers()
     this.updateStatus()
   }
 
   stop(): void {
-    this.stopWatch?.()
-    this.stopWatch = undefined
+    for (const watcher of this.watchers.values()) watcher.stop?.()
+    this.watchers.clear()
   }
 
   find(target: string, machine?: string): Watched | undefined {
     return [...this.records.values()].find(
-      record => record.machine === machineOf(machine) && (record.paneId === target || record.name === target),
+      record => record.machine === machine && (record.paneId === target || record.name === target),
     )
   }
 
   isWatched(terminalId: string, machine?: string): boolean {
-    return this.records.has(keyOf({ machine: machineOf(machine), terminalId } as WorkerRecord))
+    return this.records.has(keyOf({ machine, terminalId } as WorkerRecord))
   }
 
   /**
    * Watches a delivered task, a worker named by `watch` (no task) or one
-   * resuming from an answered Ask (whose question may then report again).
+   * resuming from an answered Ask, whose next question reports again.
    */
-  track({ agent, record: delivered }: Tracked, task?: string): Watched {
+  track({ agent, record: delivered }: Tracked, task?: string, answered = false): Watched {
     const existing = this.records.get(keyOf(delivered))
-    const { reportedAskId, ...kept } = existing ?? {}
     const record: Watched = {
-      ...kept,
+      ...existing,
       ...delivered,
       ...(existing && !task ? { seenInputId: existing.seenInputId } : {}),
-      ...(reportedAskId && !delivered.answeringAskId ? { reportedAskId } : {}),
       status: agent.status,
       ...(task ? { task } : {}),
     }
+    if (answered) delete record.reportedAskId
     this.records.set(keyOf(record), record)
     this.changed()
     return record
@@ -170,36 +168,26 @@ export class Fleet {
   }
 
   /**
-   * Claims an Ask for answering. A watched worker is marked before any key is
-   * sent, so the watcher reads its closing Ask as work in progress. The
-   * returned function ends the claim and, unless the answer went in, unmarks.
+   * Claims an Ask for answering and leases a watched worker, so the watcher
+   * leaves it alone while keys are entered and its Ask closes. The returned
+   * function ends both.
    */
-  beginAnswer(target: string, machine: string | undefined, askId: string): (entered: boolean) => void {
+  beginAnswer(target: string, machine: string | undefined, askId: string): () => void {
     if (this.answering.has(askId)) throw new Error(`An answer to ${askId} is already being entered; wait for its result`)
     this.answering.add(askId)
     const record = this.find(target, machine)
-    if (record) {
-      record.answeringAskId = askId
-      this.persist()
-    }
-    return entered => {
+    const release = record ? this.lease(keyOf(record)) : () => {}
+    return () => {
       this.answering.delete(askId)
-      if (!entered && record?.answeringAskId === askId) {
-        delete record.answeringAskId
-        this.persist()
-      }
+      release()
     }
   }
 
-  /** Records an explicit orchestration choice; returns the guidance to give now. */
-  orchestrate(enabled: boolean, guidance: string): string {
+  /** Records an explicit orchestration choice, given again after compaction. */
+  orchestrate(enabled: boolean, guidance: string): void {
     this.orchestration = { enabled, guidance }
     this.persist()
-    return guidance
-  }
-
-  orchestrationMode(): boolean {
-    return this.orchestration?.enabled ?? false
+    this.updateStatus()
   }
 
   /** Compaction dropped earlier context; brief again before the next model request. */
@@ -235,7 +223,7 @@ export class Fleet {
     try {
       for (;;) {
         signal.throwIfAborted()
-        const result = await call<CheckResult>(bridge, 'wait', { record, timeoutMs: WAIT_SLICE_MS }, WAIT_SLICE_MS + 90_000)
+        const result = await call<CheckResult>(bridge, 'wait', { record }, LONGEST_CALL_MS)
         const report = this.settle(record, result, true)
         if (report) return reportText(report)
       }
@@ -245,25 +233,26 @@ export class Fleet {
   }
 
   /** Restarts monitoring that stopped on any machine; returns a summary for /shepherdr. */
-  inspect(machines: readonly { id: string; label: string; enabled: boolean }[]): string {
-    const problems = [
-      ...(this.monitorError ? [`Monitoring had stopped (${this.monitorError}); restarted.`] : []),
-      ...[...this.machineErrors].map(
-        ([id, error]) => `Monitoring on ${machines.find(machine => machine.id === id)?.label ?? id} had stopped (${error}); restarted.`,
-      ),
-    ]
-    if (problems.length) this.restartWatcher()
+  inspect(machines: readonly Machine[]): string {
+    const labelOf = (id: string) => machines.find(machine => machine.id === id)?.label ?? id
+    const stopped = [...this.watchers].filter(([, watcher]) => watcher.error)
+    const problems = stopped.map(
+      ([machine, watcher]) =>
+        `Monitoring ${machine === 'local' ? 'here' : `on ${labelOf(machine)}`} had stopped (${watcher.error}); restarted.`,
+    )
+    for (const [machine] of stopped) this.watchers.delete(machine)
+    this.ensureWatchers()
     const records = [...this.records.values()]
     const lines = records.length
       ? records.map(record => {
-          const where = record.machine ? ` on ${machines.find(machine => machine.id === record.machine)?.label ?? record.machine}` : ''
+          const where = record.machine ? ` on ${labelOf(record.machine)}` : ''
           return `${record.name ?? record.paneId} (${record.paneId}${where}) ${record.status ?? 'unknown'}${record.task ? ', task assigned' : ''}`
         })
       : ['Shepherdr watches no agents.']
     const machineLines = machines.map(
       machine => `Machine ${machine.label} (${machine.id}): ${machine.enabled ? 'enabled' : 'disabled in Herdr'}`,
     )
-    const mode = `Orchestration: ${this.orchestrationMode() ? 'on' : 'off'}`
+    const mode = `Orchestration: ${this.orchestration?.enabled ? 'on' : 'off'}`
     return [...problems, ...lines, ...machineLines, mode].join('\n')
   }
 
@@ -302,7 +291,7 @@ export class Fleet {
 
   private changed(): void {
     this.persist()
-    this.ensureWatcher()
+    this.ensureWatchers()
     this.updateStatus()
   }
 
@@ -314,51 +303,52 @@ export class Fleet {
       .catch(error => this.io.toast(`Shepherdr could not save its watches: ${message(error)}`))
   }
 
-  private restartWatcher(): void {
-    this.watchKey = ''
-    this.stop()
-    this.ensureWatcher()
+  /** Restarts each machine's watcher whose targets changed; leaves the others running. */
+  private ensureWatchers(): void {
+    const groups = new Map<string, Watched[]>()
+    for (const record of this.records.values()) {
+      const machine = machineKey(record.machine)
+      groups.set(machine, [...(groups.get(machine) ?? []), record])
+    }
+    for (const [machine, watcher] of this.watchers)
+      if (!groups.has(machine)) {
+        watcher.stop?.()
+        this.watchers.delete(machine)
+      }
+    for (const [machine, records] of groups) {
+      const key = JSON.stringify(records.map(record => [record.terminalId, record.sessionPath ?? null]).sort())
+      const current = this.watchers.get(machine)
+      if (current?.key === key) continue
+      current?.stop?.()
+      const id = machine === 'local' ? undefined : machine
+      const watcher: Watcher = { key }
+      watcher.stop = watchWorkers(
+        this.io.bridge,
+        id,
+        records,
+        line => this.onLine(id, line),
+        error => {
+          if (this.watchers.get(machine) !== watcher) return
+          watcher.stop = undefined
+          watcher.error = error
+          this.updateStatus()
+        },
+      )
+      this.watchers.set(machine, watcher)
+    }
   }
 
-  private ensureWatcher(): void {
-    const records = [...this.records.values()]
-    const key = JSON.stringify(records.map(record => [keyOf(record), record.sessionPath ?? null]).sort())
-    if (key === this.watchKey && (this.stopWatch || !records.length)) return
-    this.stop()
-    this.watchKey = key
-    this.monitorError = undefined
-    this.machineErrors.clear()
-    if (!records.length) return this.updateStatus()
-    const stop = watchWorkers(
-      this.io.bridge,
-      records,
-      line => this.onLine(line),
-      error => {
-        if (this.stopWatch !== stop) return
-        this.stopWatch = undefined
-        this.monitorError = error
-        this.updateStatus()
-      },
-    )
-    this.stopWatch = stop
-  }
-
-  private onLine(line: WatchLine): void {
-    const records = [...this.records.values()].filter(record => record.machine === line.machine)
+  private onLine(machine: string | undefined, line: WatchLine): void {
+    const records = [...this.records.values()].filter(record => record.machine === machine)
     switch (line.type) {
       case 'ready':
-        this.machineErrors.delete(line.machine ?? 'local')
-        this.updateStatus()
         for (const record of records) this.reconcile(keyOf(record))
-        return
-      case 'error':
-        this.machineErrors.set(line.machine ?? 'local', line.message)
-        this.updateStatus()
         return
       case 'session':
         for (const record of records) {
           if (record.sessionPath !== line.path) continue
-          if (line.ask && line.ask.toolCallId !== record.reportedAskId) this.question(record, line.ask)
+          // A background question reports at once, while its worker continues.
+          if (line.ask) this.report(this.settle(record, { state: 'question', ask: line.ask }, false))
           // A working worker writes its transcript continuously; Herdr's status
           // event marks when it settles, so only settled workers' writes matter.
           else if (record.status !== 'working') this.reconcile(keyOf(record))
@@ -369,10 +359,9 @@ export class Fleet {
         const record = records.find(candidate => candidate.paneId === line.pane)
         if (!record) return
         if (line.status === 'working' || line.status === 'unknown') {
-          // Starting work settles nothing; leaving `blocked` ends an answered Ask.
+          // Starting work settles nothing.
           record.status = line.status
           record.blockedReported = false
-          delete record.answeringAskId
           this.persist()
           this.updateStatus()
           return
@@ -380,16 +369,6 @@ export class Fleet {
         this.reconcile(keyOf(record))
       }
     }
-  }
-
-  /**
-   * A background question: reported at once, while its worker keeps working,
-   * even during a blocking call on it, which ends only when the task does.
-   */
-  private question(record: Watched, ask: Ask): void {
-    record.reportedAskId = ask.toolCallId
-    this.persist()
-    this.deliver(reportText({ record, status: 'question', ask }))
   }
 
   private reconcile(key: string): void {
@@ -405,8 +384,7 @@ export class Fleet {
           if (!record || this.leases.has(key)) break
           const result = await call<CheckResult>(this.io.bridge, 'check', { record }, 90_000)
           if (this.leases.has(key) || this.records.get(key) !== record) continue
-          const report = this.settle(record, result, false)
-          if (report) this.deliver(reportText(report))
+          this.report(this.settle(record, result, false))
         } while (this.checking.get(key))
       } catch (error) {
         this.io.toast(`Shepherdr could not check a worker: ${message(error)}`)
@@ -427,7 +405,6 @@ export class Fleet {
       record.paneId = result.agent.target
       record.status = result.agent.status
       if (result.agent.name) record.name = result.agent.name
-      if (result.agent.status !== 'blocked') delete record.answeringAskId
     }
     let report: Report | undefined
     switch (result.state) {
@@ -439,9 +416,8 @@ export class Fleet {
         record.sessionPath = result.sessionPath
         record.seenInputId = result.inputId ?? null
         delete record.reportedAskId
-        delete record.answeringAskId
         record.blockedReported = false
-        if (record.task || force) report = { record, status: 'interrupted' }
+        if (record.task || force) report = { record: { ...record }, status: 'interrupted' }
         delete record.task
         break
       case 'working':
@@ -482,7 +458,9 @@ export class Fleet {
   }
 
   /** Queues for the running turn; otherwise starts a turn with the report as its prompt. */
-  private deliver(text: string): void {
+  private report(report: Report | undefined): void {
+    if (!report) return
+    const text = reportText(report)
     if (this.busy) this.outbox.push(text)
     else this.submit(text)
   }
@@ -497,13 +475,13 @@ export class Fleet {
 
   private updateStatus(): void {
     const records = [...this.records.values()]
-    const stopped = this.monitorError ?? [...this.machineErrors.values()][0]
+    const stopped = [...this.watchers.values()].find(watcher => watcher.error)?.error
+    const mode = this.orchestration?.enabled ? 'orchestrating' : undefined
     if (stopped) this.io.status(`shepherdr: monitoring stopped (${stopped}); run /shepherdr`)
-    else if (!records.length) this.io.status(this.orchestrationMode() ? 'shepherdr: orchestrating' : undefined)
+    else if (!records.length) this.io.status(mode && `shepherdr: ${mode}`)
     else {
       const working = records.filter(record => record.status === 'working').length
-      const mode = this.orchestrationMode() ? ', orchestrating' : ''
-      this.io.status(`shepherdr: ${records.length} watched, ${working} working${mode}`)
+      this.io.status(`shepherdr: ${records.length} watched, ${working} working${mode ? `, ${mode}` : ''}`)
     }
   }
 }

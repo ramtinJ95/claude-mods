@@ -14,12 +14,9 @@ export type WorkerRecord = {
   machine?: string
   terminalId: string
   paneId: string
-  kind: string
   name?: string
   sessionPath?: string
   seenInputId: string | null
-  /** An answered Ask: while Herdr keeps the worker blocked on it, the worker counts as working. */
-  answeringAskId?: string
 }
 
 export type AgentSummary = {
@@ -61,9 +58,9 @@ export type Tracked = { agent: AgentSummary; record: WorkerRecord }
 export type AnswerResult = {
   agent: AgentSummary
   status: 'accepted' | 'rejected' | 'unknown'
-  inputSent: boolean
   /** A background Ask: the worker never stopped, so there is no settlement to wait for. */
   background?: boolean
+  /** Present only when answers were entered; a recorded retry sends nothing. */
   record?: WorkerRecord
 }
 
@@ -71,6 +68,13 @@ export function message(error: unknown): string {
   return error instanceof Error ? error.message : String(error)
 }
 
+/** The ten-minute ceiling $.process.run allows, less room to wind down. */
+export const LONGEST_CALL_MS = 590_000
+
+/**
+ * Runs one bridge operation. Its time limit is the one budget for everything
+ * beneath: the bridge, and any SSH call it makes, finish inside it.
+ */
 export async function call<T>(
   bridge: Bridge,
   op: string,
@@ -78,7 +82,7 @@ export async function call<T>(
   timeoutMs = 60_000,
 ): Promise<T> {
   const run = await bridge.run(['node', `${bridge.root}/bridge/cli.mjs`], {
-    stdin: JSON.stringify({ op, ...params }),
+    stdin: JSON.stringify({ op, ...params, budgetMs: timeoutMs - 2_000 }),
     timeoutMs,
   })
   const line = run.stdout.trim().split('\n').at(-1) ?? ''
@@ -95,25 +99,25 @@ export async function call<T>(
 }
 
 /** Every line carries `machine` when it came from a remote machine's watcher. */
-export type WatchLine = { machine?: string } & (
+export type WatchLine =
   | { type: 'ready' }
   | { type: 'event'; event: string; pane: string | null; status?: string }
   | { type: 'session'; path: string; ask?: Ask }
-  | { type: 'error'; message: string }
-)
 
-/** Starts the session-lifetime watcher; the returned function stops it. */
+/** Starts one machine's watcher (this one when `machine` is absent); the returned function stops it. */
 export function watchWorkers(
   bridge: Bridge,
+  machine: string | undefined,
   records: readonly WorkerRecord[],
   onLine: (line: WatchLine) => void,
   onExit: (error: string) => void,
 ): () => void {
   const stream = bridge.spawn({
     argv: ['node', `${bridge.root}/bridge/watch.mjs`],
-    input: JSON.stringify({
-      targets: records.map(({ machine, terminalId, sessionPath }) => ({ machine, terminalId, sessionPath })),
-    }),
+    input: `${JSON.stringify({
+      machine,
+      targets: records.map(({ terminalId, sessionPath }) => ({ terminalId, sessionPath })),
+    })}\n`,
   })
   let stopped = false
   void (async () => {
@@ -131,9 +135,8 @@ export function watchWorkers(
           const line = buffer.slice(0, newline)
           buffer = buffer.slice(newline + 1)
           if (!line) continue
-          const value = JSON.parse(line) as WatchLine
-          // A local failure ends the watcher; a remote machine's is one line.
-          if (value.type === 'error' && !value.machine) error = value.message
+          const value = JSON.parse(line) as WatchLine | { type: 'error'; message: string }
+          if (value.type === 'error') error = value.message
           else onLine(value)
         }
       }

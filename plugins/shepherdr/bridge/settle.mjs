@@ -1,20 +1,17 @@
 // Settlement: what a watched worker's state means for its controller.
 //
-// A record is { terminalId, paneId, sessionPath?, seenInputId, answeringAskId? }.
-// seenInputId is the latest worker input the controller already accounted for;
-// a settled worker whose latest input differs has finished new work.
-// answeringAskId names an Ask the controller answered: Herdr keeps the worker
-// blocked while that Ask's UI closes, which is not a new question.
+// A record is { terminalId, paneId, sessionPath?, seenInputId }. seenInputId is
+// the latest worker input the controller already accounted for; a settled
+// worker whose latest input differs has finished new work.
 import {
 	agentByTerminal,
 	agentSummary,
 	getAgent,
 	isHerdrErrorCode,
 	snapshot,
-	subscribe,
 	workerSubscriptions,
 } from "./herdr.mjs";
-import { watchSessions } from "./vendor/shepherdr-session-watch.mjs";
+import { openTrigger } from "./trigger.mjs";
 import { workerFor } from "./workers/index.mjs";
 
 // Herdr can report a settled status before the worker writes its reply.
@@ -56,65 +53,22 @@ async function inspect(record) {
 		return { state: "working", agent };
 	const view = await worker.view(agent);
 	const inputId = view.input?.id ?? null;
-	if (status === "blocked") {
-		const answered = record.answeringAskId;
-		if (
-			answered &&
-			(view.ask?.toolCallId === answered ||
-				(!view.ask && view.askResults?.[answered]))
-		)
-			return { state: "working", agent };
+	if (status === "blocked")
 		return view.ask
 			? { state: "question", agent, inputId, ask: view.ask }
 			: { state: "blocked", agent, inputId };
-	}
 	if (inputId === record.seenInputId) return { state: "idle", agent };
 	if (view.assistantAfterInput && view.assistant)
 		return { state: "done", agent, inputId, reply: view.assistant };
 	return { state: "replying", agent, inputId };
 }
 
-/** Fires on the worker's status changes, pane moves/closes and transcript writes. */
-async function openTrigger(paneId, path) {
-	let dirty = false;
-	let failure;
-	let wake;
-	const fire = () => {
-		dirty = true;
-		wake?.();
-	};
-	const fail = (error) => {
-		failure = error;
-		wake?.();
-	};
-	const unsubscribe = await subscribe(workerSubscriptions([paneId]), fire, fail);
-	let unwatch = () => {};
-	try {
-		if (path) unwatch = watchSessions([path], fire, fail);
-	} catch (error) {
-		unsubscribe();
-		throw error;
-	}
-	return {
-		paneId,
-		async next(timeoutMs) {
-			if (!dirty && !failure)
-				await new Promise((resolve) => {
-					const timer = setTimeout(resolve, timeoutMs);
-					wake = () => {
-						clearTimeout(timer);
-						resolve();
-					};
-				});
-			wake = undefined;
-			dirty = false;
-			if (failure) throw failure;
-		},
-		close() {
-			unsubscribe();
-			unwatch();
-		},
-	};
+/** Fires on the worker's status changes, pane moves and closes, and transcript writes. */
+function workerTrigger(paneId, path) {
+	return openTrigger({
+		subscriptions: workerSubscriptions([paneId]),
+		paths: path ? [path] : [],
+	});
 }
 
 function finalResult({ agent, ...rest }) {
@@ -130,7 +84,7 @@ export async function check(record, trigger) {
 	if (result.state !== "replying") return finalResult(result);
 	const own =
 		trigger ??
-		(await openTrigger(
+		(await workerTrigger(
 			result.agent.pane_id,
 			workerFor(result.agent).sessionPath(result.agent),
 		));
@@ -148,19 +102,18 @@ export async function check(record, trigger) {
 	}
 }
 
-/** Waits until the worker settles new work, asks, blocks or closes, or the timeout passes. */
-export async function wait(record, timeoutMs) {
-	const deadline = Date.now() + timeoutMs;
+/** Waits until the worker settles new work, asks, blocks or closes, or `deadline` passes. */
+export async function wait(record, deadline) {
 	let current = { ...record };
-	let trigger = await openTrigger(current.paneId, current.sessionPath);
+	let trigger = await workerTrigger(current.paneId, current.sessionPath);
 	try {
 		for (;;) {
 			const result = await check(current, trigger);
 			if (result.state !== "working" && result.state !== "idle") return result;
-			if (result.agent && result.agent.target !== trigger.paneId) {
+			if (result.agent && result.agent.target !== current.paneId) {
 				current = { ...current, paneId: result.agent.target };
 				trigger.close();
-				trigger = await openTrigger(current.paneId, current.sessionPath);
+				trigger = await workerTrigger(current.paneId, current.sessionPath);
 				continue;
 			}
 			const remaining = deadline - Date.now();

@@ -93,19 +93,17 @@ async function handle(bridge: Bridge, cwd: string, request: AgentsRequest, signa
     case 'answer': {
       const askId = request.ask_id!
       const end = current.beginAnswer(request.target!, machine, askId)
-      let entered = false
       try {
         const params = { machine, target: request.target, ask_id: askId, answers: request.answers }
         const answered = await call<AnswerResult>(bridge, 'answer', params, 150_000)
-        entered = true
         const result = { target: answered.agent.target, ask_id: askId, status: answered.status }
         if (!answered.record) return JSON.stringify({ ...result, input_sent: false })
-        const record = current.track({ agent: answered.agent, record: answered.record })
+        const record = current.track({ agent: answered.agent, record: answered.record }, undefined, true)
         // A background Ask never stopped its worker: there is nothing to wait for.
         if (answered.background || request.blocking === false) return JSON.stringify(result)
         return `${JSON.stringify(result)}\n${await current.waitFor(bridge, record, signal)}`
       } finally {
-        end(entered)
+        end()
       }
     }
     case 'send': {
@@ -145,10 +143,8 @@ async function runCommand(
   if (choice === 'orchestrate' || choice === 'normal') {
     const enabled = choice === 'orchestrate'
     const { profiles } = await call<Profiles>(bridge, 'profiles')
-    const guidance = current.orchestrate(
-      enabled,
-      orchestrationGuidance(enabled, profiles.some(profile => profile.name === 'general')),
-    )
+    const guidance = orchestrationGuidance(enabled, profiles.some(profile => profile.name === 'general'))
+    current.orchestrate(enabled, guidance)
     return { text: `Orchestration ${enabled ? 'on' : 'off'}.`, context: [guidance] }
   }
   if (choice) return { text: 'Use /shepherdr, /shepherdr orchestrate or /shepherdr normal.' }

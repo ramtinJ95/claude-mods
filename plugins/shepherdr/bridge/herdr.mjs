@@ -6,12 +6,21 @@ import { join } from "node:path";
 
 const MAX_FRAME_BYTES = 8 * 1024 * 1024;
 
+export function isSessionName(value) {
+	return (
+		typeof value === "string" &&
+		/^[a-zA-Z0-9_.-]{1,64}$/.test(value) &&
+		value !== "." &&
+		value !== ".."
+	);
+}
+
 /** The Herdr session named by `--session`, when the bridge runs on a remote machine. */
 export function remoteSession() {
 	const index = process.argv.indexOf("--session");
 	if (index < 0) return undefined;
 	const session = process.argv[index + 1];
-	if (!session || !/^[a-zA-Z0-9_.-]{1,64}$/.test(session) || session === "." || session === "..")
+	if (!isSessionName(session))
 		throw new Error("A valid Herdr --session is required");
 	return session;
 }
