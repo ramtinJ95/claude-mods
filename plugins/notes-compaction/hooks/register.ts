@@ -1,28 +1,80 @@
-import type { EngineInterface, Register, SessionCompacted, ToolCallInput, ToolCallResult } from 'claude-code'
-import { useHistory } from './history.ts'
-import { type Note, noteFileName, recentPaths, useNotes } from './notes.ts'
-import { GUIDANCE, newState, nextWindow, reminderFor, type SessionState, windowText } from './windows.ts'
+import type {
+  EngineInterface,
+  Register,
+  RenderElement,
+  SessionCompacted,
+  SessionMessage,
+  ToolCallInput,
+  ToolCallResult,
+} from 'claude-code'
+import { MESSAGE_LIMIT, useHistory } from './history.ts'
+import {
+  agentIdOf,
+  agentName,
+  type Note,
+  noteFileName,
+  ROOT,
+  recentPaths,
+  resolvePath,
+  useNotes,
+  WRITE_ACTIONS,
+} from './notes.ts'
+import {
+  GUIDANCE,
+  newState,
+  nextWindow,
+  reminderFor,
+  remindersDone,
+  type SessionState,
+  type WindowIdentity,
+  windowMarker,
+  windowText,
+} from './windows.ts'
 
-const NOTES_ACTIONS = ['help', 'list_files_by_prefix', 'read_file', 'search_contents', 'append_to_file', 'write_file']
-const HISTORY_ACTIONS = ['help', 'list_windows', 'list_items', 'read_item', 'search_contents']
-const FIELDS: Record<string, readonly string[]> = {
-  list_files_by_prefix: ['prefix', 'file_order', 'file_order_by', 'max_results'],
-  read_file: ['path', 'start_line', 'stop_line'],
-  search_notes: ['query', 'path_prefix', 'max_files', 'max_matches_per_file', 'recent_file_first'],
-  append_to_file: ['path', 'text'],
-  write_file: ['path', 'text'],
-  list_windows: ['limit', 'recent_first'],
-  list_items: ['window_id', 'role', 'tool_name', 'limit', 'max_chars_per_item', 'recent_first'],
-  read_item: ['window_id', 'item_id', 'offset_chars', 'limit_chars'],
-  search_history: ['window_id', 'role', 'tool_name', 'query', 'limit', 'recent_first'],
+const NOTES_TOOL = 'mcp__notes-compaction__notes'
+
+type Namespace = 'notes' | 'history'
+interface ActionSpec {
+  fields: readonly string[]
+  required?: readonly string[]
+  /** The notes field that holds a virtual path. */
+  pathField?: string
 }
-const REQUIRED = ['path', 'text', 'query', 'item_id', 'window_id']
+/** Each tool's actions: the fields they take and which are required. Help, filtering and checks derive from it. */
+const ACTIONS: Record<Namespace, Record<string, ActionSpec>> = {
+  notes: {
+    list_files_by_prefix: { fields: ['prefix', 'file_order', 'file_order_by', 'max_results'], pathField: 'prefix' },
+    read_file: { fields: ['path', 'start_line', 'stop_line'], required: ['path'], pathField: 'path' },
+    search_contents: {
+      fields: ['query', 'path_prefix', 'max_files', 'max_matches_per_file', 'recent_file_first'],
+      required: ['query'],
+      pathField: 'path_prefix',
+    },
+    append_to_file: { fields: ['path', 'text'], required: ['path', 'text'], pathField: 'path' },
+    write_file: { fields: ['path', 'text'], required: ['path', 'text'], pathField: 'path' },
+  },
+  history: {
+    list_windows: { fields: ['agent_name', 'limit', 'recent_first'] },
+    list_items: {
+      fields: ['agent_name', 'window_id', 'role', 'tool_name', 'limit', 'max_chars_per_item', 'recent_first'],
+    },
+    read_item: {
+      fields: ['agent_name', 'window_id', 'item_id', 'offset_chars', 'limit_chars'],
+      required: ['window_id', 'item_id'],
+    },
+    search_contents: {
+      fields: ['agent_name', 'window_id', 'role', 'tool_name', 'query', 'limit', 'recent_first'],
+      required: ['query'],
+    },
+  },
+}
+const actionNames = (namespace: Namespace) => ['help', ...Object.keys(ACTIONS[namespace])]
 const STRING = { type: 'string' }
 const POSITIVE = { type: 'integer', minimum: 1 }
 const NOTES_SCHEMA = {
   type: 'object',
   properties: {
-    action: { type: 'string', enum: NOTES_ACTIONS },
+    action: { type: 'string', enum: actionNames('notes') },
     path: STRING,
     text: STRING,
     prefix: STRING,
@@ -42,7 +94,8 @@ const NOTES_SCHEMA = {
 const HISTORY_SCHEMA = {
   type: 'object',
   properties: {
-    action: { type: 'string', enum: HISTORY_ACTIONS },
+    action: { type: 'string', enum: actionNames('history') },
+    agent_name: STRING,
     item_id: STRING,
     window_id: STRING,
     query: STRING,
@@ -57,6 +110,23 @@ const HISTORY_SCHEMA = {
   additionalProperties: false,
 }
 const EMPTY_SCHEMA = { type: 'object', properties: {}, additionalProperties: false }
+const TOOLS = [
+  {
+    name: 'notes',
+    description:
+      'Cross-window notes. write_file replaces; append_to_file adds. Virtual paths: relative uses current agent; cross-agent uses <agent>/notes[/path], read-only. Call with no arguments for help.',
+    inputSchema: NOTES_SCHEMA,
+    isDeferred: false,
+  },
+  {
+    name: 'history',
+    description: 'Prior-window detail. Pass IDs unchanged. Search, never browse. Call with no arguments for help.',
+    inputSchema: HISTORY_SCHEMA,
+    isDeferred: true,
+  },
+  { name: 'new_context', description: 'Start a new context window', inputSchema: EMPTY_SCHEMA, isDeferred: false },
+  { name: 'get_context_remaining', description: 'Remaining context tokens', inputSchema: EMPTY_SCHEMA, isDeferred: true },
+]
 
 /** The tool's own arguments: tool.call's input also carries reserved keys beside them. */
 function args(e: object, schema: { properties: object }): Record<string, unknown> {
@@ -64,77 +134,167 @@ function args(e: object, schema: { properties: object }): Record<string, unknown
   return Object.fromEntries(Object.entries(e).filter(([key]) => keys.includes(key)))
 }
 
-/** Help-backed tools: no arguments, or action help, lists each action's fields. */
-function discovery(namespace: 'notes' | 'history', params: Record<string, unknown>) {
+/** Help-backed tools: no arguments, or action help, lists each action's fields; optional ones end in `?`. */
+function discovery(namespace: Namespace, params: Record<string, unknown>) {
   const keys = Object.keys(params)
   if (keys.length && params['action'] !== 'help') return
   if (keys.some((key) => key !== 'action')) throw new Error('Help accepts only action: help')
-  const actions = namespace === 'notes' ? NOTES_ACTIONS : HISTORY_ACTIONS
   return {
-    actions: Object.fromEntries(
-      actions.map((action) => [
+    actions: Object.fromEntries([
+      ['help', ''],
+      ...Object.entries(ACTIONS[namespace]).map(([action, spec]) => [
         action,
-        action === 'help'
-          ? ''
-          : FIELDS[action === 'search_contents' ? `search_${namespace}` : action]!
-              .map((field) => (REQUIRED.includes(field) ? field : `${field}?`))
-              .join(' '),
+        spec.fields.map((field) => (spec.required?.includes(field) ? field : `${field}?`)).join(' '),
       ]),
-    ),
+    ]),
   }
 }
 
-function relevant(namespace: 'notes' | 'history', params: Record<string, unknown>): Record<string, unknown> {
-  const action = params['action']
-  const fields = FIELDS[action === 'search_contents' ? `search_${namespace}` : String(action)]
-  if (!fields) throw new Error('Unknown action')
-  return Object.fromEntries(Object.entries(params).filter(([key]) => key === 'action' || fields.includes(key)))
+/** The action's own fields, with its required ones present. */
+function relevant(namespace: Namespace, params: Record<string, unknown>) {
+  const spec = ACTIONS[namespace][String(params['action'])]
+  if (!spec) throw new Error('Unknown action')
+  const missing = (spec.required ?? []).filter((field) => typeof params[field] !== 'string' || !params[field])
+  if (missing.length) throw new Error(`Supply ${missing.join(' and ')}`)
+  const scoped = Object.fromEntries(
+    Object.entries(params).filter(([key]) => key === 'action' || spec.fields.includes(key)),
+  )
+  return { scoped, spec }
 }
 
+const message = (error: unknown) => (error instanceof Error ? error.message : String(error))
 const result = (payload: unknown) => ({ result: JSON.stringify(payload) })
-const failure = (error: unknown) => ({ deny: error instanceof Error ? error.message : String(error) })
+const failure = (error: unknown) => ({ deny: message(error) })
 
 const CHECKPOINT_PROMPT =
   '<context_window_reminder>\nContext checkpoint requested. Save the current state with notes, then finish your response. The new window opens after this turn. Do not call new_context. If saving fails, report the failure without rolling over.\n</context_window_reminder>'
 
+/** One successful root write: root's whole note set after it, its window, and the session's subagents. */
+interface Revision {
+  /** The writing session, so /notes can prune its records with it. */
+  session?: string
+  notes: Note[]
+  window?: WindowIdentity
+  agents?: string[]
+}
+/** $.fs.read takes at most 4 MiB, so a revision must stay below it to be restorable. */
+const REVISION_LIMIT = 4_000_000
+
 // Module state restarts on reload; the window identity itself is persisted per session.
-let cached: { dir: string; state: SessionState } | undefined
-let loading: { dir: string; promise: Promise<{ dir: string; state: SessionState }> } | undefined
-let turn: { id: string; saved: number; failed: boolean } | undefined
-let lastCompleted: { windowId: string; fresh: boolean } | undefined
-let rollRequested = false
-let checkpoint: { windowId: string } | undefined
-let rolling = false
-let opened = false
+let storage: Promise<string> | undefined
+let sessionId: string | undefined
+let loaded: { dir: string; promise: Promise<{ dir: string; state: SessionState }> } | undefined
+let turn: { id: string; notes: 'none' | 'saved' | 'failed' } | undefined
+/** The window whose latest completed turn saved fresh notes. */
+let freshWindowId: string | undefined
+/** At most one rollover at a time: requested by new_context, a /compact checkpoint, or the /compact opening it. */
+let pending: { kind: 'requested' } | { kind: 'checkpoint'; windowId: string } | { kind: 'rolling' } | undefined
+/**
+ * Where Claude Code compacts on its own (an auto-compact window such as 400k), refreshed each turn.
+ * Reminders and remaining context measure against it, so checkpoints come before that compaction.
+ */
+let compactThreshold: number | undefined
+/** Parallel calls in one batch would otherwise read the same note before either append lands. */
+let notesQueue: Promise<unknown> = Promise.resolve()
+/** The /notes setting: run Claude Code's summary before each new window, as Pi's normal compaction does. */
+let normalCompaction = false
+/** What the /notes pane shows; a change redraws it. */
+let panel: { status: string[]; confirmPrune: boolean; message?: string } = { status: [], confirmPrune: false }
+const PANE = 'notes-compaction'
 
 // The engine follows $ only into functions declared in this file, so all I/O lives here.
 
-/** Per-session storage outside ~/.claude, which may be a synced dotfiles directory. */
-async function session($: EngineInterface) {
-  const base = (await $.env.get('XDG_DATA_HOME')) || `${await $.env.get('HOME')}/.local/share`
-  const dir = `${base}/claude-notes-compaction/sessions/${await $.session.id()}`
-  if (cached?.dir === dir) return cached
-  // Concurrent first calls share one load; a failed load is retried by the next call.
-  if (loading?.dir !== dir) {
-    const promise = loadSession($, dir)
-    loading = { dir, promise }
-    promise.then(
-      (loaded) => {
-        cached = loaded
-      },
-      () => {
-        if (loading?.promise === promise) loading = undefined
-      },
-    )
-  }
-  return loading.promise
+/** Storage outside ~/.claude, which may be a synced dotfiles directory. */
+function storageRoot($: EngineInterface): Promise<string> {
+  storage ??= dataHome($)
+  return storage
 }
 
+async function dataHome($: EngineInterface): Promise<string> {
+  return `${(await $.env.get('XDG_DATA_HOME')) || `${await $.env.get('HOME')}/.local/share`}/claude-notes-compaction`
+}
+
+/** Where Claude Code keeps this profile's transcripts, one folder per project. */
+async function transcriptsDir($: EngineInterface): Promise<string> {
+  return `${(await $.env.get('CLAUDE_CONFIG_DIR')) || `${await $.env.get('HOME')}/.claude`}/projects`
+}
+
+async function revisionPath($: EngineInterface, toolUseId: string): Promise<string> {
+  return `${await storageRoot($)}/revisions/${toolUseId}.json`
+}
+
+const rootNotesDir = (sessionDir: string) => `${sessionDir}/notes`
+
+/**
+ * Root notes live with their session. A subagent's live under its agent ID, which is unique,
+ * so a fork that carries the Agent call reaches the same notes.
+ */
+async function notesDir($: EngineInterface, agent: string): Promise<string> {
+  const id = agentIdOf(agent)
+  return id === undefined ? rootNotesDir((await session($)).dir) : `${await storageRoot($)}/agents/${id}/notes`
+}
+
+/** The session's state, loaded once; concurrent first calls share the load, and a failed one is retried. */
+async function session($: EngineInterface) {
+  sessionId ??= await $.session.id()
+  const dir = `${await storageRoot($)}/sessions/${sessionId}`
+  if (loaded?.dir !== dir) {
+    const promise = loadSession($, dir)
+    loaded = { dir, promise }
+    promise.catch(() => {
+      if (loaded?.promise === promise) loaded = undefined
+    })
+  }
+  return loaded.promise
+}
+
+/**
+ * A session without state is new, or a fork (`--fork-session`, `/branch`) whose transcript was
+ * copied from its parent. Like Pi's receipts, each successful root write saves a revision under its
+ * tool use ID, so the last write the copied transcript shows restores the notes as they stood at
+ * the fork point. A window marker after that write wins for the window identity.
+ */
 async function loadSession($: EngineInterface, dir: string) {
   const path = `${dir}/state.json`
   if (await $.fs.exists(path)) return { dir, state: JSON.parse(await $.fs.read(path)) as SessionState }
-  // Persist before use: history and notes may cite the first window's ID before anything else is saved.
+  const messages = await $.session.messages()
+  const markers = messages.map(windowMarker)
   const state = newState()
+  state.projects = await transcriptsDir($)
+  // A fork inherits the subagents its copied transcript launched, with their notes.
+  const launched = messages.flatMap((m) => m.toolUses.flatMap((use) => (use.agentId ? [agentName(use.agentId)] : [])))
+  if (launched.length) state.agents = [...new Set(launched)]
+  let restored: Revision | undefined
+  let restoredFrom: string | undefined
+  let markerWindow: WindowIdentity | undefined
+  let sawWrite = false
+  for (let i = messages.length - 1; i >= 0 && !restored; i--) {
+    const marker = markers[i]
+    if (marker && !markerWindow)
+      markerWindow = {
+        firstWindowId: marker.first ?? marker.current,
+        currentWindowId: marker.current,
+        ...(marker.previous ? { previousWindowId: marker.previous } : {}),
+        windowNumber: markers.filter(Boolean).length,
+      }
+    for (const use of [...messages[i]!.toolUses].reverse()) {
+      if (use.tool !== NOTES_TOOL || use.isError || !WRITE_ACTIONS.includes(use.input['action'])) continue
+      sawWrite = true
+      const file = await revisionPath($, use.tool_use_id)
+      if (!(await $.fs.exists(file))) continue
+      restored = JSON.parse(await $.fs.read(file)) as Revision
+      restoredFrom = use.tool_use_id
+      break
+    }
+  }
+  state.window = markerWindow ?? restored?.window ?? state.window
+  if (restored) {
+    await Promise.all(restored.notes.map((note) => writeNote($, rootNotesDir(dir), note)))
+    state.agents = [...new Set([...(state.agents ?? []), ...(restored.agents ?? [])])]
+    state.restoredFrom = restoredFrom
+  } else if (sawWrite || messages.length >= MESSAGE_LIMIT)
+    $.ui.toast("This session's earlier notes could not be restored. Notes start empty; earlier history remains.")
+  // Persist before use: history and notes may cite the first window's ID before anything else is saved.
   await saveState($, dir, state)
   return { dir, state }
 }
@@ -143,27 +303,50 @@ async function saveState($: EngineInterface, dir: string, state: SessionState) {
   await $.fs.write(`${dir}/state.json`, JSON.stringify(state))
 }
 
-async function readNotes($: EngineInterface, dir: string): Promise<Map<string, Note>> {
-  const notes = new Map<string, Note>()
-  if (!(await $.fs.exists(`${dir}/notes`))) return notes
-  for (const entry of await $.fs.list(`${dir}/notes`)) {
-    if (entry.kind !== 'file' || !entry.name.endsWith('.json')) continue
-    const note = JSON.parse(await $.fs.read(`${dir}/notes/${entry.name}`)) as Note
-    notes.set(note.path, note)
-  }
-  return notes
+async function writeNote($: EngineInterface, dir: string, note: Note) {
+  await $.fs.write(`${dir}/${await noteFileName(note.path)}`, JSON.stringify(note))
 }
 
-async function openWindow($: EngineInterface): Promise<SessionCompacted> {
+async function readNotes($: EngineInterface, dir: string): Promise<Map<string, Note>> {
+  if (!(await $.fs.exists(dir))) return new Map()
+  const files = (await $.fs.list(dir)).filter((entry) => entry.kind === 'file' && entry.name.endsWith('.json'))
+  const notes = await Promise.all(files.map(async (entry) => JSON.parse(await $.fs.read(`${dir}/${entry.name}`)) as Note))
+  return new Map(notes.map((note) => [note.path, note]))
+}
+
+/** One note, for a read: its own file instead of the whole set. */
+async function readNote($: EngineInterface, dir: string, path: string): Promise<Map<string, Note>> {
+  const file = `${dir}/${await noteFileName(path)}`
+  if (!(await $.fs.exists(file))) return new Map()
+  const note = JSON.parse(await $.fs.read(file)) as Note
+  return new Map([[note.path, note]])
+}
+
+/**
+ * Whether a note path may name this agent: root, the caller, subagents that wrote notes here, or
+ * a subagent the transcript in view launched.
+ */
+async function isSessionAgent($: EngineInterface, self: string, agent: string): Promise<boolean> {
+  if (agent === ROOT || agent === self || (await session($)).state.agents?.includes(agent)) return true
+  return (await $.session.messages()).some((m) => m.toolUses.some((use) => use.agentId && agentName(use.agentId) === agent))
+}
+
+/**
+ * The window's opening message, after `kept` (normal compaction's summary, or nothing for a
+ * notes-only window); the conversation continues once it stands.
+ */
+async function openWindow($: EngineInterface, kept: readonly SessionMessage[] = []): Promise<SessionCompacted> {
   const { dir, state } = await session($)
   const ids = nextWindow(state.window)
-  const recent = recentPaths(await readNotes($, dir))
+  const recent = recentPaths(await readNotes($, rootNotesDir(dir)), ROOT)
   state.window = ids
   state.reminded = []
   await saveState($, dir, state)
+  $.clock.after(100, () => $.prompt.submit({ text: 'Continue.' }))
   return {
     messages: [
-      { role: 'user', text: windowText(ids, recent), toolUses: [] },
+      ...kept,
+      { role: 'user', text: windowText(ROOT, ids, recent), toolUses: [] },
       { role: 'assistant', text: 'New context window opened.', toolUses: [] },
     ],
   }
@@ -171,19 +354,26 @@ async function openWindow($: EngineInterface): Promise<SessionCompacted> {
 
 /** Rollover runs between turns through /compact: the one route on which our session.compact hook answers. */
 function roll($: EngineInterface) {
+  pending = { kind: 'rolling' }
   $.clock.after(100, async () => {
-    rolling = true
-    opened = false
     try {
       await $.command.run({ command: 'compact' })
     } catch (error) {
-      $.ui.toast(`Context rollover failed: ${String(error)}. The existing context remains.`)
-      return
+      $.ui.toast(`Context rollover failed: ${message(error)}. The existing context remains.`)
     } finally {
-      rolling = false
+      pending = undefined
     }
-    if (opened) await $.prompt.submit({ text: 'Continue.' })
   })
+}
+
+async function refreshThreshold($: EngineInterface) {
+  const breakdown = (await $.session.usage({ breakdown: 'summary' })).context.breakdown
+  compactThreshold = breakdown?.isAutoCompactEnabled ? breakdown.autoCompactThreshold : undefined
+}
+
+async function contextUsed($: EngineInterface): Promise<{ limit: number; tokens?: number }> {
+  const { context } = await $.session.usage()
+  return { limit: Math.min(context.window, compactThreshold ?? context.window), tokens: context.tokens }
 }
 
 /** Context reminders ride on tool results, the one mid-turn channel to the model. Each fires once per window. */
@@ -191,7 +381,9 @@ async function remind($: EngineInterface, agentId: string | undefined, called: T
   if (agentId !== undefined || called.deny !== undefined) return called
   try {
     const { dir, state } = await session($)
-    const reminder = reminderFor(state, (await $.session.usage()).context.percent)
+    if (remindersDone(state)) return called
+    const { limit, tokens } = await contextUsed($)
+    const reminder = reminderFor(state, tokens === undefined || limit <= 0 ? undefined : (100 * tokens) / limit)
     if (!reminder) return called
     await saveState($, dir, state)
     return { ...called, context: [...(called.context ?? []), reminder] }
@@ -199,9 +391,6 @@ async function remind($: EngineInterface, agentId: string | undefined, called: T
     return called
   }
 }
-
-/** Parallel calls in one batch would otherwise read the same note before either append lands. */
-let notesQueue: Promise<unknown> = Promise.resolve()
 
 function callNotes($: EngineInterface, e: ToolCallInput): Promise<ToolCallResult> {
   const run = notesQueue.then(() => runNotes($, e))
@@ -211,22 +400,59 @@ function callNotes($: EngineInterface, e: ToolCallInput): Promise<ToolCallResult
 
 async function runNotes($: EngineInterface, e: ToolCallInput): Promise<ToolCallResult> {
   const params = args(e, NOTES_SCHEMA)
-  const isWrite = params['action'] === 'write_file' || params['action'] === 'append_to_file'
+  const isWrite = WRITE_ACTIONS.includes(params['action'])
+  const main = e.agentId === undefined
   try {
     const help = discovery('notes', params)
     if (help) return result(help)
-    const { dir } = await session($)
-    const { payload, write } = useNotes(await readNotes($, dir), relevant('notes', params), await $.clock.now())
+    const { scoped, spec } = relevant('notes', params)
+    const self = agentName(e.agentId)
+    const field = spec.pathField!
+    const target = resolvePath(scoped[field], self, spec.required?.includes(field) ?? false)
+    if (isWrite && target.agent !== self)
+      throw new Error(`Write only your own notes, with a relative path. ${target.agent}'s notes are read-only here.`)
+    if (!(await isSessionAgent($, self, target.agent)))
+      throw new Error(`${target.agent} is not an agent of this session. Use a relative path for your own notes.`)
+    const dir = await notesDir($, target.agent)
+    const notes = params['action'] === 'read_file' ? await readNote($, dir, target.path) : await readNotes($, dir)
+    const { payload, write } = useNotes(notes, { ...scoped, [field]: target.path }, await $.clock.now(), target.agent)
     if (!write) return result(payload)
+    const { dir: sessionDir, state } = await session($)
+    // The revision is the receipt a fork rebuilds root notes from. Subagent notes need none: they
+    // live under the agent ID, which a fork shares. Its size is checked before anything changes.
+    notes.set(write.path, write)
+    const revision =
+      e.tool_use_id && main
+        ? JSON.stringify({
+            session: sessionId,
+            notes: [...notes.values()],
+            window: state.window,
+            agents: state.agents,
+          } satisfies Revision)
+        : undefined
+    if (revision && new TextEncoder().encode(revision).length > REVISION_LIMIT)
+      throw new Error('Notes exceed 4 MB in total. Shorten or replace existing notes, then save again.')
     try {
-      await $.fs.write(`${dir}/notes/${await noteFileName(write.path)}`, JSON.stringify(write))
+      await writeNote($, dir, write)
     } catch {
       throw new Error('Note could not be saved. Retry after local storage is available.')
     }
-    if (e.agentId === undefined && turn) turn.saved++
+    if (revision)
+      try {
+        await $.fs.write(await revisionPath($, e.tool_use_id!), revision)
+      } catch {
+        throw new Error(
+          `${payload['path']} was saved, but forks of this session will not see it. Read it back and save it again with write_file.`,
+        )
+      }
+    if (!main && !state.agents?.includes(self)) {
+      state.agents = [...(state.agents ?? []), self]
+      await saveState($, sessionDir, state)
+    }
+    if (main && turn?.notes === 'none') turn.notes = 'saved'
     return result(payload)
   } catch (error) {
-    if (isWrite && e.agentId === undefined && turn) turn.failed = true
+    if (isWrite && main && turn) turn.notes = 'failed'
     return failure(error)
   }
 }
@@ -236,78 +462,191 @@ async function callHistory($: EngineInterface, e: ToolCallInput): Promise<ToolCa
   try {
     const help = discovery('history', params)
     if (help) return result(help)
-    const { state } = await session($)
-    return result(useHistory(await $.session.messages(), relevant('history', params), state.window.currentWindowId))
+    const { scoped } = relevant('history', params)
+    const name = scoped['agent_name']
+    const id = agentIdOf(typeof name === 'string' && name ? name : agentName(e.agentId))
+    if (id === undefined) {
+      const { state } = await session($)
+      return result(useHistory(await $.session.messages(), scoped, state.window.currentWindowId))
+    }
+    // A subagent's transcript is its own single window.
+    const found = await $.session.messages({ agentId: id })
+    if ('deny' in found)
+      throw new Error(`${agentName(id)}'s history is not available here. Omit agent_name to search your own.`)
+    return result(useHistory(found, scoped, `agent:${id}`))
   } catch (error) {
     return failure(error)
   }
 }
 
+function showPanel($: EngineInterface, change: Partial<typeof panel>) {
+  panel = { ...panel, ...change }
+  $.ui.invalidate('ui.render')
+}
+
+async function childNames($: EngineInterface, dir: string, kind: 'file' | 'dir'): Promise<string[]> {
+  if (!(await $.fs.exists(dir))) return []
+  return (await $.fs.list(dir)).filter((entry) => entry.kind === kind).map((entry) => entry.name)
+}
+
+async function refreshPanel($: EngineInterface) {
+  const base = await storageRoot($)
+  const { dir, state } = await session($)
+  const notes = (await childNames($, rootNotesDir(dir), 'file')).length
+  const sessions = (await childNames($, `${base}/sessions`, 'dir')).length
+  const records = (await childNames($, `${base}/revisions`, 'file')).length
+  const { limit } = await contextUsed($)
+  showPanel($, {
+    status: [
+      `Continuity active · window ${state.window.windowNumber + 1} · ${notes} notes in this session`,
+      `Reminders at 85% and 90% of ${limit} tokens (${compactThreshold ? 'the auto-compact threshold' : 'the model window'})`,
+      `${sessions} sessions · ${records} fork records`,
+    ],
+  })
+}
+
+async function toggleNormalCompaction($: EngineInterface) {
+  normalCompaction = !normalCompaction
+  await $.store.set('settings', { normalCompaction })
+  showPanel($, { message: undefined })
+}
+
+/** A session this recently active stays: one that saves no transcript may still be running. */
+const PRUNE_GRACE_MS = 24 * 60 * 60 * 1000
+
+/**
+ * Removes stored sessions of this profile whose Claude Code transcript is gone, with their fork
+ * records and the subagent notes no remaining session names. The active session, recently active
+ * ones, other profiles' sessions and records a remaining fork restored from stay.
+ */
+async function prune($: EngineInterface): Promise<string> {
+  const base = await storageRoot($)
+  const projects = await transcriptsDir($)
+  if (!(await $.fs.exists(projects))) return `No Claude Code transcripts found at ${projects}. Nothing was pruned.`
+  const live = new Set([sessionId])
+  for (const project of await childNames($, projects, 'dir'))
+    for (const file of await childNames($, `${projects}/${project}`, 'file'))
+      if (file.endsWith('.jsonl')) live.add(file.slice(0, -'.jsonl'.length))
+  const now = await $.clock.now()
+  const removed = new Set<string>()
+  const kept: SessionState[] = []
+  let retained = 0
+  for (const id of await childNames($, `${base}/sessions`, 'dir')) {
+    const dir = `${base}/sessions/${id}`
+    const entries = await $.fs.list(dir)
+    const stateFile = entries.find((entry) => entry.name === 'state.json')
+    const state = stateFile ? (JSON.parse(await $.fs.read(`${dir}/state.json`)) as SessionState) : undefined
+    const recent = entries.some((entry) => now - entry.mtimeMs < PRUNE_GRACE_MS)
+    if (live.has(id) || !state || state.projects !== projects || recent) {
+      if (state) kept.push(state)
+      if (!live.has(id)) retained++
+    } else removed.add(id)
+  }
+  const keptAgents = new Set(kept.flatMap((state) => state.agents ?? []))
+  const keptRecords = new Set(kept.flatMap((state) => (state.restoredFrom ? [`${state.restoredFrom}.json`] : [])))
+  const records: string[] = []
+  for (const file of await childNames($, `${base}/revisions`, 'file')) {
+    if (keptRecords.has(file)) continue
+    const owner = (JSON.parse(await $.fs.read(`${base}/revisions/${file}`)) as Revision).session
+    if (owner && removed.has(owner)) records.push(`${base}/revisions/${file}`)
+  }
+  const agents = (await childNames($, `${base}/agents`, 'dir')).filter((id) => !keptAgents.has(agentName(id)))
+  const paths = [
+    ...[...removed].map((id) => `${base}/sessions/${id}`),
+    ...records,
+    ...agents.map((id) => `${base}/agents/${id}`),
+  ]
+  const retainedNote = retained
+    ? ` Retained ${retained} sessions without a transcript that are recent, from another profile or of unknown origin.`
+    : ''
+  if (!paths.length) return `Nothing to prune.${retainedNote}`
+  for (let i = 0; i < paths.length; i += 200) {
+    let run: { exitCode: number; stderr: string }
+    try {
+      run = await $.process.run(['rm', '-rf', ...paths.slice(i, i + 200)])
+    } catch (error) {
+      return `Prune needs the rm command, which could not run: ${message(error)}. Nothing further was removed.`
+    }
+    if (run.exitCode !== 0) return `Prune stopped: ${run.stderr.trim() || `rm exited ${run.exitCode}`}.`
+  }
+  return `Pruned ${removed.size} sessions, ${records.length} fork records and ${agents.length} subagent note sets.${retainedNote}`
+}
+
+async function confirmPrune($: EngineInterface) {
+  showPanel($, { confirmPrune: false, message: 'Pruning…' })
+  let outcome: string
+  try {
+    outcome = await prune($)
+  } catch (error) {
+    outcome = `Prune failed: ${message(error)}`
+  }
+  showPanel($, { message: outcome })
+  await refreshPanel($)
+}
+
 export const register: Register = (on) => {
+  // First registered is outermost: this wraps every tool's result, the plugin's own included.
+  on('tool.call', async ($, e, next) => remind($, e.agentId, await next(e)))
+
   on('session.start', async ($, e, next) => {
     const started = await next(e)
-    turn = lastCompleted = checkpoint = undefined
-    rollRequested = rolling = false
-    await $.tool.register({
-      name: 'notes',
-      description:
-        'Cross-window notes. write_file replaces; append_to_file adds. Relative virtual paths. Call with no arguments for help.',
-      inputSchema: NOTES_SCHEMA,
-      isDeferred: false,
-    })
-    await $.tool.register({
-      name: 'history',
-      description: 'Prior-window detail. Pass IDs unchanged. Search, never browse. Call with no arguments for help.',
-      inputSchema: HISTORY_SCHEMA,
-      isDeferred: true,
-    })
-    await $.tool.register({
-      name: 'new_context',
-      description: 'Start a new context window',
-      inputSchema: EMPTY_SCHEMA,
-      isDeferred: false,
-    })
-    await $.tool.register({
-      name: 'get_context_remaining',
-      description: 'Remaining context tokens',
-      inputSchema: EMPTY_SCHEMA,
-      isDeferred: true,
-    })
+    const settings = (await $.store.get('settings')) as { normalCompaction?: boolean } | undefined
+    normalCompaction = settings?.normalCompaction === true
+    for (const tool of TOOLS) await $.tool.register(tool)
+    await $.command.register({ name: 'notes', description: 'Notes continuity status and settings' })
     return started
   })
 
+  // After new_context, the turn ends at its next model request, once the whole tool batch ran,
+  // as Pi's new_context ends the run; the rollover then follows the turn's completion.
+  // A note that failed this turn keeps the turn going, so the model sees the error; the rollover is then cancelled.
+  on('turn.step', async function* ($, e, next) {
+    if (e.agentId !== undefined || pending?.kind !== 'requested' || turn?.notes === 'failed') return yield* next(e)
+    const answer = 'Starting a new context window.'
+    yield { kind: 'text', index: 0, text: answer }
+    yield { kind: 'stop', stopReason: 'end_turn', usage: null }
+    return { turnId: e.turnId, index: e.index, answer, toolUses: [], stopReason: 'end_turn', usage: null }
+  })
+
+  // /clear ends this session in the same process, under a new ID.
   on('session.end', async ($, e, next) => {
-    cached = loading = turn = lastCompleted = checkpoint = undefined
-    rollRequested = rolling = false
+    sessionId = loaded = turn = freshWindowId = pending = undefined
     return next(e)
   })
 
   on('prompt.compose', async ($, e, next) => {
     const composed = await next(e)
-    if (!e.tools.includes('mcp__notes-compaction__notes')) return composed
+    if (!e.tools.includes(NOTES_TOOL)) return composed
     return { sections: [...composed.sections, { id: 'notes-compaction:guidance', text: GUIDANCE, scope: 'session' }] }
   })
 
   on('turn.start', async ($, e, next) => {
-    turn = { id: e.turnId, saved: 0, failed: false }
+    turn = { id: e.turnId, notes: 'none' }
+    // /config and /model can move the threshold between turns; the previous figure stands meanwhile.
+    refreshThreshold($).catch(() => undefined)
     return next(e)
   })
 
   on('turn.complete', async ($, e, next) => {
     const completed = await next(e)
     if (e.agentId !== undefined) return completed
-    const { state } = await session($)
-    const windowId = state.window.currentWindowId
-    const fresh = e.reason === 'answer' && turn?.id === e.turnId && turn.saved > 0 && !turn.failed
-    lastCompleted = { windowId, fresh }
-    if (checkpoint) {
-      const requested = checkpoint
-      checkpoint = undefined
-      if (fresh && requested.windowId === windowId) roll($)
-      else $.ui.toast('Rollover did not start. No fresh note was saved in the checkpoint. The old context remains.')
-    } else if (rollRequested) {
-      rollRequested = false
+    const windowId = (await session($)).state.window.currentWindowId
+    const fresh = e.reason === 'answer' && turn?.id === e.turnId && turn.notes === 'saved'
+    freshWindowId = fresh ? windowId : undefined
+    const was = pending
+    if (was?.kind === 'checkpoint') {
+      pending = undefined
+      if (e.isAborted || was.windowId !== windowId) $.ui.toast('Checkpoint cancelled. The old context remains.')
+      else if (fresh) roll($)
+      else
+        $.ui.toast(
+          'Rollover did not start. No fresh note was saved in the completed checkpoint. The old context remains.',
+        )
+    } else if (was?.kind === 'requested') {
+      pending = undefined
       if (e.isAborted) $.ui.toast('Rollover cancelled by the interruption. The old context remains.')
+      else if (turn?.id === e.turnId && turn.notes === 'failed')
+        $.ui.toast('Rollover did not start: a note failed to save this turn. The old context remains.')
       else roll($)
     }
     return completed
@@ -315,26 +654,23 @@ export const register: Register = (on) => {
 
   on('session.compact', async ($, e, next) => {
     if (e.agentId !== undefined || e.trigger === 'precompute') return next(e)
-    if (rolling) {
-      const window = await openWindow($)
-      opened = true
-      return window
+    if (pending?.kind === 'rolling') {
+      if (!normalCompaction) return openWindow($)
+      const compacted = await next(e)
+      return compacted.skip ? compacted : openWindow($, compacted.messages)
     }
-    if (e.trigger === 'manual') {
-      if (checkpoint || rollRequested) return { skip: 'A notes checkpoint or rollover is already pending.' }
-      const { state } = await session($)
-      const windowId = state.window.currentWindowId
-      if (!e.instructions?.trim() && lastCompleted?.fresh && lastCompleted.windowId === windowId) {
-        const window = await openWindow($)
-        $.clock.after(100, () => $.prompt.submit({ text: 'Continue.' }))
-        return window
-      }
-      checkpoint = { windowId }
-      const guidance = e.instructions?.trim() ? `\n\nCheckpoint guidance:\n${e.instructions}` : ''
+    // With normal compaction on, /compact is Claude Code's own, as in Pi.
+    if (e.trigger === 'manual' && !normalCompaction) {
+      if (pending) return { skip: 'A notes checkpoint or rollover is already pending.' }
+      const windowId = (await session($)).state.window.currentWindowId
+      const instructions = e.instructions?.trim()
+      if (!instructions && freshWindowId === windowId) return openWindow($)
+      pending = { kind: 'checkpoint', windowId }
+      const guidance = instructions ? `\n\nCheckpoint guidance:\n${e.instructions}` : ''
       $.clock.after(100, () => $.prompt.submit({ text: CHECKPOINT_PROMPT + guidance }))
       return { skip: 'Saving a notes checkpoint first. The new window opens after it completes.' }
     }
-    // Automatic compaction stays Claude Code's own; reminders restart in the compacted context.
+    // Other compaction stays Claude Code's own; reminders restart in the compacted context.
     const compacted = await next(e)
     if (!compacted.skip) {
       const { dir, state } = await session($)
@@ -342,46 +678,81 @@ export const register: Register = (on) => {
       await saveState($, dir, state)
     }
     return compacted
-  }).catch(() => {
-    rolling = false
-    return { skip: 'Context rollover failed. The existing context remains.' }
-  })
+  }).catch(() => ({ skip: 'Context rollover failed. The existing context remains.' }))
 
-  on('tool.call', { tool: 'mcp__notes-compaction__notes' }, async ($, e) =>
-    remind($, e.agentId, await callNotes($, e)),
-  )
+  on('tool.call', { tool: 'mcp__notes-compaction__notes' }, ($, e) => callNotes($, e))
 
-  on('tool.call', { tool: 'mcp__notes-compaction__history' }, async ($, e) =>
-    remind($, e.agentId, await callHistory($, e)),
-  )
+  on('tool.call', { tool: 'mcp__notes-compaction__history' }, ($, e) => callHistory($, e))
 
   on('tool.call', { tool: 'mcp__notes-compaction__new_context' }, async ($, e) => {
     if (e.agentId !== undefined) return { deny: 'Only the main conversation can start a new context window.' }
-    if (checkpoint || rollRequested || rolling)
+    if (pending)
       return result({
         started: false,
         message: 'A checkpoint or rollover is already pending. Save notes and finish your response',
       })
-    rollRequested = true
+    pending = { kind: 'requested' }
     return result({
       started: true,
-      message: 'Finish your response now. A new window will continue from your notes after this turn',
+      message: normalCompaction
+        ? 'Normal compaction will run before the new window opens'
+        : 'A new window will continue from your notes after this turn',
     })
   })
 
-  on('tool.call', { tool: 'mcp__notes-compaction__get_context_remaining' }, async ($) => {
+  on('command.run', { command: 'notes' }, async ($, e) => {
+    if (e.args.trim()) return { text: 'Use /notes to open the notes panel.' }
+    showPanel($, { confirmPrune: false, message: undefined })
+    await refreshPanel($)
+    await $.ui.open({ id: PANE, title: 'Notes continuity' })
+    return { text: 'Notes panel opened.' }
+  })
+
+  on('ui.render', { component: 'Pane', requestId: PANE }, async ($, e) => {
+    const { Box, Text, Button } = $.ui.resolve(e)
+    const prune = panel.confirmPrune
+      ? h(
+          Box,
+          { flexDirection: 'row', gap: 1 },
+          h(
+            Button,
+            { key: 'confirm', hotkey: 'y', variant: 'primary', onPress: () => void confirmPrune($) },
+            'Confirm prune',
+          ),
+          h(Button, { key: 'cancel', hotkey: 'c', onPress: () => showPanel($, { confirmPrune: false }) }, 'Cancel'),
+        )
+      : h(
+          Button,
+          { key: 'prune', hotkey: 'p', onPress: () => showPanel($, { confirmPrune: true, message: undefined }) },
+          'Prune missing sessions',
+        )
+    return h(
+      Box,
+      { flexDirection: 'column' },
+      ...panel.status.map((line) => h(Text, null, line)),
+      h(
+        Button,
+        { key: 'normal', hotkey: 'n', onPress: () => void toggleNormalCompaction($) },
+        `Normal compaction before new windows: ${normalCompaction ? 'on' : 'off'}`,
+      ),
+      prune,
+      panel.confirmPrune &&
+        h(Text, { dimColor: true }, 'Removes stored notes of sessions whose Claude Code transcript no longer exists.'),
+      panel.message && h(Text, { dimColor: true }, panel.message),
+      h(Button, { key: 'close', hotkey: 'x', role: 'dismiss', onPress: () => void $.ui.close({ id: PANE }) }, 'Close'),
+    ) as RenderElement
+  })
+
+  on('tool.call', { tool: 'mcp__notes-compaction__get_context_remaining' }, async ($, e) => {
+    if (e.agentId !== undefined) return { deny: 'Context usage is reported for the main conversation only.' }
     const { state } = await session($)
-    const { context } = await $.session.usage()
-    const remainingTokens =
-      typeof context.tokens === 'number' && context.window > 0 ? Math.max(0, context.window - context.tokens) : null
+    const { limit, tokens } = await contextUsed($)
+    const remainingTokens = typeof tokens === 'number' && limit > 0 ? Math.max(0, limit - tokens) : null
     return result({
-      contextWindow: context.window,
+      contextWindow: limit,
       windowId: state.window.currentWindowId,
       remainingTokens,
-      remainingPercent: remainingTokens === null ? null : Math.round((remainingTokens / context.window) * 1000) / 10,
+      remainingPercent: remainingTokens === null ? null : Math.round((remainingTokens / limit) * 1000) / 10,
     })
   })
-
-  // Other tools' results carry reminders too; a hook that answers without next never reaches this one.
-  on('tool.call', async ($, e, next) => remind($, e.agentId, await next(e)))
 }
