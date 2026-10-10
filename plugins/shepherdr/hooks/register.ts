@@ -3,6 +3,7 @@ import type { EngineInterface, Register } from 'claude-code'
 import { type AgentSummary, type AnswerResult, type Bridge, type Delivery, type Tracked, call, message } from './bridge'
 import { type AgentsRequest, type ProfileSummary, TOOL_SPEC, helpText, orchestrationGuidance, parseRequest } from './contract'
 import { Fleet, type SessionIo } from './fleet'
+import { CallRow, PushedReports, ResultRow, parseReports } from './render'
 
 const COMMAND = 'shepherdr'
 
@@ -229,4 +230,21 @@ export const register: Register = on => {
   }).catch(($, e, next) => next(e))
 
   on('command.run', { command: COMMAND }, ($, e) => runCommand($, e.args))
+
+  // The rows the person sees; the model reads the same JSON and reports.
+  on('ui.render', { component: 'ToolUse', props: { tool: 'mcp__shepherdr__agents' } }, ($, e) =>
+    CallRow($.ui.resolve(e), e.props.input as Record<string, unknown>, e.props),
+  )
+
+  on('ui.render', { component: 'ToolResult', props: { tool: 'mcp__shepherdr__agents' } }, ($, e, next) => {
+    if (e.props.isErrored || typeof e.props.output !== 'string') return next(e)
+    return ResultRow($.ui.resolve(e), e.props.output) ?? next(e)
+  })
+
+  // Reports pushed as a prompt of their own; ctrl+o still shows the raw text.
+  on('ui.render', { component: 'UserMessage', props: { origin: { kind: 'plugin' } } }, ($, e, next) => {
+    const { origin, isExpanded, text } = e.props
+    const reports = origin.kind === 'plugin' && origin.name === 'shepherdr' && !isExpanded ? parseReports(text) : []
+    return reports.length ? PushedReports($.ui.resolve(e), reports) : next(e)
+  })
 }
