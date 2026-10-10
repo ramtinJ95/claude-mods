@@ -16,7 +16,16 @@ export type WorkerRecord = {
   name?: string
   sessionPath?: string
   seenInputId: string | null
+  /** An Ask just answered; until answeringUntil, staying blocked on it is not a new question. */
+  answeringAskId?: string
+  answeringUntil?: number
 }
+
+export type AskAnswer = { selections?: string[]; other?: string; comment?: string }
+
+export type AnswerResult =
+  | { agent: AgentSummary; status: 'accepted' | 'rejected' | 'unknown'; record?: undefined }
+  | { agent: AgentSummary; record: WorkerRecord; status?: undefined }
 
 export type AgentSummary = {
   target: string

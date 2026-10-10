@@ -1,6 +1,6 @@
 import type { Register } from 'claude-code'
 
-import { type AgentSummary, type Bridge, type Delivery, call } from './bridge'
+import { type AgentSummary, type AnswerResult, type Bridge, type Delivery, call } from './bridge'
 import { type AgentsRequest, type ProfileSummary, TOOL_SPEC, helpText, parseRequest } from './contract'
 import { Fleet } from './fleet'
 
@@ -58,6 +58,22 @@ async function handle(bridge: Bridge, cwd: string, request: AgentsRequest, signa
         kind: 'task',
       })
       return dispatchWork(bridge, current, delivery, request.message!, request.blocking ?? true, signal)
+    }
+    case 'answer': {
+      const release = current.hold(request.target!)
+      try {
+        const params = { target: request.target, ask_id: request.ask_id, answers: request.answers }
+        const answered = await call<AnswerResult>(bridge, 'answer', params)
+        const result = { target: answered.agent.target, ask_id: request.ask_id }
+        if (!answered.record) return JSON.stringify({ ...result, status: answered.status, input_sent: false })
+        const record = current.trackAnswer(answered)
+        if (request.blocking === false) return JSON.stringify({ ...result, status: 'submitted' })
+        const report = await current.waitFor(bridge, record, signal)
+        const { status } = await call<{ status: string }>(bridge, 'answer_status', params)
+        return `${JSON.stringify({ ...result, status })}\n${report}`
+      } finally {
+        release()
+      }
     }
     case 'send': {
       const delivery = await call<Delivery>(bridge, 'deliver', {

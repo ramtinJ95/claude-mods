@@ -159,6 +159,31 @@ const OPS = {
 		);
 		return { agent: summary(agent), record: await recordFor(agent, pending) };
 	},
+	async answer({ target, ask_id: askId, answers }) {
+		const agent = await resolveWorker(target);
+		const worker = workerFor(agent);
+		// A retry of an answer Pi already recorded sends no input.
+		const prior = await worker.answerStatus(agent, askId, answers);
+		if (prior) return { agent: summary(agent), status: prior };
+		const record = await recordFor(agent, true);
+		await worker.answer(agent, askId, answers);
+		return {
+			agent: summary(agent),
+			record: {
+				...record,
+				answeringAskId: askId,
+				answeringUntil: Date.now() + 30_000,
+			},
+		};
+	},
+	async answer_status({ target, ask_id: askId, answers }) {
+		const agent = await resolveWorker(target);
+		return {
+			status:
+				(await workerFor(agent).answerStatus(agent, askId, answers)) ??
+				"unknown",
+		};
+	},
 	check({ record }) {
 		return check(record);
 	},

@@ -2,7 +2,7 @@
 
 export const TOOL_NAME = 'agents'
 
-const ACTIONS = ['help', 'list', 'spawn', 'send', 'assign', 'read', 'watch', 'unwatch'] as const
+const ACTIONS = ['help', 'list', 'spawn', 'send', 'assign', 'answer', 'read', 'watch', 'unwatch'] as const
 const STATUSES = ['idle', 'working', 'blocked', 'done', 'unknown'] as const
 const PLACEMENTS = ['new_tab', 'new_workspace', 'pane'] as const
 const SOURCES = ['latest', 'visible', 'recent'] as const
@@ -15,6 +15,7 @@ const FIELDS: Record<Action, readonly string[]> = {
   spawn: ['agent_type', 'label', 'name', 'placement', 'workspace', 'pane', 'cwd', 'message', 'base', 'blocking'],
   send: ['target', 'message'],
   assign: ['target', 'message', 'blocking'],
+  answer: ['target', 'ask_id', 'answers', 'blocking'],
   read: ['target', 'source', 'lines'],
   watch: ['target'],
   unwatch: ['target'],
@@ -45,6 +46,20 @@ export const TOOL_SPEC = {
       status: { type: 'string', enum: STATUSES },
       source: { type: 'string', enum: SOURCES },
       lines: { type: 'integer', minimum: 1, maximum: 200 },
+      ask_id: { type: 'string' },
+      answers: {
+        type: 'array',
+        description: 'One per prompt, in order',
+        items: {
+          type: 'object',
+          additionalProperties: false,
+          properties: {
+            selections: { type: 'array', items: { type: 'string' } },
+            other: { type: 'string' },
+            comment: { type: 'string' },
+          },
+        },
+      },
     },
   },
 } as const
@@ -66,6 +81,8 @@ export type AgentsRequest = {
   status?: (typeof STATUSES)[number]
   source?: (typeof SOURCES)[number]
   lines?: number
+  ask_id?: string
+  answers?: { selections?: string[]; other?: string; comment?: string }[]
 }
 
 const RESERVED = new Set(['tool', 'tool_use_id', 'consent', 'agentId'])
@@ -85,15 +102,17 @@ export function parseRequest(input: Record<string, unknown>): AgentsRequest {
         ? 'send is message-only; omit blocking. Use assign to delegate work'
         : `unknown ${action} field(s): ${unknown.join(', ')}`,
     )
-  for (const field of ['target', 'message', 'agent_type', 'label'] as const) {
+  for (const field of ['target', 'message', 'agent_type', 'label', 'ask_id'] as const) {
     const needed =
       (field === 'target' && !['help', 'list', 'spawn'].includes(action)) ||
       (field === 'message' && ['spawn', 'send', 'assign'].includes(action)) ||
-      ((field === 'agent_type' || field === 'label') && action === 'spawn')
+      ((field === 'agent_type' || field === 'label') && action === 'spawn') ||
+      (field === 'ask_id' && action === 'answer')
     const value = request[field]
     if (needed && (typeof value !== 'string' || !value.trim()))
       throw new Error(`${field} is required for ${action}`)
   }
+  if (action === 'answer' && !Array.isArray(request['answers'])) throw new Error('answers is required for answer')
   return { ...request, action } as AgentsRequest
 }
 
@@ -115,15 +134,17 @@ export function helpText(profiles: { source: string; profiles: ProfileSummary[] 
       spawn: '{action:"spawn", agent_type, label (2-3 words), message, cwd?, placement?: new_tab|new_workspace|pane, workspace?, pane?, name?, base?, blocking?}',
       send: '{action:"send", target, message}',
       assign: '{action:"assign", target, message, blocking?}',
+      answer: '{action:"answer", target, ask_id, answers: [{selections?: [choice label], other?, comment?}] one per prompt in order, blocking?}',
       read: '{action:"read", target, source?: latest|visible|recent, lines?}',
       watch: '{action:"watch", target}',
       unwatch: '{action:"unwatch", target}',
     },
     rules: [
-      'spawn and assign block until the worker settles unless blocking:false; a profile blocking setting overrides spawn',
+      'spawn, assign and answer block until the worker settles unless blocking:false; a profile blocking setting overrides spawn',
       'Non-blocking work and watched agents report completion, questions and blockage as agent_report messages; never poll',
       'send delivers input without waiting or watching; use assign only for work whose result you need',
       'Delegation and watch keep reporting later work until unwatch or the pane closes',
+      'A question report carries its ask_id and prompts; answer it with answer, asking the user first when the choice is theirs',
       'Messages starting with / run as the worker\'s slash commands without a watch',
       'For work in this repository, create a dedicated worktree and pass it as cwd',
       'Close finished workers by sending "/quit"; do not send acknowledgements',

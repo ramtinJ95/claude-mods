@@ -4,5 +4,7 @@
 - `$.prompt.submit` resolves only when its turn starts: never await it from `turn.complete`. Subagent runs raise `turn.complete` with `agentId` but no `turn.start`.
 - Records are keyed by Herdr terminal ID. Pane IDs change on move and Herdr rejects subscriptions naming a missing pane, so the watcher subscribes to each terminal's current pane.
 - `bridge/vendor/*.mjs` and `profiles/` are unchanged copies from pi-shepherdr (`packages/pi-shepherdr/src/remote/` and `profiles/` at howaboua-pi-stuff `1f189a2`). Never edit them here; recopy them when pi-shepherdr changes `PEER_PROTOCOL` or its session reader.
-- New worker kinds are adapters in `bridge/workers/` exposing `kind`, `sessionPath`, `isReady`, `view` and `deliver`. The hooks side is kind-agnostic.
+- `bridge/workers/pi-ask.mjs` is a hand port of pi-shepherdr's `src/ask-answer.ts` and depends on Pi Ask's terminal layout (its frame rules, tab row and `Review` step). Port changes from there instead of improvising; it must keep refusing to send keys when the frame is not recognized.
+- While an answered Ask's UI closes, its worker stays `blocked`; `answeringAskId`/`answeringUntil` make settlement treat that as working, and `Fleet.hold` keeps the watcher off the worker until the answer is tracked.
+- New worker kinds are adapters in `bridge/workers/` exposing `kind`, `sessionPath`, `isReady`, `view`, `deliver`, `answer` and `answerStatus`, with questions and answers in the shared shape documented in `workers/index.mjs`. The hooks side is kind-agnostic.
 - `fs.watch` fails with `EMFILE` inside Claude Code's Bash sandbox, so `watch.mjs` and `wait` cannot be probed from there; the mod's own processes are not sandboxed.

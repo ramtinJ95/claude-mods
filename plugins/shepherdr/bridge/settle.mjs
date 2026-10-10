@@ -1,8 +1,11 @@
 // Settlement: what a watched worker's state means for its controller.
 //
-// A record is { terminalId, paneId, sessionPath?, seenInputId }. seenInputId is
-// the latest worker input the controller already accounted for; a settled
-// worker whose latest input differs has finished new work.
+// A record is { terminalId, paneId, sessionPath?, seenInputId, answeringAskId? }.
+// seenInputId is the latest worker input the controller already accounted for;
+// a settled worker whose latest input differs has finished new work.
+// answeringAskId names an Ask the controller just answered: until
+// answeringUntil the worker staying blocked on it is its UI closing, not a new
+// question. Past that, a still-open Ask is reported again.
 import { getAgent, isHerdrErrorCode, snapshot, subscribe } from "./herdr.mjs";
 import { watchSessions } from "./vendor/shepherdr-session-watch.mjs";
 import { workerFor } from "./workers/index.mjs";
@@ -49,6 +52,13 @@ async function inspect(record) {
 		return { state: "working", agent };
 	const view = await worker.view(agent);
 	const inputId = view.input?.id ?? null;
+	if (
+		status === "blocked" &&
+		record.answeringAskId &&
+		(record.answeringUntil ?? 0) > Date.now() &&
+		(!view.ask || view.ask.toolCallId === record.answeringAskId)
+	)
+		return { state: "working", agent };
 	if (status === "blocked")
 		return view.ask
 			? { state: "question", agent, inputId, ask: view.ask }
@@ -166,7 +176,9 @@ export async function wait(record, timeoutMs) {
 			}
 			const remaining = deadline - Date.now();
 			if (remaining <= 0) return { ...result, timedOut: true };
-			await trigger.next(remaining);
+			// Re-check when an answered Ask's grace ends, even without an event.
+			const grace = (current.answeringUntil ?? 0) - Date.now();
+			await trigger.next(grace > 0 ? Math.min(remaining, grace + 50) : remaining);
 		}
 	} finally {
 		trigger.close();

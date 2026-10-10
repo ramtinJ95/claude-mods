@@ -26,12 +26,13 @@ One tool, `agents`. Called with `{}` it returns the available profiles, request 
 | `spawn` | Start a profiled Pi worker in a new tab (or `new_workspace`, or an existing `pane`) and give it a task |
 | `assign` | Give an existing Pi agent a task whose result is needed |
 | `send` | Deliver a message without waiting or watching |
+| `answer` | Answer a worker's Pi Ask question by its `ask_id`, then wait for the worker to settle |
 | `read` | The worker's latest reply, or its `visible` or `recent` terminal output |
 | `watch` / `unwatch` | Start or stop reporting an agent's work |
 
 `spawn` and `assign` wait for the worker's reply by default. With `blocking: false` they return at once, and the result arrives later as an `agent_report` message: added to a running turn, or starting a new turn when the session is idle. Watched agents also report questions, blockage and closed panes. Delegation keeps a watch until `unwatch` or the pane closes. Messages starting with `/` run as the worker's slash commands; `/quit` closes it.
 
-A worker's Pi Ask question is reported with its prompts. Answering it through the tool is not supported yet; answer it in the worker's pane.
+A worker's Pi Ask question is reported with its `ask_id` and prompts. `answer` takes one entry per prompt, in order: `selections` with exact choice labels, `other` for a custom answer, and an optional `comment`. It types the answers into the Ask, checking the dialog at every step and stopping rather than guessing, then reports whether Pi recorded them: `accepted`, `rejected` or `unknown`. Retrying an answer Pi already recorded sends no input. Asks that run in the background while the worker continues are not answered through the tool; they wait in the worker's pane.
 
 `/shepherdr` lists watched agents and restarts monitoring if it stopped. The status line shows how many are watched and working.
 

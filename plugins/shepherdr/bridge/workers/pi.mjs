@@ -5,8 +5,23 @@ import { access } from "node:fs/promises";
 import { request } from "../herdr.mjs";
 import { peerInboxPath, sendPeerMessage } from "../vendor/shepherdr-peer.mjs";
 import { readSessionView } from "../vendor/shepherdr-session.mjs";
+import { answerAsk, answersMatch } from "./pi-ask.mjs";
 
 export const kind = "pi";
+
+export function answer(agent, askId, answers) {
+	return answerAsk(agent, sessionPath(agent), askId, answers);
+}
+
+/** accepted | rejected | unknown once Pi recorded the Ask's outcome, else undefined. */
+export async function answerStatus(agent, askId, answers) {
+	const result = (await view(agent)).askResults?.[askId];
+	if (!result) return undefined;
+	if (result.status === "rejected") return "rejected";
+	return result.status === "accepted" && answersMatch(answers, result.responses)
+		? "accepted"
+		: "unknown";
+}
 
 export function sessionPath(agent) {
 	return agent.agent_session?.kind === "path"

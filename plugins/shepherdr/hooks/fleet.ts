@@ -51,7 +51,7 @@ export function reportText({ record, status, reply, ask }: Report): string {
       : status === 'failed'
         ? reply || 'The worker stopped with an error.'
         : status === 'question'
-          ? `${JSON.stringify(ask?.prompts ?? [])}\nThe question waits in the worker's pane; ask the user to answer it there.`
+          ? `${JSON.stringify({ ask_id: ask?.toolCallId, prompts: ask?.prompts ?? [] })}\nAnswer with answer and this ask_id, or let the user answer it in the worker's pane.`
           : status === 'blocked'
             ? 'Waiting on an approval or dialog. Inspect it with read source:"visible"; tell the user if it needs them.'
             : status === 'interrupted'
@@ -114,6 +114,25 @@ export class Fleet {
     }
     this.records.set(record.terminalId, record)
     this.changed()
+    return record
+  }
+
+  /** Keeps the watcher off a watched worker while the caller drives it; release reconciles it. */
+  hold(target: string): () => void {
+    const id = this.find(target)?.terminalId
+    if (!id) return () => {}
+    this.claims.add(id)
+    return () => {
+      this.claims.delete(id)
+      if (this.records.has(id)) this.reconcile(id)
+    }
+  }
+
+  /** Watches a worker resuming from an answered Ask; a later question with the same ID reports again. */
+  trackAnswer(answered: Pick<Delivery, 'agent' | 'record'>): Watched {
+    const record = this.track(answered)
+    delete record.reportedAskId
+    this.persist()
     return record
   }
 
@@ -293,6 +312,10 @@ export class Fleet {
     const identity = [record.paneId, record.sessionPath]
     this.observe(record, result)
     let report: Report | undefined
+    if (result.state !== 'working' && result.state !== 'idle') {
+      delete record.answeringAskId
+      delete record.answeringUntil
+    }
     switch (result.state) {
       case 'closed':
         this.records.delete(record.terminalId)
