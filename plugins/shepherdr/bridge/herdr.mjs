@@ -148,6 +148,36 @@ export async function snapshot() {
 	return result.snapshot;
 }
 
+/** The events that can change a worker's settlement; the watcher and blocking waits share them. */
+export function workerSubscriptions(paneIds) {
+	return [
+		...paneIds.map((paneId) => ({
+			type: "pane.agent_status_changed",
+			pane_id: paneId,
+		})),
+		{ type: "pane.closed" },
+		{ type: "pane.moved" },
+	];
+}
+
+/** The one agent shape the mod reads. */
+export function agentSummary(agent) {
+	const cwd = agent.foreground_cwd || agent.cwd;
+	return {
+		target: agent.pane_id,
+		...(agent.name ? { name: agent.name } : {}),
+		kind: agent.agent,
+		status: agent.agent_status,
+		terminal: agent.terminal_id,
+		...(cwd ? { cwd } : {}),
+	};
+}
+
+/** Pane IDs change on move; the terminal identifies the occupant. */
+export function agentByTerminal(agents, terminalId) {
+	return agents.find((agent) => agent.terminal_id === terminalId);
+}
+
 export async function currentPane() {
 	const paneId = process.env.HERDR_PANE_ID;
 	if (!paneId) throw new Error("HERDR_PANE_ID is unset");

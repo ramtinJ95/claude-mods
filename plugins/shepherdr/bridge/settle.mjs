@@ -3,10 +3,17 @@
 // A record is { terminalId, paneId, sessionPath?, seenInputId, answeringAskId? }.
 // seenInputId is the latest worker input the controller already accounted for;
 // a settled worker whose latest input differs has finished new work.
-// answeringAskId names an Ask the controller just answered: until
-// answeringUntil the worker staying blocked on it is its UI closing, not a new
-// question. Past that, a still-open Ask is reported again.
-import { getAgent, isHerdrErrorCode, snapshot, subscribe } from "./herdr.mjs";
+// answeringAskId names an Ask the controller answered: Herdr keeps the worker
+// blocked while that Ask's UI closes, which is not a new question.
+import {
+	agentByTerminal,
+	agentSummary,
+	getAgent,
+	isHerdrErrorCode,
+	snapshot,
+	subscribe,
+	workerSubscriptions,
+} from "./herdr.mjs";
 import { watchSessions } from "./vendor/shepherdr-session-watch.mjs";
 import { workerFor } from "./workers/index.mjs";
 
@@ -20,10 +27,7 @@ async function locate(record) {
 	} catch (error) {
 		if (!isHerdrErrorCode(error, "agent_not_found")) throw error;
 	}
-	// Moved panes get new IDs; the terminal still identifies the occupant.
-	return (await snapshot()).agents.find(
-		(agent) => agent.terminal_id === record.terminalId,
-	);
+	return agentByTerminal((await snapshot()).agents, record.terminalId);
 }
 
 /**
@@ -52,17 +56,18 @@ async function inspect(record) {
 		return { state: "working", agent };
 	const view = await worker.view(agent);
 	const inputId = view.input?.id ?? null;
-	if (
-		status === "blocked" &&
-		record.answeringAskId &&
-		(record.answeringUntil ?? 0) > Date.now() &&
-		(!view.ask || view.ask.toolCallId === record.answeringAskId)
-	)
-		return { state: "working", agent };
-	if (status === "blocked")
+	if (status === "blocked") {
+		const answered = record.answeringAskId;
+		if (
+			answered &&
+			(view.ask?.toolCallId === answered ||
+				(!view.ask && view.askResults?.[answered]))
+		)
+			return { state: "working", agent };
 		return view.ask
 			? { state: "question", agent, inputId, ask: view.ask }
 			: { state: "blocked", agent, inputId };
+	}
 	if (inputId === record.seenInputId) return { state: "idle", agent };
 	if (view.assistantAfterInput && view.assistant)
 		return { state: "done", agent, inputId, reply: view.assistant };
@@ -82,15 +87,7 @@ async function openTrigger(paneId, path) {
 		failure = error;
 		wake?.();
 	};
-	const unsubscribe = await subscribe(
-		[
-			{ type: "pane.agent_status_changed", pane_id: paneId },
-			{ type: "pane.closed" },
-			{ type: "pane.moved" },
-		],
-		fire,
-		fail,
-	);
+	const unsubscribe = await subscribe(workerSubscriptions([paneId]), fire, fail);
 	let unwatch = () => {};
 	try {
 		if (path) unwatch = watchSessions([path], fire, fail);
@@ -120,42 +117,34 @@ async function openTrigger(paneId, path) {
 	};
 }
 
-function finalResult(result) {
-	const { agent, ...rest } = result;
-	return {
-		...rest,
-		...(agent
-			? {
-					agent: {
-						pane_id: agent.pane_id,
-						terminal_id: agent.terminal_id,
-						status: agent.agent_status,
-						...(agent.name ? { name: agent.name } : {}),
-					},
-				}
-			: {}),
-	};
+function finalResult({ agent, ...rest }) {
+	return { ...rest, ...(agent ? { agent: agentSummary(agent) } : {}) };
 }
 
-/** Inspects once, waiting out the reply grace when a settled worker has not replied yet. */
-export async function check(record) {
+/**
+ * Inspects once, waiting out the reply grace when a settled worker has not
+ * replied yet. `trigger` is the caller's own, when it holds one.
+ */
+export async function check(record, trigger) {
 	let result = await inspect(record);
 	if (result.state !== "replying") return finalResult(result);
-	const trigger = await openTrigger(
-		result.agent.pane_id,
-		workerFor(result.agent).sessionPath(result.agent),
-	);
+	const own =
+		trigger ??
+		(await openTrigger(
+			result.agent.pane_id,
+			workerFor(result.agent).sessionPath(result.agent),
+		));
 	try {
 		const deadline = Date.now() + REPLY_GRACE_MS;
 		while (result.state === "replying") {
 			const remaining = deadline - Date.now();
 			if (remaining <= 0) return finalResult({ ...result, state: "done" });
-			await trigger.next(remaining);
+			await own.next(remaining);
 			result = await inspect(record);
 		}
 		return finalResult(result);
 	} finally {
-		trigger.close();
+		if (!trigger) own.close();
 	}
 }
 
@@ -166,19 +155,17 @@ export async function wait(record, timeoutMs) {
 	let trigger = await openTrigger(current.paneId, current.sessionPath);
 	try {
 		for (;;) {
-			const result = await check(current);
+			const result = await check(current, trigger);
 			if (result.state !== "working" && result.state !== "idle") return result;
-			if (result.agent && result.agent.pane_id !== trigger.paneId) {
-				current = { ...current, paneId: result.agent.pane_id };
+			if (result.agent && result.agent.target !== trigger.paneId) {
+				current = { ...current, paneId: result.agent.target };
 				trigger.close();
 				trigger = await openTrigger(current.paneId, current.sessionPath);
 				continue;
 			}
 			const remaining = deadline - Date.now();
-			if (remaining <= 0) return { ...result, timedOut: true };
-			// Re-check when an answered Ask's grace ends, even without an event.
-			const grace = (current.answeringUntil ?? 0) - Date.now();
-			await trigger.next(grace > 0 ? Math.min(remaining, grace + 50) : remaining);
+			if (remaining <= 0) return result;
+			await trigger.next(remaining);
 		}
 	} finally {
 		trigger.close();

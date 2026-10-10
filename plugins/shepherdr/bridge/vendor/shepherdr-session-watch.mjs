@@ -1,51 +1,43 @@
-// @howaboua/pi-shepherdr managed bridge
+// Transcript watcher, from pi-shepherdr.
 import { watch } from "node:fs";
-import { homedir } from "node:os";
-import { basename, dirname, join } from "node:path";
+import { basename, dirname } from "node:path";
 
 /**
  * Watch only named sessions' directories, including file replacement.
- * @param {string[]} paths
+ * @param {string[]} paths absolute transcript paths
  * @param {(path: string) => void} onChange
  * @param {(error: Error) => void} onError
- * @param {AbortSignal} [signal]
+ * @returns {() => void} close
  */
-export function watchSessions(paths, onChange, onError, signal) {
+export function watchSessions(paths, onChange, onError) {
 	/** @type {import('node:fs').FSWatcher[]} */
 	const watchers = [];
 	/** @type {Map<string, NodeJS.Timeout>} */
 	const timers = new Map();
-	/** @type {Map<string, Map<string, string>>} */
+	/** @type {Map<string, Set<string>>} */
 	const directories = new Map();
 	let closed = false;
 	const close = () => {
 		if (closed) return;
 		closed = true;
-		signal?.removeEventListener("abort", close);
 		for (const watcher of watchers) watcher.close();
 		for (const timer of timers.values()) clearTimeout(timer);
 		timers.clear();
 	};
 	try {
 		for (const path of new Set(paths)) {
-			const expanded =
-				path === "~"
-					? homedir()
-					: path.startsWith("~/")
-						? join(homedir(), path.slice(2))
-						: path;
-			const directory = dirname(expanded);
-			const files = directories.get(directory) ?? new Map();
-			files.set(basename(expanded), path);
-			directories.set(directory, files);
+			const files = directories.get(dirname(path)) ?? new Set();
+			files.add(path);
+			directories.set(dirname(path), files);
 		}
 		for (const [directory, files] of directories) {
 			const watcher = watch(
 				directory,
 				{ persistent: false },
 				(_event, filename) => {
-					for (const [name, path] of files) {
-						if (filename !== null && filename.toString() !== name) continue;
+					for (const path of files) {
+						if (filename !== null && filename.toString() !== basename(path))
+							continue;
 						if (timers.has(path) || closed) continue;
 						const timer = setTimeout(() => {
 							timers.delete(path);
@@ -62,8 +54,6 @@ export function watchSessions(paths, onChange, onError, signal) {
 			});
 			watchers.push(watcher);
 		}
-		signal?.addEventListener("abort", close, { once: true });
-		if (signal?.aborted) close();
 		return close;
 	} catch (error) {
 		close();

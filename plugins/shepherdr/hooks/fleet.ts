@@ -2,18 +2,26 @@
 //
 // Records are keyed by Herdr terminal ID (pane IDs change on move) and
 // persisted per Claude Code session. One watcher process streams changes; each
-// change is reconciled with a bridge `check`. A blocking tool call claims its
+// change is reconciled with a bridge `check`. A blocking tool call leases its
 // worker, so the watcher never reports what the call itself returns.
-import { type Ask, type Bridge, type CheckResult, type Delivery, type WatchLine, type WorkerRecord, call, watchWorkers } from './bridge'
+import {
+  type Ask,
+  type Bridge,
+  type CheckResult,
+  type Tracked,
+  type WatchLine,
+  type WorkerRecord,
+  call,
+  message,
+  watchWorkers,
+} from './bridge'
 
-/** The session's engine calls, bound by session.start since `$` cannot be passed. */
+/** The session's engine calls, bound in register.ts where `$` is reachable. */
 export type SessionIo = {
   bridge: Bridge
-  append: (text: string) => Promise<unknown>
   submit: (text: string) => Promise<unknown>
   status: (text: string | undefined) => void
   toast: (text: string) => void
-  after: (ms: number, fn: () => void) => void
   /** This session's saved watches; [] when none were saved. */
   readWatches: () => Promise<unknown>
   writeWatches: (records: readonly WorkerRecord[]) => Promise<void>
@@ -35,10 +43,6 @@ type Report = {
 
 // A blocking wait re-arms well inside the ten-minute process ceiling.
 const WAIT_SLICE_MS = 9 * 60_000
-
-function message(error: unknown): string {
-  return error instanceof Error ? error.message : String(error)
-}
 
 function attribute(value: string): string {
   return value.replaceAll('&', '&amp;').replaceAll('"', '&quot;').replaceAll('<', '&lt;')
@@ -64,16 +68,19 @@ export function reportText({ record, status, reply, ask }: Report): string {
 
 export class Fleet {
   private readonly records = new Map<string, Watched>()
-  private readonly claims = new Set<string>()
+  /** Blocking calls per terminal; the watcher leaves leased workers alone. */
+  private readonly leases = new Map<string, number>()
+  /** Ask IDs whose answers are being entered. */
+  private readonly answering = new Set<string>()
   private readonly checking = new Map<string, boolean>()
+  /** Reports waiting for the running turn's next tool boundary or its end. */
+  private outbox: string[] = []
+  /** A main turn is running, or a submitted report has yet to start one. */
+  private busy = false
   private loaded = false
   private stopWatch: (() => void) | undefined
   private watchKey = ''
   private monitorError: string | undefined
-  private running = false
-  private seq = 0
-  private loopTop = 0
-  private lastAppend = 0
 
   constructor(private readonly io: SessionIo) {}
 
@@ -91,56 +98,31 @@ export class Fleet {
     this.stopWatch = undefined
   }
 
-  list(): Watched[] {
-    return [...this.records.values()]
-  }
-
   find(target: string): Watched | undefined {
-    return this.list().find(record => record.paneId === target || record.name === target)
+    return [...this.records.values()].find(record => record.paneId === target || record.name === target)
   }
 
   isWatched(terminalId: string): boolean {
     return this.records.has(terminalId)
   }
 
-  /** Watches a delivered task, or a worker named by `watch` when task is absent. */
-  track(delivery: Pick<Delivery, 'agent' | 'record'>, task?: string): Watched {
-    const existing = this.records.get(delivery.record.terminalId)
+  /**
+   * Watches a delivered task, a worker named by `watch` (no task) or one
+   * resuming from an answered Ask (whose question may then report again).
+   */
+  track({ agent, record: delivered }: Tracked, task?: string): Watched {
+    const existing = this.records.get(delivered.terminalId)
+    const { reportedAskId, ...kept } = existing ?? {}
     const record: Watched = {
-      ...existing,
-      ...delivery.record,
+      ...kept,
+      ...delivered,
       ...(existing && !task ? { seenInputId: existing.seenInputId } : {}),
-      status: delivery.agent.status,
+      ...(reportedAskId && !delivered.answeringAskId ? { reportedAskId } : {}),
+      status: agent.status,
       ...(task ? { task } : {}),
     }
     this.records.set(record.terminalId, record)
     this.changed()
-    return record
-  }
-
-  /** Keeps the watcher off a watched worker while the caller drives it; release reconciles it. */
-  hold(target: string): () => void {
-    const id = this.find(target)?.terminalId
-    if (!id) return () => {}
-    this.claims.add(id)
-    return () => {
-      this.claims.delete(id)
-      if (this.records.has(id)) this.reconcile(id)
-    }
-  }
-
-  /** Watches a worker resuming from an answered Ask; a later question with the same ID reports again. */
-  trackAnswer(answered: Pick<Delivery, 'agent' | 'record'>): Watched {
-    const record = this.track(answered)
-    delete record.reportedAskId
-    this.persist()
-    // No event may follow if the worker stays blocked; re-check once the grace ends.
-    const id = record.terminalId
-    const grace = (record.answeringUntil ?? 0) - Date.now()
-    if (grace > 0)
-      this.io.after(grace + 100, () => {
-        if (this.records.has(id)) this.reconcile(id)
-      })
     return record
   }
 
@@ -149,76 +131,80 @@ export class Fleet {
     this.changed()
   }
 
-  turnStarted(): void {
-    this.running = true
-    this.loopTop = ++this.seq
+  /**
+   * Claims an Ask for answering. A watched worker is marked before any key is
+   * sent, so the watcher reads its closing Ask as work in progress. The
+   * returned function ends the claim and, unless the answer went in, unmarks.
+   */
+  beginAnswer(target: string, askId: string): (entered: boolean) => void {
+    if (this.answering.has(askId)) throw new Error(`An answer to ${askId} is already being entered; wait for its result`)
+    this.answering.add(askId)
+    const record = this.find(target)
+    if (record) {
+      record.answeringAskId = askId
+      this.persist()
+    }
+    return entered => {
+      this.answering.delete(askId)
+      if (!entered && record?.answeringAskId === askId) {
+        delete record.answeringAskId
+        this.persist()
+      }
+    }
   }
 
-  /** The next model request of a running turn starts after its tool results. */
-  toolFinished(): void {
-    if (this.running) this.loopTop = ++this.seq
+  turnStarted(): string[] {
+    this.busy = true
+    return this.drain()
   }
 
-  /** Never awaits the wake: a submitted prompt resolves only once its turn starts. */
+  /** Reports to append before the running turn's next model request. */
+  drain(): string[] {
+    const queued = this.outbox
+    this.outbox = []
+    return queued
+  }
+
+  /** Submits reports the turn did not reach; a submitted prompt resolves only once its turn starts. */
   turnEnded(): void {
-    this.running = false
-    const unread = this.lastAppend > this.loopTop
-    this.lastAppend = 0
-    if (unread)
-      this.io
-        .submit('Agent reports arrived while your last response was being written; act on any you have not handled.')
-        .catch(error => this.io.toast(`Shepherdr could not wake the session: ${message(error)}`))
+    this.busy = false
+    const queued = this.drain()
+    if (queued.length) this.submit(queued.join('\n\n'))
   }
 
-  async briefAfterCompaction(): Promise<void> {
-    const active = this.list().filter(record => record.task)
-    if (!active.length) return
-    const agents = active.map(record => ({
-      target: record.paneId,
-      ...(record.name ? { name: record.name } : {}),
-      status: record.status ?? 'unknown',
-      task: record.task,
-    }))
-    // Context for later requests, not a report: it never needs a wake.
-    await this.io.append(
-      `<active_agents>\n${JSON.stringify(agents)}\n</active_agents>\nThis work stays assigned and reports when it settles; do not delegate it again.`,
-    )
+  briefAfterCompaction(): string | undefined {
+    const agents = [...this.records.values()]
+      .filter(record => record.task)
+      .map(record => ({
+        target: record.paneId,
+        ...(record.name ? { name: record.name } : {}),
+        status: record.status ?? 'unknown',
+        task: record.task,
+      }))
+    if (!agents.length) return undefined
+    return `<active_agents>\n${JSON.stringify(agents)}\n</active_agents>\nThis work stays assigned and reports when it settles; do not delegate it again.`
   }
 
   /** Holds a tool call until the worker settles, through the calling hook's own Bridge. */
   async waitFor(bridge: Bridge, record: Watched, signal: AbortSignal): Promise<string> {
-    const id = record.terminalId
-    this.claims.add(id)
+    const release = this.lease(record.terminalId)
     try {
       for (;;) {
         signal.throwIfAborted()
-        const result = await call<CheckResult>(
-          bridge,
-          'wait',
-          { record, timeoutMs: WAIT_SLICE_MS },
-          WAIT_SLICE_MS + 60_000,
-        )
-        if (result.state === 'working' || result.state === 'idle') {
-          this.observe(record, result)
-          continue
-        }
+        const result = await call<CheckResult>(bridge, 'wait', { record, timeoutMs: WAIT_SLICE_MS }, WAIT_SLICE_MS + 60_000)
         const report = this.settle(record, result, true)
         if (report) return reportText(report)
       }
     } finally {
-      this.claims.delete(id)
-      if (this.records.has(id)) this.reconcile(id)
+      release()
     }
   }
 
   /** Restarts stopped monitoring; returns a summary for /shepherdr. */
   inspect(): string {
     const problem = this.monitorError
-    if (problem) {
-      this.watchKey = ''
-      this.ensureWatcher()
-    }
-    const records = this.list()
+    if (problem) this.ensureWatcher()
+    const records = [...this.records.values()]
     const lines = records.length
       ? records.map(
           record =>
@@ -226,6 +212,18 @@ export class Fleet {
         )
       : ['Shepherdr watches no agents.']
     return [...(problem ? [`Monitoring had stopped (${problem}); restarted.`] : []), ...lines].join('\n')
+  }
+
+  private lease(id: string): () => void {
+    this.leases.set(id, (this.leases.get(id) ?? 0) + 1)
+    return () => {
+      const left = (this.leases.get(id) ?? 1) - 1
+      if (left) this.leases.set(id, left)
+      else {
+        this.leases.delete(id)
+        if (this.records.has(id)) this.reconcile(id)
+      }
+    }
   }
 
   private changed(): void {
@@ -238,13 +236,13 @@ export class Fleet {
     // Never overwrite saved watches before they were read.
     if (!this.loaded) return
     this.io
-      .writeWatches(this.list())
+      .writeWatches([...this.records.values()])
       .catch(error => this.io.toast(`Shepherdr could not save its watches: ${message(error)}`))
   }
 
   private ensureWatcher(): void {
-    const records = this.list()
-    const key = JSON.stringify(records.map(({ paneId, sessionPath }) => [paneId, sessionPath ?? null]).sort())
+    const records = [...this.records.values()]
+    const key = JSON.stringify(records.map(({ terminalId, sessionPath }) => [terminalId, sessionPath ?? null]).sort())
     if (key === this.watchKey && (this.stopWatch || !records.length)) return
     this.stop()
     this.watchKey = key
@@ -257,7 +255,6 @@ export class Fleet {
       error => {
         if (this.stopWatch !== stop) return
         this.stopWatch = undefined
-        this.watchKey = ''
         this.monitorError = error
         this.updateStatus()
       },
@@ -270,16 +267,27 @@ export class Fleet {
       for (const id of this.records.keys()) this.reconcile(id)
       return
     }
-    const records = this.list()
-    // A working worker writes its transcript continuously; Herdr's status
-    // event marks when it settles, so only settled workers' writes matter.
-    const matched =
-      line.type === 'session'
-        ? records.filter(record => record.sessionPath === line.path && record.status !== 'working')
-        : records.filter(record => record.paneId === line.pane)
-    // A moved pane reports its new ID, which no record knows yet.
-    const moved = line.type === 'event' && line.event === 'pane.moved'
-    for (const record of matched.length || !moved ? matched : records) this.reconcile(record.terminalId)
+    const records = [...this.records.values()]
+    if (line.type === 'session') {
+      // A working worker writes its transcript continuously; Herdr's status
+      // event marks when it settles, so only settled workers' writes matter.
+      for (const record of records)
+        if (record.sessionPath === line.path && record.status !== 'working') this.reconcile(record.terminalId)
+      return
+    }
+    // Moves and closes name the pane by the ID the record knows.
+    const record = records.find(candidate => candidate.paneId === line.pane)
+    if (!record) return
+    if (line.status === 'working' || line.status === 'unknown') {
+      // Starting work settles nothing; leaving `blocked` ends an answered Ask.
+      record.status = line.status
+      record.blockedReported = false
+      delete record.answeringAskId
+      this.persist()
+      this.updateStatus()
+      return
+    }
+    this.reconcile(record.terminalId)
   }
 
   private reconcile(id: string): void {
@@ -287,17 +295,16 @@ export class Fleet {
       this.checking.set(id, true)
       return
     }
-    this.checking.set(id, false)
     void (async () => {
       try {
         do {
           this.checking.set(id, false)
           const record = this.records.get(id)
-          if (!record || this.claims.has(id)) break
+          if (!record || this.leases.has(id)) break
           const result = await call<CheckResult>(this.io.bridge, 'check', { record }, 30_000)
-          if (this.claims.has(id) || this.records.get(id) !== record) continue
+          if (this.leases.has(id) || this.records.get(id) !== record) continue
           const report = this.settle(record, result, false)
-          if (report) await this.deliver(reportText(report))
+          if (report) this.deliver(reportText(report))
         } while (this.checking.get(id))
       } catch (error) {
         this.io.toast(`Shepherdr could not check a worker: ${message(error)}`)
@@ -307,23 +314,20 @@ export class Fleet {
     })()
   }
 
-  private observe(record: Watched, result: CheckResult): void {
-    if (!result.agent) return
-    record.paneId = result.agent.pane_id
-    record.status = result.agent.status
-    if (result.agent.name) record.name = result.agent.name
-  }
-
-  /** Applies a check to its record; returns what the controller has not heard yet. */
+  /**
+   * Applies a check to its record; returns what the controller has not heard
+   * yet. `force` reports a settlement even if it was reported before.
+   */
   private settle(record: Watched, result: CheckResult, force: boolean): Report | undefined {
     const before = JSON.stringify(record)
     const identity = [record.paneId, record.sessionPath]
-    this.observe(record, result)
-    let report: Report | undefined
-    if (result.state !== 'working' && result.state !== 'idle') {
-      delete record.answeringAskId
-      delete record.answeringUntil
+    if (result.agent) {
+      record.paneId = result.agent.target
+      record.status = result.agent.status
+      if (result.agent.name) record.name = result.agent.name
+      if (result.agent.status !== 'blocked') delete record.answeringAskId
     }
+    let report: Report | undefined
     switch (result.state) {
       case 'closed':
         this.records.delete(record.terminalId)
@@ -333,6 +337,7 @@ export class Fleet {
         record.sessionPath = result.sessionPath
         record.seenInputId = result.inputId ?? null
         delete record.reportedAskId
+        delete record.answeringAskId
         record.blockedReported = false
         if (record.task || force) report = { record, status: 'interrupted' }
         delete record.task
@@ -374,19 +379,22 @@ export class Fleet {
     return report
   }
 
-  private async append(text: string): Promise<void> {
-    await this.io.append(text)
-    this.lastAppend = ++this.seq
+  /** Queues for the running turn; otherwise starts a turn with the report as its prompt. */
+  private deliver(text: string): void {
+    if (this.busy) this.outbox.push(text)
+    else this.submit(text)
   }
 
-  /** Steers a running turn; otherwise wakes the session with a turn of its own. */
-  private async deliver(text: string): Promise<void> {
-    if (this.running) await this.append(text)
-    else await this.io.submit(text)
+  private submit(text: string): void {
+    this.busy = true
+    this.io.submit(text).catch(error => {
+      this.busy = false
+      this.io.toast(`Shepherdr could not deliver an agent report: ${message(error)}`)
+    })
   }
 
   private updateStatus(): void {
-    const records = this.list()
+    const records = [...this.records.values()]
     if (this.monitorError) this.io.status(`shepherdr: monitoring stopped (${this.monitorError}); run /shepherdr`)
     else if (!records.length) this.io.status(undefined)
     else {

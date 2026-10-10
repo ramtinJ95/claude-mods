@@ -28,12 +28,13 @@ async function isDirectory(path) {
 	}
 }
 
-export async function profilesSource() {
-	const shared = join(
-		process.env.PI_CODING_AGENT_DIR ?? join(homedir(), ".pi", "agent"),
-		"shepherdr",
-		"profiles",
-	);
+/** Pi's agent directory, where pi-shepherdr profiles and Pi keybindings live. */
+export function piAgentDir() {
+	return process.env.PI_CODING_AGENT_DIR ?? join(homedir(), ".pi", "agent");
+}
+
+async function profilesSource() {
+	const shared = join(piAgentDir(), "shepherdr", "profiles");
 	if (await isDirectory(shared))
 		return { directory: shared, source: "pi-shepherdr" };
 	return {
@@ -112,7 +113,7 @@ export async function listProfiles() {
 			...(profile.blocking === undefined ? {} : { blocking: profile.blocking }),
 		});
 	}
-	return { source, directory, profiles };
+	return { source, profiles };
 }
 
 export function profileArgs(profile) {

@@ -1,36 +1,29 @@
-// @howaboua/pi-shepherdr managed bridge
+// Pi transcript reader, from pi-shepherdr. Scans back from EOF along the
+// active parentId chain for the latest input, reply and Ask state.
 
 import { open, stat } from "node:fs/promises";
-import { homedir } from "node:os";
-import { join } from "node:path";
 
 const READ_CHUNK_BYTES = 64 * 1024;
 const sessionCache = new Map();
 
-function expandHome(path) {
-	return path === "~"
-		? homedir()
-		: path.startsWith("~/")
-			? join(homedir(), path.slice(2))
-			: path;
+function textOf(message) {
+	if (typeof message.content === "string") return message.content;
+	if (!Array.isArray(message.content)) return "";
+	return message.content
+		.filter(
+			(part) =>
+				part &&
+				typeof part === "object" &&
+				part.type === "text" &&
+				typeof part.text === "string",
+		)
+		.map((part) => part.text)
+		.join("");
 }
 
 function assistantFromMessage(id, message) {
 	if (message.role !== "assistant") return undefined;
-	const text = [];
-	if (typeof message.content === "string") text.push(message.content);
-	else if (Array.isArray(message.content)) {
-		for (const part of message.content) {
-			if (
-				part &&
-				typeof part === "object" &&
-				part.type === "text" &&
-				typeof part.text === "string"
-			)
-				text.push(part.text);
-		}
-	}
-	const joined = text.join("");
+	const joined = textOf(message);
 	const stopReason =
 		typeof message.stopReason === "string" ? message.stopReason : undefined;
 	if (!joined && stopReason !== "error") return undefined;
@@ -43,21 +36,31 @@ function assistantFromMessage(id, message) {
 
 function inputFromMessage(id, message) {
 	if (message.role !== "user") return undefined;
-	const text = [];
-	if (typeof message.content === "string") text.push(message.content);
-	else if (Array.isArray(message.content)) {
-		for (const part of message.content) {
-			if (
-				part &&
-				typeof part === "object" &&
-				part.type === "text" &&
-				typeof part.text === "string"
-			)
-				text.push(part.text);
-		}
-	}
-	const joined = text.join("");
+	const joined = textOf(message);
 	return joined ? { id, text: joined } : undefined;
+}
+
+/** Pi Code Mode runs tools inside an exec cell and records each call as a trace. */
+function traceAskResults(message) {
+	if (message.role !== "toolResult" || !Array.isArray(message.details?.traces))
+		return [];
+	return message.details.traces
+		.filter(
+			(trace) =>
+				trace?.name === "ask" &&
+				typeof trace.id === "string" &&
+				(trace.status === "done" || trace.status === "error"),
+		)
+		.map((trace) =>
+			askResult({
+				role: "toolResult",
+				toolName: "ask",
+				toolCallId: trace.id,
+				isError: trace.status === "error",
+				details: trace.result?.details,
+			}),
+		)
+		.filter(Boolean);
 }
 
 function askChoice(value) {
@@ -241,8 +244,11 @@ async function sessionView(path, size) {
 		}
 		const message = entry.message;
 		if (message && typeof message === "object") {
-			const result = askResult(message);
-			if (result && !askResults.has(result[0])) askResults.set(...result);
+			for (const result of [askResult(message), ...traceAskResults(message)]) {
+				if (!result) continue;
+				resolved.add(result[0]);
+				if (!askResults.has(result[0])) askResults.set(...result);
+			}
 			if (
 				(message.role === "toolResult" || message.role === "tool") &&
 				message.details?.pending !== true &&
@@ -303,19 +309,18 @@ async function sessionView(path, size) {
 
 export async function readSessionView(path) {
 	if (!path) return {};
-	const expanded = expandHome(path);
 	let metadata;
 	try {
-		metadata = await stat(expanded);
+		metadata = await stat(path);
 	} catch (error) {
 		if (error.code === "ENOENT") return {};
 		throw error;
 	}
-	const cached = sessionCache.get(expanded);
+	const cached = sessionCache.get(path);
 	if (cached?.size === metadata.size && cached.mtimeMs === metadata.mtimeMs)
 		return cached.result;
-	const result = await sessionView(expanded, metadata.size);
-	sessionCache.set(expanded, {
+	const result = await sessionView(path, metadata.size);
+	sessionCache.set(path, {
 		size: metadata.size,
 		mtimeMs: metadata.mtimeMs,
 		result,

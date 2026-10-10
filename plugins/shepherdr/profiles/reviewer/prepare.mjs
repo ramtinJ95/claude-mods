@@ -140,16 +140,13 @@ function safeStatus(value) {
 }
 
 export function prepare(input) {
-	if (input.local === false) {
+	if (
+		input.local === false ||
+		runGit(input.cwd, ["rev-parse", "--show-toplevel"]).code !== 0
+	)
 		return input.base
 			? `Review base: ${input.base}\n\n${input.message}`
 			: input.message;
-	}
-	if (runGit(input.cwd, ["rev-parse", "--show-toplevel"]).code !== 0) {
-		return input.base
-			? `Review base: ${input.base}\n\n${input.message}`
-			: input.message;
-	}
 	const review = collectReviewContext(input.cwd, input.base);
 	return [
 		"Review context:",

@@ -1,17 +1,40 @@
-import type { Register } from 'claude-code'
+import type { EngineInterface, Register } from 'claude-code'
 
-import { type AgentSummary, type AnswerResult, type Bridge, type Delivery, call } from './bridge'
+import { type AgentSummary, type AnswerResult, type Bridge, type Delivery, type Tracked, call, message } from './bridge'
 import { type AgentsRequest, type ProfileSummary, TOOL_SPEC, helpText, parseRequest } from './contract'
-import { Fleet } from './fleet'
+import { Fleet, type SessionIo } from './fleet'
 
 const COMMAND = 'shepherdr'
 
 let fleet: Fleet | undefined
-const answering = new Set<string>()
 
 function requireFleet(): Fleet {
   if (!fleet) throw new Error('Shepherdr is still starting; retry')
   return fleet
+}
+
+/** A hook's own process calls: a blocking wait pauses only that hook's budget. */
+function bridgeOf($: EngineInterface): Bridge {
+  return {
+    root: $.plugin.root,
+    run: (argv, init) => $.process.run(argv, init),
+    spawn: request => $.process.spawn(request),
+  }
+}
+
+function sessionIo($: EngineInterface, file: string): SessionIo {
+  return {
+    bridge: bridgeOf($),
+    submit: text => $.prompt.submit({ text }),
+    status: text => $.ui.status(text),
+    toast: text => $.ui.toast(text),
+    readWatches: async () => ((await $.fs.exists(file)) ? JSON.parse(await $.fs.read(file)) : []),
+    writeWatches: records => $.fs.write(file, JSON.stringify(records)),
+  }
+}
+
+async function appendAll($: EngineInterface, texts: readonly string[]): Promise<void> {
+  for (const text of texts) await $.session.append({ message: { type: 'user', content: [{ type: 'text', text }] } })
 }
 
 function dispatchWork(
@@ -27,8 +50,8 @@ function dispatchWork(
     ...(delivery.agent.name ? { name: delivery.agent.name } : {}),
     delivery: delivery.delivery,
   }
-  if (delivery.command) return JSON.stringify({ ...summary, commandSubmitted: true })
-  const record = current.track(delivery, task)
+  if (delivery.command || !delivery.record) return JSON.stringify({ ...summary, commandSubmitted: true })
+  const record = current.track({ agent: delivery.agent, record: delivery.record }, task)
   if (!blocking) return JSON.stringify({ ...summary, status: 'working' })
   return current.waitFor(bridge, record, signal)
 }
@@ -53,44 +76,30 @@ async function handle(bridge: Bridge, cwd: string, request: AgentsRequest, signa
       return dispatchWork(bridge, current, delivery, request.message!, blocking, signal)
     }
     case 'assign': {
-      const delivery = await call<Delivery>(bridge, 'deliver', {
-        target: request.target,
-        message: request.message,
-        kind: 'task',
-      })
+      const params = { target: request.target, message: request.message, kind: 'task' }
+      const delivery = await call<Delivery>(bridge, 'deliver', params)
       return dispatchWork(bridge, current, delivery, request.message!, request.blocking ?? true, signal)
     }
     case 'answer': {
       const askId = request.ask_id!
-      // Two callers driving one Ask UI would toggle each other's selections.
-      if (answering.has(askId)) throw new Error(`An answer to ${askId} is already being entered; wait for its result`)
-      answering.add(askId)
-      const release = current.hold(request.target!)
+      const end = current.beginAnswer(request.target!, askId)
+      let entered = false
       try {
         const params = { target: request.target, ask_id: askId, answers: request.answers }
         const answered = await call<AnswerResult>(bridge, 'answer', params)
-        const result = { target: answered.agent.target, ask_id: askId }
-        if (!answered.record) return JSON.stringify({ ...result, status: answered.status, input_sent: false })
-        const record = current.trackAnswer(answered)
-        if (request.blocking === false) return JSON.stringify({ ...result, status: 'submitted' })
-        const report = await current.waitFor(bridge, record, signal)
-        // The settlement stands even when the worker has since closed or moved.
-        const status = await call<{ status: string }>(bridge, 'answer_status', { ...params, target: record.paneId }).then(
-          reply => reply.status,
-          () => 'unknown',
-        )
-        return `${JSON.stringify({ ...result, status })}\n${report}`
+        entered = true
+        const result = { target: answered.agent.target, ask_id: askId, status: answered.status }
+        if (!answered.record) return JSON.stringify({ ...result, input_sent: false })
+        const record = current.track({ agent: answered.agent, record: answered.record })
+        if (request.blocking === false) return JSON.stringify(result)
+        return `${JSON.stringify(result)}\n${await current.waitFor(bridge, record, signal)}`
       } finally {
-        release()
-        answering.delete(askId)
+        end(entered)
       }
     }
     case 'send': {
-      const delivery = await call<Delivery>(bridge, 'deliver', {
-        target: request.target,
-        message: request.message,
-        kind: 'message',
-      })
+      const params = { target: request.target, message: request.message, kind: 'message' }
+      const delivery = await call<Delivery>(bridge, 'deliver', params)
       return JSON.stringify({
         target: delivery.agent.target,
         delivery: delivery.delivery,
@@ -102,8 +111,7 @@ async function handle(bridge: Bridge, cwd: string, request: AgentsRequest, signa
         await call(bridge, 'read', { target: request.target, source: request.source, lines: request.lines }),
       )
     case 'watch': {
-      const delivery = await call<Pick<Delivery, 'agent' | 'record'>>(bridge, 'watch', { target: request.target })
-      const record = current.track(delivery)
+      const record = current.track(await call<Tracked>(bridge, 'watch', { target: request.target }))
       return JSON.stringify({ target: record.paneId, ...(record.name ? { name: record.name } : {}), watching: true })
     }
     case 'unwatch': {
@@ -117,33 +125,20 @@ async function handle(bridge: Bridge, cwd: string, request: AgentsRequest, signa
 
 export const register: Register = on => {
   on('session.start', async ($, e, next) => {
-    await $.tool.register(TOOL_SPEC)
-    await $.command.register({ name: COMMAND, description: 'Show Shepherdr agents and restart stopped monitoring' })
+    await Promise.all([
+      $.tool.register(TOOL_SPEC),
+      $.command.register({ name: COMMAND, description: 'Show Shepherdr agents and restart stopped monitoring' }),
+    ])
     const started = await next(e)
     fleet?.stop()
-    const dataHome = (await $.env.get('XDG_DATA_HOME')) || `${await $.env.get('HOME')}/.local/share`
-    const file = `${dataHome}/claude-shepherdr/sessions/${await $.session.id()}.json`
-    fleet = new Fleet({
-      bridge: {
-        root: $.plugin.root,
-        run: (argv, init) => $.process.run(argv, init),
-        spawn: request => $.process.spawn(request),
-      },
-      append: text => $.session.append({ message: { type: 'user', content: [{ type: 'text', text }] } }),
-      submit: text => $.prompt.submit({ text }),
-      status: text => $.ui.status(text),
-      toast: text => $.ui.toast(text),
-      after: (ms, fn) => {
-        $.clock.after(ms, fn)
-      },
-      readWatches: async () => ((await $.fs.exists(file)) ? JSON.parse(await $.fs.read(file)) : []),
-      writeWatches: records => $.fs.write(file, JSON.stringify(records)),
-    })
+    const [xdg, home, sessionId] = await Promise.all([$.env.get('XDG_DATA_HOME'), $.env.get('HOME'), $.session.id()])
+    const file = `${xdg || `${home}/.local/share`}/claude-shepherdr/sessions/${sessionId}.json`
+    fleet = new Fleet(sessionIo($, file))
     try {
       await fleet.load()
     } catch (error) {
       $.ui.toast(
-        `Shepherdr could not read its saved watches (${error instanceof Error ? error.message : String(error)}); fix or remove ${file}. New watches are not saved until then.`,
+        `Shepherdr could not read its saved watches (${message(error)}); fix or remove ${file}. New watches are not saved until then.`,
       )
     }
     return started
@@ -154,33 +149,27 @@ export const register: Register = on => {
     return next(e)
   })
 
-  // Bridge calls go through this hook's own $, so a blocking wait does not
-  // count against the hook's budget.
   on('tool.call', { tool: 'mcp__shepherdr__agents' }, async ($, e, next) => {
     try {
-      const bridge: Bridge = {
-        root: $.plugin.root,
-        run: (argv, init) => $.process.run(argv, init),
-        spawn: request => $.process.spawn(request),
-      }
       const request = parseRequest(e as unknown as Record<string, unknown>)
       const cwd = request.action === 'spawn' ? await $.session.cwd() : ''
-      return { result: await handle(bridge, cwd, request, next.signal) }
+      return { result: await handle(bridgeOf($), cwd, request, next.signal) }
     } catch (error) {
       if (next.signal.aborted) return { deny: 'Cancelled; the worker keeps running and reports when it settles.' }
-      return { deny: error instanceof Error ? error.message : String(error) }
+      return { deny: message(error) }
     }
   }).catch(() => ({ deny: 'Shepherdr failed to handle the call; retry or call agents with {} for help.' }))
 
-  // Observes every tool; its failure must never change another tool's call.
+  // Observes every tool: reports queued during the call join the next model
+  // request. Its failure must never change another tool's call.
   on('tool.call', async ($, e, next) => {
     const ran = await next(e)
-    if (!e.agentId) fleet?.toolFinished()
+    if (!e.agentId && fleet) await appendAll($, fleet.drain())
     return ran
   }).catch(($, e, next) => next(e))
 
-  on('turn.start', ($, e, next) => {
-    fleet?.turnStarted()
+  on('turn.start', async ($, e, next) => {
+    if (fleet) await appendAll($, fleet.turnStarted())
     return next(e)
   })
 
@@ -193,7 +182,8 @@ export const register: Register = on => {
 
   on('session.compact', async ($, e, next) => {
     const compacted = await next(e)
-    await fleet?.briefAfterCompaction()
+    const brief = fleet?.briefAfterCompaction()
+    if (brief) await appendAll($, [brief])
     return compacted
   }).catch(($, e, next) => next(e))
 

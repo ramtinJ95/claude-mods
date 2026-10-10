@@ -2,10 +2,15 @@
 // src/ask-answer.ts. Every step re-verifies the agent and the Ask frame and
 // stops rather than guessing; it never retries input.
 import { readFile } from "node:fs/promises";
-import { homedir } from "node:os";
 import { join } from "node:path";
+import { setTimeout as sleep } from "node:timers/promises";
 import { getAgent, request } from "../herdr.mjs";
+import { piAgentDir } from "../profiles.mjs";
 import { readSessionView } from "../vendor/shepherdr-session.mjs";
+import { watchSessions } from "../vendor/shepherdr-session-watch.mjs";
+
+// Pi records the Ask's outcome in its transcript right after the final key.
+const RECORD_TIMEOUT_MS = 10_000;
 
 const REPHRASE_REQUEST_RESPONSE =
 	"User asked for rephrase, split, or follow-up.";
@@ -99,11 +104,9 @@ function answerPlan(prompts, answers, controls) {
 }
 
 async function readKeybindings() {
-	const directory =
-		process.env.PI_CODING_AGENT_DIR ?? join(homedir(), ".pi", "agent");
 	try {
 		const value = JSON.parse(
-			await readFile(join(directory, "keybindings.json"), "utf8"),
+			await readFile(join(piAgentDir(), "keybindings.json"), "utf8"),
 		);
 		return typeof value === "object" && value !== null ? value : {};
 	} catch {
@@ -211,8 +214,8 @@ async function sendInput(agent, step) {
 }
 
 /**
- * Enters and submits answers to the blocking Ask `askId`. Resolves once the
- * final submission was sent; whether Pi accepted it shows in askResults.
+ * Enters and submits answers to the blocking Ask `askId`. Resolves once Pi
+ * recorded its outcome in askResults.
  */
 export async function answerAsk(agent, sessionPath, askId, answers) {
 	const view = await readSessionView(sessionPath);
@@ -255,7 +258,7 @@ export async function answerAsk(agent, sessionPath, askId, answers) {
 	for (const step of plan) {
 		await requireLiveAsk();
 		await sendInput(agent, step);
-		await new Promise((resolve) => setTimeout(resolve, 35));
+		await sleep(35);
 		await requireLiveAsk();
 		if (!inspectAskScreen(await screen(agent.pane_id), ask).recognized)
 			throw new Error(
@@ -268,4 +271,47 @@ export async function answerAsk(agent, sessionPath, askId, answers) {
 			"ask UI is not ready to submit; stopped without retrying input",
 		);
 	await sendInput(agent, final);
+	await recorded(sessionPath, askId);
+}
+
+/** Waits until Pi records the Ask's outcome, so a final key that did not take fails here. */
+async function recorded(sessionPath, askId) {
+	const deadline = Date.now() + RECORD_TIMEOUT_MS;
+	let dirty = false;
+	let failure;
+	let wake;
+	const close = watchSessions(
+		[sessionPath],
+		() => {
+			dirty = true;
+			wake?.();
+		},
+		(error) => {
+			failure = error;
+			wake?.();
+		},
+	);
+	try {
+		for (;;) {
+			if ((await readSessionView(sessionPath)).askResults?.[askId]) return;
+			const remaining = deadline - Date.now();
+			if (remaining <= 0)
+				throw new Error(
+					"The answers were submitted, but Pi recorded no result; inspect the worker with read before retrying",
+				);
+			if (!dirty && !failure)
+				await new Promise((resolve) => {
+					const timer = setTimeout(resolve, remaining);
+					wake = () => {
+						clearTimeout(timer);
+						resolve();
+					};
+				});
+			wake = undefined;
+			dirty = false;
+			if (failure) throw failure;
+		}
+	} finally {
+		close();
+	}
 }

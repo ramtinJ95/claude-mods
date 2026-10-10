@@ -1,18 +1,12 @@
 // Starts a profiled Pi worker in a new Herdr tab, workspace or existing pane.
 import { stat } from "node:fs/promises";
 import { resolve } from "node:path";
-import {
-	currentPane,
-	getAgent,
-	isHerdrErrorCode,
-	request,
-	snapshot,
-} from "./herdr.mjs";
+import { setTimeout as sleep } from "node:timers/promises";
+import { getAgent, isHerdrErrorCode, request } from "./herdr.mjs";
 import { profileArgs } from "./profiles.mjs";
 import { workerFor } from "./workers/index.mjs";
 
 const AGENT_NAME = /^[a-z][a-z0-9_-]{0,31}$/;
-const sleep = (ms) => new Promise((done) => setTimeout(done, ms));
 
 function slugify(value) {
 	const slug = value
@@ -25,10 +19,8 @@ function slugify(value) {
 	return named.slice(0, 32).replace(/-+$/u, "") || "agent";
 }
 
-async function allocateName(label, requested) {
-	const names = new Set(
-		(await snapshot()).agents.map((agent) => agent.name).filter(Boolean),
-	);
+function allocateName(agents, label, requested) {
+	const names = new Set(agents.map((agent) => agent.name).filter(Boolean));
 	if (requested) {
 		if (!AGENT_NAME.test(requested))
 			throw new Error("name must match [a-z][a-z0-9_-]{0,31}");
@@ -66,19 +58,13 @@ function resolveWorkspace(workspaces, target) {
 	);
 }
 
-async function createLocation(params, cwd, label) {
+async function createLocation(params, cwd, label, { pane, snap }) {
 	const placement = params.placement ?? "new_tab";
-	if (placement === "pane") {
-		if (!params.pane) throw new Error("pane is required for placement=pane");
-		if (params.cwd)
-			throw new Error("cwd cannot change an existing pane; omit cwd");
-		return { paneId: params.pane };
-	}
+	if (placement === "pane") return { paneId: params.pane };
 	if (placement === "new_tab") {
 		const workspaceId = params.workspace
-			? resolveWorkspace((await snapshot()).workspaces, params.workspace)
-					.workspace_id
-			: (await currentPane()).workspace_id;
+			? resolveWorkspace(snap.workspaces, params.workspace).workspace_id
+			: pane.workspace_id;
 		const created = await request("tab.create", {
 			workspace_id: workspaceId,
 			cwd,
@@ -164,28 +150,30 @@ export async function spawnDirectory(params, fallbackCwd) {
 	if (params.placement !== "pane")
 		return directory(resolve(fallbackCwd, params.cwd?.trim() || "."));
 	if (!params.pane) throw new Error("pane is required for placement=pane");
+	if (params.cwd)
+		throw new Error("cwd cannot change an existing pane; omit cwd");
 	const { pane } = await request("pane.get", { pane_id: params.pane });
 	return pane.foreground_cwd || pane.cwd || fallbackCwd;
 }
 
-export async function spawnAgent(profile, params, cwd) {
+/** `context` is the controller's pane and a Herdr snapshot taken for this spawn. */
+export async function spawnAgent(profile, params, cwd, context) {
 	const label = params.label.trim();
-	const name = await allocateName(label, params.name);
+	const name = allocateName(context.snap.agents, label, params.name);
 	const args = ["--name", label, ...profileArgs(profile)];
 	if (args.includes("--no-session"))
 		throw new Error(
 			"spawn requires a persistent Pi session; remove --no-session from the profile",
 		);
-	const location = await createLocation(params, cwd, label);
+	const location = await createLocation(params, cwd, label, context);
 	try {
-		const agent = await startWhenShellReady({
+		return await startWhenShellReady({
 			name,
 			kind: "pi",
 			pane_id: location.paneId,
 			args,
 			timeout_ms: 30_000,
 		});
-		return agent;
 	} catch (error) {
 		return rollback(location.cleanup, error);
 	}

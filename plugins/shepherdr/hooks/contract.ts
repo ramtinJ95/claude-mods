@@ -21,6 +21,18 @@ const FIELDS: Record<Action, readonly string[]> = {
   unwatch: ['target'],
 }
 
+const REQUIRED: Record<Action, readonly string[]> = {
+  help: [],
+  list: [],
+  spawn: ['agent_type', 'label', 'message'],
+  send: ['target', 'message'],
+  assign: ['target', 'message'],
+  answer: ['target', 'ask_id', 'answers'],
+  read: ['target'],
+  watch: ['target'],
+  unwatch: ['target'],
+}
+
 export const TOOL_SPEC = {
   name: TOOL_NAME,
   description:
@@ -102,17 +114,11 @@ export function parseRequest(input: Record<string, unknown>): AgentsRequest {
         ? 'send is message-only; omit blocking. Use assign to delegate work'
         : `unknown ${action} field(s): ${unknown.join(', ')}`,
     )
-  for (const field of ['target', 'message', 'agent_type', 'label', 'ask_id'] as const) {
-    const needed =
-      (field === 'target' && !['help', 'list', 'spawn'].includes(action)) ||
-      (field === 'message' && ['spawn', 'send', 'assign'].includes(action)) ||
-      ((field === 'agent_type' || field === 'label') && action === 'spawn') ||
-      (field === 'ask_id' && action === 'answer')
+  for (const field of REQUIRED[action as Action]) {
     const value = request[field]
-    if (needed && (typeof value !== 'string' || !value.trim()))
-      throw new Error(`${field} is required for ${action}`)
+    const present = field === 'answers' ? Array.isArray(value) : typeof value === 'string' && value.trim() !== ''
+    if (!present) throw new Error(`${field} is required for ${action}`)
   }
-  if (action === 'answer' && !Array.isArray(request['answers'])) throw new Error('answers is required for answer')
   return { ...request, action } as AgentsRequest
 }
 

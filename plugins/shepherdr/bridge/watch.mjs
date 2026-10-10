@@ -1,7 +1,12 @@
 // Session-lifetime watcher: streams one JSON line per worker change so the
 // mod can reconcile it with `cli.mjs check`. Input on stdin:
 // { targets: [{ terminalId, sessionPath? }] }. Exits nonzero when monitoring breaks.
-import { snapshot, subscribe } from "./herdr.mjs";
+import {
+	agentByTerminal,
+	snapshot,
+	subscribe,
+	workerSubscriptions,
+} from "./herdr.mjs";
 import { watchSessions } from "./vendor/shepherdr-session-watch.mjs";
 
 const emit = (value) => process.stdout.write(`${JSON.stringify(value)}\n`);
@@ -21,21 +26,22 @@ try {
 	// pane; the mod's reconciliation after ready reports the closed ones.
 	const { agents } = await snapshot();
 	const panes = targets
-		.map(
-			({ terminalId }) =>
-				agents.find((agent) => agent.terminal_id === terminalId)?.pane_id,
-		)
+		.map(({ terminalId }) => agentByTerminal(agents, terminalId)?.pane_id)
 		.filter(Boolean);
 	await subscribe(
-		[
-			...panes.map((paneId) => ({
-				type: "pane.agent_status_changed",
-				pane_id: paneId,
-			})),
-			{ type: "pane.closed" },
-			{ type: "pane.moved" },
-		],
-		(event, data) => emit({ type: "event", event, pane: data.pane_id ?? null }),
+		workerSubscriptions(panes),
+		(event, data) =>
+			emit({
+				type: "event",
+				event,
+				// A move names the pane by the ID it had before.
+				pane:
+					(event === "pane.moved" ? data.previous_pane_id : data.pane_id) ??
+					null,
+				...(typeof data.agent_status === "string"
+					? { status: data.agent_status }
+					: {}),
+			}),
 		fail,
 	);
 	watchSessions(

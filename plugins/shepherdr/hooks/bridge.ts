@@ -1,6 +1,6 @@
 // The mod has no Node APIs; Herdr sockets, transcripts and processes go
-// through the Node helpers under ../bridge. Hooks may not pass `$` along, so
-// each hook hands its own process calls in as a Bridge.
+// through the Node helpers under ../bridge. A Bridge carries one hook's own
+// process calls, since `$` stays in the hooks module's top-level functions.
 import type { HookStream, ProcessRunInit, ProcessRunResult, ProcessSpawnChunk, ProcessSpawnRequest, ProcessSpawnResult } from 'claude-code'
 
 export type Bridge = {
@@ -16,16 +16,9 @@ export type WorkerRecord = {
   name?: string
   sessionPath?: string
   seenInputId: string | null
-  /** An Ask just answered; until answeringUntil, staying blocked on it is not a new question. */
+  /** An answered Ask: while Herdr keeps the worker blocked on it, the worker counts as working. */
   answeringAskId?: string
-  answeringUntil?: number
 }
-
-export type AskAnswer = { selections?: string[]; other?: string; comment?: string }
-
-export type AnswerResult =
-  | { agent: AgentSummary; status: 'accepted' | 'rejected' | 'unknown'; record?: undefined }
-  | { agent: AgentSummary; record: WorkerRecord; status?: undefined }
 
 export type AgentSummary = {
   target: string
@@ -43,21 +36,33 @@ export type Ask = {
 
 export type CheckResult = {
   state: 'closed' | 'replaced' | 'working' | 'idle' | 'done' | 'question' | 'blocked'
-  agent?: { pane_id: string; terminal_id: string; status: string; name?: string }
+  agent?: AgentSummary
   inputId?: string | null
   sessionPath?: string
   reply?: { id: string; text: string; stopReason?: string }
   ask?: Ask
-  reason?: string
-  timedOut?: true
 }
 
 export type Delivery = {
   agent: AgentSummary
-  record: WorkerRecord
+  /** Present for tasks: the watch that reports the outcome. */
+  record?: WorkerRecord
   delivery: 'peer' | 'terminal'
   command?: true
   profileBlocking?: boolean
+}
+
+export type Tracked = { agent: AgentSummary; record: WorkerRecord }
+
+export type AnswerResult = {
+  agent: AgentSummary
+  status: 'accepted' | 'rejected' | 'unknown'
+  inputSent: boolean
+  record?: WorkerRecord
+}
+
+export function message(error: unknown): string {
+  return error instanceof Error ? error.message : String(error)
 }
 
 export async function call<T>(
@@ -71,7 +76,7 @@ export async function call<T>(
     timeoutMs,
   })
   const line = run.stdout.trim().split('\n').at(-1) ?? ''
-  let reply: { ok: true; result: T } | { ok: false; error: { message: string; code?: string } }
+  let reply: { ok: true; result: T } | { ok: false; error: { message: string } }
   try {
     reply = JSON.parse(line)
   } catch {
@@ -85,7 +90,7 @@ export async function call<T>(
 
 export type WatchLine =
   | { type: 'ready' }
-  | { type: 'event'; event: string; pane: string | null }
+  | { type: 'event'; event: string; pane: string | null; status?: string }
   | { type: 'session'; path: string }
 
 /** Starts the session-lifetime watcher; the returned function stops it. */
@@ -123,7 +128,7 @@ export function watchWorkers(
         }
       }
     } catch (thrown) {
-      error = thrown instanceof Error ? thrown.message : String(thrown)
+      error = message(thrown)
     }
     if (!stopped) onExit(error ?? (stderr.trim() || 'monitor exited'))
   })()

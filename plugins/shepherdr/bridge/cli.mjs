@@ -1,16 +1,18 @@
 // One-shot bridge operations for the Claude Code mod, which has no Node APIs.
 // Reads one JSON request on stdin and writes one JSON line: { ok, result } or
-// { ok: false, error }.
+// { ok: false, error }. The hooks side validates request fields.
 import { hostname } from "node:os";
-import { currentPane, getAgent, request, snapshot } from "./herdr.mjs";
 import {
-	listProfiles,
-	loadProfile,
-	prepareMessage,
-} from "./profiles.mjs";
+	agentSummary,
+	currentPane,
+	getAgent,
+	request,
+	snapshot,
+} from "./herdr.mjs";
+import { listProfiles, loadProfile, prepareMessage } from "./profiles.mjs";
 import { check, wait } from "./settle.mjs";
 import { spawnAgent, spawnDirectory } from "./spawn.mjs";
-import { isWorker, WORKER_KINDS, workerFor } from "./workers/index.mjs";
+import { isWorker, workerFor } from "./workers/index.mjs";
 
 const DELEGATED_WORKER_GUIDANCE =
 	"If blocked mid-run, use a question-asking tool, not peer messages. Without one, end with the blocker. Finish with an assistant reply, not a separate send report; never watch your parent.";
@@ -36,8 +38,13 @@ function labels(snap, agent) {
 	};
 }
 
-async function attribute(text, kind) {
+/** This Claude Code pane and the Herdr snapshot, read once per operation. */
+async function controller() {
 	const [pane, snap] = await Promise.all([currentPane(), snapshot()]);
+	return { pane, snap };
+}
+
+function attribute({ pane, snap }, text, kind) {
 	const paneName = pane.label || pane.title;
 	const source = {
 		kind,
@@ -60,56 +67,41 @@ async function attribute(text, kind) {
 	};
 }
 
-function summary(agent) {
-	return {
-		target: agent.pane_id,
-		...(agent.name ? { name: agent.name } : {}),
-		kind: agent.agent,
-		status: agent.agent_status,
-		terminal: agent.terminal_id,
-		...(agent.foreground_cwd || agent.cwd
-			? { cwd: agent.foreground_cwd || agent.cwd }
-			: {}),
-	};
-}
-
 async function resolveWorker(target) {
-	if (!target?.trim()) throw new Error("target is required");
-	const agent = await getAgent(target.trim());
+	const agent = await getAgent(target);
 	if (agent.pane_id === process.env.HERDR_PANE_ID)
 		throw new Error("refusing to target this Claude Code session");
-	workerFor(agent);
-	return agent;
+	return { agent, worker: workerFor(agent) };
 }
 
-async function recordFor(agent, pendingWork) {
-	const worker = workerFor(agent);
-	const view = await worker.view(agent);
+async function recordFor(agent, worker, pendingWork) {
+	const path = worker.sessionPath(agent);
 	return {
 		terminalId: agent.terminal_id,
 		paneId: agent.pane_id,
 		kind: agent.agent,
 		...(agent.name ? { name: agent.name } : {}),
-		...(worker.sessionPath(agent)
-			? { sessionPath: worker.sessionPath(agent) }
-			: {}),
+		...(path ? { sessionPath: path } : {}),
 		// Input IDs are nonempty, so "" reports the next settled reply.
-		seenInputId: pendingWork ? "" : (view.input?.id ?? null),
+		seenInputId: pendingWork
+			? ""
+			: ((await worker.view(agent)).input?.id ?? null),
 	};
 }
 
-async function deliverTo(agent, text, kind) {
-	const record = await recordFor(agent, false);
-	const receipt = await workerFor(agent).deliver(
-		agent,
-		await attribute(text, kind),
-	);
-	return { agent: summary(agent), record, ...receipt };
+/** Delivers a message; a task also returns the record that watches its outcome. */
+async function deliverTo(agent, worker, context, text, kind) {
+	const [record, resolved] = await Promise.all([
+		kind === "task" ? recordFor(agent, worker, false) : undefined,
+		context,
+	]);
+	const receipt = await worker.deliver(agent, attribute(resolved, text, kind));
+	return { agent: agentSummary(agent), ...(record ? { record } : {}), ...receipt };
 }
 
 const OPS = {
-	async profiles() {
-		return { ...(await listProfiles()), workers: WORKER_KINDS };
+	profiles() {
+		return listProfiles();
 	},
 	async list({ query, status }) {
 		const snap = await snapshot();
@@ -118,7 +110,7 @@ const OPS = {
 			.filter((agent) => agent.pane_id !== process.env.HERDR_PANE_ID)
 			.filter((agent) => !status || agent.agent_status === status)
 			.map((agent) => ({
-				...summary(agent),
+				...agentSummary(agent),
 				...labels(snap, agent),
 				...(isWorker(agent) ? {} : { unsupported: true }),
 			}))
@@ -129,59 +121,54 @@ const OPS = {
 			);
 	},
 	async spawn(params) {
-		if (!params.agent_type?.trim()) throw new Error("agent_type is required");
-		if (!params.label?.trim()) throw new Error("label is required");
-		if (!params.message?.trim()) throw new Error("message is required");
 		const profile = await loadProfile(params.agent_type.trim());
+		const context = await controller();
 		const cwd = await spawnDirectory(params, params.fallbackCwd);
 		const task = await prepareMessage(profile, {
 			cwd,
 			message: params.message,
 			base: params.base,
 		});
-		const agent = await spawnAgent(profile, params, cwd);
+		const agent = await spawnAgent(profile, params, cwd, context);
 		return {
-			...(await deliverTo(agent, task, "task")),
+			...(await deliverTo(agent, workerFor(agent), context, task, "task")),
 			...(profile.blocking === undefined
 				? {}
 				: { profileBlocking: profile.blocking }),
 		};
 	},
 	async deliver({ target, message, kind }) {
-		if (!message?.trim()) throw new Error("message is required");
-		return deliverTo(await resolveWorker(target), message, kind);
+		const [context, { agent, worker }] = await Promise.all([
+			controller(),
+			resolveWorker(target),
+		]);
+		return deliverTo(agent, worker, context, message, kind);
 	},
 	async watch({ target }) {
-		const agent = await resolveWorker(target);
+		const { agent, worker } = await resolveWorker(target);
 		// A blocked worker resumes its current input once answered.
 		const pending = ["working", "unknown", "blocked"].includes(
 			agent.agent_status,
 		);
-		return { agent: summary(agent), record: await recordFor(agent, pending) };
-	},
-	async answer({ target, ask_id: askId, answers }) {
-		const agent = await resolveWorker(target);
-		const worker = workerFor(agent);
-		// A retry of an answer Pi already recorded sends no input.
-		const prior = await worker.answerStatus(agent, askId, answers);
-		if (prior) return { agent: summary(agent), status: prior };
-		const record = await recordFor(agent, true);
-		await worker.answer(agent, askId, answers);
 		return {
-			agent: summary(agent),
-			record: {
-				...record,
-				answeringAskId: askId,
-				answeringUntil: Date.now() + 30_000,
-			},
+			agent: agentSummary(agent),
+			record: await recordFor(agent, worker, pending),
 		};
 	},
-	async answer_status({ target, ask_id: askId, answers }) {
-		const agent = await resolveWorker(target);
+	/** Enters the answers unless Pi already recorded them; the status is Pi's record. */
+	async answer({ target, ask_id: askId, answers }) {
+		const { agent, worker } = await resolveWorker(target);
+		const prior = await worker.answerStatus(agent, askId, answers);
+		if (prior) return { agent: agentSummary(agent), status: prior, inputSent: false };
+		const [record, status] = await Promise.all([
+			recordFor(agent, worker, true),
+			worker.answer(agent, askId, answers),
+		]);
 		return {
-			status:
-				(await workerFor(agent).answerStatus(agent, askId, answers)) ??
-				"unknown",
+			agent: agentSummary(agent),
+			status: status ?? "unknown",
+			inputSent: true,
+			record: { ...record, answeringAskId: askId },
 		};
 	},
 	check({ record }) {
@@ -191,11 +178,11 @@ const OPS = {
 		return wait(record, timeoutMs);
 	},
 	async read({ target, source = "latest", lines = 80 }) {
-		const agent = await resolveWorker(target);
+		const { agent, worker } = await resolveWorker(target);
 		if (source === "latest") {
-			const view = await workerFor(agent).view(agent);
+			const view = await worker.view(agent);
 			return {
-				agent: summary(agent),
+				agent: agentSummary(agent),
 				...(view.assistant ? { reply: view.assistant.text } : {}),
 				...(view.ask ? { ask: view.ask } : {}),
 			};
@@ -205,7 +192,7 @@ const OPS = {
 			source: source === "recent" ? "recent-unwrapped" : "visible",
 			lines,
 		});
-		return { agent: summary(agent), text: result.read?.text ?? result };
+		return { agent: agentSummary(agent), text: result.read?.text ?? result };
 	},
 };
 
@@ -226,7 +213,6 @@ main().then(
 				ok: false,
 				error: {
 					message: error instanceof Error ? error.message : String(error),
-					...(typeof error?.code === "string" ? { code: error.code } : {}),
 				},
 			})}\n`,
 		),
