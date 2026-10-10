@@ -5,6 +5,7 @@ A monorepo for Claude Code mods: plugins built on Claude Code's function-hooks A
 | Mod | What it does |
 | --- | --- |
 | [notes-compaction](plugins/notes-compaction) | Checkpoint notes and fresh context windows that continue from them |
+| [shepherdr](plugins/shepherdr) | Spawn, delegate to and monitor Pi agents in Herdr, with results pushed back into the session |
 
 ## Install
 

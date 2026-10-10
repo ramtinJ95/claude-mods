@@ -7,6 +7,11 @@
       "name": "notes-compaction",
       "source": "./plugins/notes-compaction",
       "description": "Checkpoint notes and fresh context windows that continue from them"
+    },
+    {
+      "name": "shepherdr",
+      "source": "./plugins/shepherdr",
+      "description": "Spawn, delegate to and monitor Pi agents in Herdr, with results pushed back into the session"
     }
   ]
 }

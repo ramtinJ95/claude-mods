@@ -1,0 +1,5 @@
+{
+	"name": "shepherdr",
+	"version": "0.1.0",
+	"description": "Spawn, delegate to and monitor Pi agents in Herdr, with results pushed back into the session"
+}
