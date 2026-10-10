@@ -33,10 +33,28 @@ export async function answerStatus(agent, askId, answers) {
 		: "unknown";
 }
 
-/** Enters the answers and resolves with the status Pi recorded. */
+/** The slash commands the worker's Shepherdr receiver accepts; works while it is busy. */
+export async function commands(agent) {
+	const receipt = await sendPeerMessage(
+		request,
+		agent,
+		{ text: "", sender: "" },
+		{ commands: true },
+	);
+	if (!receipt?.commands)
+		throw new Error(
+			`${agent.pane_id} has no Shepherdr receiver to list its commands; install @howaboua/pi-shepherdr in that Pi`,
+		);
+	return receipt.commands;
+}
+
+/** Enters the answers; resolves the status Pi recorded and whether the Ask ran in the background. */
 export async function answer(agent, askId, answers) {
-	await answerAsk(agent, sessionPath(agent), askId, answers);
-	return answerStatus(agent, askId, answers);
+	const ask = await answerAsk(agent, sessionPath(agent), askId, answers);
+	return {
+		status: await answerStatus(agent, askId, answers),
+		background: ask.delivery === "steer",
+	};
 }
 
 /** @returns {Promise<{ delivery: "peer" | "terminal", command?: true }>} */

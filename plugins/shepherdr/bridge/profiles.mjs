@@ -116,20 +116,31 @@ export async function listProfiles() {
 	return { source, profiles };
 }
 
-export function profileArgs(profile) {
+/**
+ * Pi arguments for a worker. A remote worker cannot read this machine's prompt
+ * file, so it gets the prompt as one line of text instead.
+ */
+export async function profileArgs(profile, local) {
+	const prompt = !profile.promptPath
+		? undefined
+		: local
+			? profile.promptPath
+			: (await readFile(profile.promptPath, "utf8"))
+					.replace(/\p{Cc}+/gu, " ")
+					.replace(/\s+/gu, " ")
+					.trim();
 	return [
 		"--model",
 		profile.model,
 		"--thinking",
 		profile.thinking,
-		...(profile.promptPath
-			? ["--append-system-prompt", profile.promptPath]
-			: []),
+		...(prompt ? ["--append-system-prompt", prompt] : []),
 		...profile.piArgs,
 	];
 }
 
-export async function prepareMessage(profile, { cwd, message, base }) {
+/** The worker's task; `local` tells the profile's preparation whether it runs on the worker's machine. */
+export async function prepareMessage(profile, { cwd, message, base, local }) {
 	if (base && !profile.accepts.includes("base"))
 		throw new Error(`base is not supported by ${profile.name}`);
 	if (!profile.prepare)
@@ -140,7 +151,7 @@ export async function prepareMessage(profile, { cwd, message, base }) {
 	);
 	if (typeof module.prepare !== "function")
 		throw new Error(`${profile.name}.prepare must export prepare()`);
-	const prepared = await module.prepare({ cwd, message, base, local: true });
+	const prepared = await module.prepare({ cwd, message, base, local });
 	if (typeof prepared !== "string" || !prepared.trim())
 		throw new Error(`${profile.name}.prepare must return a non-empty string`);
 	return prepared;

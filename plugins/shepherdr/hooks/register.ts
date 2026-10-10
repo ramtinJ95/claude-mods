@@ -1,10 +1,13 @@
 import type { EngineInterface, Register } from 'claude-code'
 
 import { type AgentSummary, type AnswerResult, type Bridge, type Delivery, type Tracked, call, message } from './bridge'
-import { type AgentsRequest, type ProfileSummary, TOOL_SPEC, helpText, parseRequest } from './contract'
+import { type AgentsRequest, type ProfileSummary, TOOL_SPEC, helpText, orchestrationGuidance, parseRequest } from './contract'
 import { Fleet, type SessionIo } from './fleet'
 
 const COMMAND = 'shepherdr'
+
+type Machine = { id: string; label: string; enabled: boolean }
+type Profiles = { source: string; profiles: ProfileSummary[] }
 
 let fleet: Fleet | undefined
 
@@ -28,8 +31,8 @@ function sessionIo($: EngineInterface, file: string): SessionIo {
     submit: text => $.prompt.submit({ text }),
     status: text => $.ui.status(text),
     toast: text => $.ui.toast(text),
-    readWatches: async () => ((await $.fs.exists(file)) ? JSON.parse(await $.fs.read(file)) : []),
-    writeWatches: records => $.fs.write(file, JSON.stringify(records)),
+    readState: async () => ((await $.fs.exists(file)) ? JSON.parse(await $.fs.read(file)) : undefined),
+    writeState: state => $.fs.write(file, JSON.stringify(state)),
   }
 }
 
@@ -47,6 +50,7 @@ function dispatchWork(
 ): Promise<string> | string {
   const summary = {
     target: delivery.agent.target,
+    ...(delivery.record?.machine ? { machine: delivery.record.machine } : {}),
     ...(delivery.agent.name ? { name: delivery.agent.name } : {}),
     delivery: delivery.delivery,
   }
@@ -58,48 +62,55 @@ function dispatchWork(
 
 async function handle(bridge: Bridge, cwd: string, request: AgentsRequest, signal: AbortSignal): Promise<string> {
   const current = requireFleet()
+  const { machine } = request
   switch (request.action) {
     case 'help':
-      return helpText(await call<{ source: string; profiles: ProfileSummary[] }>(bridge, 'profiles'))
+      if (request.commands) return JSON.stringify(await call(bridge, 'commands', { machine, target: request.target }))
+      return helpText(await call<Profiles>(bridge, 'profiles'))
     case 'list': {
-      const agents = await call<AgentSummary[]>(bridge, 'list', { query: request.query, status: request.status })
-      return JSON.stringify(
-        agents.map(({ terminal, ...agent }) => ({
+      const { agents, unavailable } = await call<{
+        agents: (AgentSummary & { machine?: string })[]
+        unavailable?: unknown[]
+      }>(bridge, 'list', { machine, query: request.query, status: request.status })
+      return JSON.stringify({
+        agents: agents.map(({ terminal, ...agent }) => ({
           ...agent,
-          ...(current.isWatched(terminal) ? { watched: true } : {}),
+          ...(current.isWatched(terminal, agent.machine) ? { watched: true } : {}),
         })),
-      )
+        ...(unavailable ? { unavailable } : {}),
+      })
     }
     case 'spawn': {
-      const delivery = await call<Delivery>(bridge, 'spawn', { ...request, fallbackCwd: cwd }, 120_000)
+      const delivery = await call<Delivery>(bridge, 'spawn', { ...request, fallbackCwd: cwd }, 240_000)
       const blocking = delivery.profileBlocking ?? request.blocking ?? true
       return dispatchWork(bridge, current, delivery, request.message!, blocking, signal)
     }
     case 'assign': {
-      const params = { target: request.target, message: request.message, kind: 'task' }
-      const delivery = await call<Delivery>(bridge, 'deliver', params)
+      const params = { machine, target: request.target, message: request.message, kind: 'task' }
+      const delivery = await call<Delivery>(bridge, 'deliver', params, 90_000)
       return dispatchWork(bridge, current, delivery, request.message!, request.blocking ?? true, signal)
     }
     case 'answer': {
       const askId = request.ask_id!
-      const end = current.beginAnswer(request.target!, askId)
+      const end = current.beginAnswer(request.target!, machine, askId)
       let entered = false
       try {
-        const params = { target: request.target, ask_id: askId, answers: request.answers }
-        const answered = await call<AnswerResult>(bridge, 'answer', params)
+        const params = { machine, target: request.target, ask_id: askId, answers: request.answers }
+        const answered = await call<AnswerResult>(bridge, 'answer', params, 150_000)
         entered = true
         const result = { target: answered.agent.target, ask_id: askId, status: answered.status }
         if (!answered.record) return JSON.stringify({ ...result, input_sent: false })
         const record = current.track({ agent: answered.agent, record: answered.record })
-        if (request.blocking === false) return JSON.stringify(result)
+        // A background Ask never stopped its worker: there is nothing to wait for.
+        if (answered.background || request.blocking === false) return JSON.stringify(result)
         return `${JSON.stringify(result)}\n${await current.waitFor(bridge, record, signal)}`
       } finally {
         end(entered)
       }
     }
     case 'send': {
-      const params = { target: request.target, message: request.message, kind: 'message' }
-      const delivery = await call<Delivery>(bridge, 'deliver', params)
+      const params = { machine, target: request.target, message: request.message, kind: 'message' }
+      const delivery = await call<Delivery>(bridge, 'deliver', params, 90_000)
       return JSON.stringify({
         target: delivery.agent.target,
         delivery: delivery.delivery,
@@ -108,14 +119,14 @@ async function handle(bridge: Bridge, cwd: string, request: AgentsRequest, signa
     }
     case 'read':
       return JSON.stringify(
-        await call(bridge, 'read', { target: request.target, source: request.source, lines: request.lines }),
+        await call(bridge, 'read', { machine, target: request.target, source: request.source, lines: request.lines }),
       )
     case 'watch': {
-      const record = current.track(await call<Tracked>(bridge, 'watch', { target: request.target }))
+      const record = current.track(await call<Tracked>(bridge, 'watch', { machine, target: request.target }))
       return JSON.stringify({ target: record.paneId, ...(record.name ? { name: record.name } : {}), watching: true })
     }
     case 'unwatch': {
-      const record = current.find(request.target!)
+      const record = current.find(request.target!, machine)
       if (!record) throw new Error(`${request.target} is not watched; list shows watched agents`)
       current.untrack(record)
       return JSON.stringify({ target: record.paneId, watching: false })
@@ -123,11 +134,35 @@ async function handle(bridge: Bridge, cwd: string, request: AgentsRequest, signa
   }
 }
 
+/** /shepherdr: status and restart; `orchestrate` or `normal` switches the guidance. */
+async function runCommand(
+  $: EngineInterface,
+  args: string,
+): Promise<{ text: string; context?: string[] }> {
+  const current = requireFleet()
+  const bridge = bridgeOf($)
+  const choice = args.trim()
+  if (choice === 'orchestrate' || choice === 'normal') {
+    const enabled = choice === 'orchestrate'
+    const { profiles } = await call<Profiles>(bridge, 'profiles')
+    const guidance = current.orchestrate(
+      enabled,
+      orchestrationGuidance(enabled, profiles.some(profile => profile.name === 'general')),
+    )
+    return { text: `Orchestration ${enabled ? 'on' : 'off'}.`, context: [guidance] }
+  }
+  if (choice) return { text: 'Use /shepherdr, /shepherdr orchestrate or /shepherdr normal.' }
+  return { text: current.inspect(await call<Machine[]>(bridge, 'machines')) }
+}
+
 export const register: Register = on => {
   on('session.start', async ($, e, next) => {
     await Promise.all([
       $.tool.register(TOOL_SPEC),
-      $.command.register({ name: COMMAND, description: 'Show Shepherdr agents and restart stopped monitoring' }),
+      $.command.register({
+        name: COMMAND,
+        description: 'Show Shepherdr agents and machines, restart monitoring, or switch orchestration (orchestrate|normal)',
+      }),
     ])
     const started = await next(e)
     fleet?.stop()
@@ -160,8 +195,8 @@ export const register: Register = on => {
     }
   }).catch(() => ({ deny: 'Shepherdr failed to handle the call; retry or call agents with {} for help.' }))
 
-  // Observes every tool: reports queued during the call join the next model
-  // request. Its failure must never change another tool's call.
+  // Observes every tool: briefings and reports queued during the call join
+  // the next model request. Its failure must never change another tool's call.
   on('tool.call', async ($, e, next) => {
     const ran = await next(e)
     if (!e.agentId && fleet) await appendAll($, fleet.drain())
@@ -182,10 +217,20 @@ export const register: Register = on => {
 
   on('session.compact', async ($, e, next) => {
     const compacted = await next(e)
-    const brief = fleet?.briefAfterCompaction()
-    if (brief) await appendAll($, [brief])
+    if (e.agentId || !fleet || compacted.skip !== undefined) return compacted
+    // Automatic compaction resumes mid-turn with no turn.start, so the
+    // briefing joins the compacted conversation itself. Between turns
+    // (/compact, a notes window) another plugin may replace the conversation
+    // after this hook, so the next turn's start brings it instead.
+    if (e.trigger === 'auto' || e.trigger === 'precompute') {
+      const briefing = fleet.briefing()
+      return briefing.length
+        ? { ...compacted, messages: [...compacted.messages, { role: 'user', text: briefing.join('\n\n'), toolUses: [] }] }
+        : compacted
+    }
+    fleet.compacted()
     return compacted
   }).catch(($, e, next) => next(e))
 
-  on('command.run', { command: COMMAND }, () => ({ text: requireFleet().inspect() }))
+  on('command.run', { command: COMMAND }, ($, e) => runCommand($, e.args))
 }

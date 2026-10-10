@@ -1,10 +1,12 @@
 // Worker adapters by Herdr agent kind. Each exports kind, sessionPath(agent),
 // isReady(agent), view(agent) -> SessionView, deliver(agent, message),
-// answer(agent, askId, answers) and answerStatus(agent, askId, answers).
-// view().ask is { toolCallId, prompts: [{ title, body?, multiple, choices }] }
-// and answers are [{ selections?, other?, comment? }] in prompt order, whatever
-// question tool the worker uses. A Claude Code adapter joins here once Claude
-// Code can receive peer messages.
+// commands(agent), answer(agent, askId, answers) -> { status, background }
+// and answerStatus(agent, askId, answers).
+// view().ask is { toolCallId, delivery?: "steer", prompts: [{ title, body?,
+// multiple, choices }] }, where "steer" marks a question asked while the worker
+// continues; answers are [{ selections?, other?, comment? }] in prompt order,
+// whatever question tool the worker uses. A Claude Code adapter joins here once
+// Claude Code can receive peer messages.
 import * as pi from "./pi.mjs";
 
 const ADAPTERS = new Map([[pi.kind, pi]]);

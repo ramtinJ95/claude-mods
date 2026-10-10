@@ -1,9 +1,29 @@
-// Herdr socket JSON-RPC for the Claude Code controller bridge.
+// Herdr socket JSON-RPC for the bridge. Locally the socket is the one Claude
+// Code runs in; on a remote machine, `--session <name>` names its Herdr session.
 import { createConnection } from "node:net";
+import { homedir } from "node:os";
+import { join } from "node:path";
 
 const MAX_FRAME_BYTES = 8 * 1024 * 1024;
 
+/** The Herdr session named by `--session`, when the bridge runs on a remote machine. */
+export function remoteSession() {
+	const index = process.argv.indexOf("--session");
+	if (index < 0) return undefined;
+	const session = process.argv[index + 1];
+	if (!session || !/^[a-zA-Z0-9_.-]{1,64}$/.test(session) || session === "." || session === "..")
+		throw new Error("A valid Herdr --session is required");
+	return session;
+}
+
 function socketPath() {
+	const session = remoteSession();
+	if (session) {
+		const root = process.env.XDG_CONFIG_HOME || join(homedir(), ".config");
+		return session === "default"
+			? join(root, "herdr", "herdr.sock")
+			: join(root, "herdr", "sessions", session, "herdr.sock");
+	}
 	const path = process.env.HERDR_SOCKET_PATH;
 	if (process.env.HERDR_ENV !== "1" || !path)
 		throw new Error("Claude Code is not running inside Herdr");

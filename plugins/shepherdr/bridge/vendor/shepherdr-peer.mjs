@@ -32,9 +32,11 @@ function deliveryError(message, rejected) {
  * @param {(method: string, params: object) => Promise<any>} request
  * @param {{ pane_id: string, terminal_id: string, agent_session?: { kind: string, value: string } | null }} expected
  * @param {{ text: string, sender: string, context?: string }} message
- * @returns {Promise<{ command: boolean } | undefined>}
+ * @param {{ commands?: boolean }} [options] commands asks for the slash
+ *   commands the worker accepts instead of delivering text; it works while blocked.
+ * @returns {Promise<{ command: boolean, commands?: { name: string, description: string }[] } | undefined>}
  */
-export async function sendPeerMessage(request, expected, message) {
+export async function sendPeerMessage(request, expected, message, options = {}) {
 	const { agent } = await request("agent.get", { target: expected.pane_id });
 	const session = agent?.agent_session;
 	const sessionFile = session?.kind === "path" ? session.value : undefined;
@@ -49,7 +51,7 @@ export async function sendPeerMessage(request, expected, message) {
 			"Target Pi session changed or is not ready; resolve the target again",
 			true,
 		);
-	if (agent.agent_status === "blocked")
+	if (!options.commands && agent.agent_status === "blocked")
 		throw deliveryError(
 			"Target is blocked; answer its pending question first",
 			true,
@@ -80,7 +82,7 @@ export async function sendPeerMessage(request, expected, message) {
 	const id = randomUUID();
 	const frame = `${JSON.stringify({
 		protocol: PEER_PROTOCOL,
-		kind: "message",
+		kind: options.commands ? "commands" : "message",
 		id,
 		token: descriptor.token,
 		sessionFile,
@@ -162,7 +164,21 @@ function deliverFrame(request, expected, message, port, sessionFile, id, frame) 
 						// The receiver retains this socket through session_shutdown.
 						// Only process exit ends it; never close a pane on a timeout.
 						clearTimeout(timer);
-					} else finish(undefined, { command: reply.command });
+					} else
+						finish(undefined, {
+							command: reply.command,
+							...(Array.isArray(reply.commands)
+								? {
+										commands: reply.commands
+											.filter(
+												(entry) =>
+													typeof entry?.name === "string" &&
+													typeof entry.description === "string",
+											)
+											.map(({ name, description }) => ({ name, description })),
+									}
+								: {}),
+						});
 				} else if (reply.ok === false && typeof reply.error === "string")
 					finish(deliveryError(reply.error, reply.rejected === true));
 				else failed();

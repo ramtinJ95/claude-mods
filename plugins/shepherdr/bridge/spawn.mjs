@@ -1,9 +1,10 @@
-// Starts a profiled Pi worker in a new Herdr tab, workspace or existing pane.
+// Starts a Pi worker in a new Herdr tab, workspace or existing pane on the
+// machine this runs on.
 import { stat } from "node:fs/promises";
+import { homedir } from "node:os";
 import { resolve } from "node:path";
 import { setTimeout as sleep } from "node:timers/promises";
-import { getAgent, isHerdrErrorCode, request } from "./herdr.mjs";
-import { profileArgs } from "./profiles.mjs";
+import { getAgent, isHerdrErrorCode, request, snapshot } from "./herdr.mjs";
 import { workerFor } from "./workers/index.mjs";
 
 const AGENT_NAME = /^[a-z][a-z0-9_-]{0,31}$/;
@@ -58,13 +59,21 @@ function resolveWorkspace(workspaces, target) {
 	);
 }
 
-async function createLocation(params, cwd, label, { pane, snap }) {
-	const placement = params.placement ?? "new_tab";
+/**
+ * A new tab goes to `workspace` or the controller's own workspace; on a remote
+ * machine there is none, so a spawn without `workspace` gets a new workspace.
+ */
+async function createLocation(params, cwd, label, workspaces, controllerWorkspace) {
+	const placement =
+		params.placement ??
+		(params.workspace || controllerWorkspace ? "new_tab" : "new_workspace");
 	if (placement === "pane") return { paneId: params.pane };
 	if (placement === "new_tab") {
 		const workspaceId = params.workspace
-			? resolveWorkspace(snap.workspaces, params.workspace).workspace_id
-			: pane.workspace_id;
+			? resolveWorkspace(workspaces, params.workspace).workspace_id
+			: controllerWorkspace;
+		if (!workspaceId)
+			throw new Error("a new tab on another machine needs workspace");
 		const created = await request("tab.create", {
 			workspace_id: workspaceId,
 			cwd,
@@ -145,8 +154,12 @@ async function startWhenShellReady(params) {
 	throw new Error(`timed out waiting for agent ${params.name} to become ready`);
 }
 
-/** The worker's directory, resolved before launch so preparation runs first. */
-export async function spawnDirectory(params, fallbackCwd) {
+/**
+ * The worker's directory, resolved on its machine before launch so the
+ * profile's preparation runs first. Relative paths start at `fallbackCwd`
+ * locally and at the home directory on a remote machine.
+ */
+export async function spawnDirectory(params, fallbackCwd = homedir()) {
 	if (params.placement !== "pane")
 		return directory(resolve(fallbackCwd, params.cwd?.trim() || "."));
 	if (!params.pane) throw new Error("pane is required for placement=pane");
@@ -156,16 +169,20 @@ export async function spawnDirectory(params, fallbackCwd) {
 	return pane.foreground_cwd || pane.cwd || fallbackCwd;
 }
 
-/** `context` is the controller's pane and a Herdr snapshot taken for this spawn. */
-export async function spawnAgent(profile, params, cwd, context) {
+/**
+ * Starts Pi on this machine with the controller's profile arguments.
+ * `controllerWorkspace` is set only when the controller runs here.
+ */
+export async function startAgent({ params, args: profile, cwd, controllerWorkspace }) {
 	const label = params.label.trim();
-	const name = allocateName(context.snap.agents, label, params.name);
-	const args = ["--name", label, ...profileArgs(profile)];
+	const { agents, workspaces } = await snapshot();
+	const name = allocateName(agents, label, params.name);
+	const args = ["--name", label, ...profile];
 	if (args.includes("--no-session"))
 		throw new Error(
 			"spawn requires a persistent Pi session; remove --no-session from the profile",
 		);
-	const location = await createLocation(params, cwd, label, context);
+	const location = await createLocation(params, cwd, label, workspaces, controllerWorkspace);
 	try {
 		return await startWhenShellReady({
 			name,

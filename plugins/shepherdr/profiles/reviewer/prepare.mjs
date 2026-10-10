@@ -140,6 +140,7 @@ function safeStatus(value) {
 }
 
 export function prepare(input) {
+	// A remote worker's directory is not on this machine.
 	if (
 		input.local === false ||
 		runGit(input.cwd, ["rev-parse", "--show-toplevel"]).code !== 0

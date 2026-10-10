@@ -214,8 +214,9 @@ async function sendInput(agent, step) {
 }
 
 /**
- * Enters and submits answers to the blocking Ask `askId`. Resolves once Pi
- * recorded its outcome in askResults.
+ * Enters and submits answers to the Ask `askId`: a blocking one, or a
+ * background one (`delivery: "steer"`) the worker asked while it continues.
+ * Resolves once Pi recorded its outcome in askResults, with the Ask.
  */
 export async function answerAsk(agent, sessionPath, askId, answers) {
 	const view = await readSessionView(sessionPath);
@@ -223,17 +224,14 @@ export async function answerAsk(agent, sessionPath, askId, answers) {
 	if (!ask) throw new Error(`${agent.pane_id} has no live Ask`);
 	if (ask.toolCallId !== askId)
 		throw new Error(`${agent.pane_id} has a different Ask call`);
-	if (ask.delivery === "steer")
-		throw new Error(
-			"Answering a background Pi Ask is not supported yet; it waits in the worker's pane",
-		);
-	if (agent.agent_status !== "blocked")
+	const background = ask.delivery === "steer";
+	if (!background && agent.agent_status !== "blocked")
 		throw new Error(`${agent.pane_id} is not waiting on Ask`);
 	const requireLiveAsk = async () => {
 		const current = await getAgent(agent.pane_id);
 		if (
 			!sameAgent(agent, current) ||
-			current.agent_status !== "blocked" ||
+			(!background && current.agent_status !== "blocked") ||
 			(await readSessionView(sessionPath)).ask?.toolCallId !== askId
 		)
 			throw new Error("ask closed before all requested answers were entered");
@@ -272,6 +270,7 @@ export async function answerAsk(agent, sessionPath, askId, answers) {
 		);
 	await sendInput(agent, final);
 	await recorded(sessionPath, askId);
+	return ask;
 }
 
 /** Waits until Pi records the Ask's outcome, so a final key that did not take fails here. */

@@ -10,6 +10,8 @@ export type Bridge = {
 }
 
 export type WorkerRecord = {
+  /** Herdr machine profile ID; absent on the machine running Claude Code. */
+  machine?: string
   terminalId: string
   paneId: string
   kind: string
@@ -31,6 +33,8 @@ export type AgentSummary = {
 
 export type Ask = {
   toolCallId: string
+  /** "steer": asked while the worker continues. */
+  delivery?: 'steer'
   prompts: { title: string; multiple: boolean; choices: { label: string; description?: string }[]; body?: string }[]
 }
 
@@ -58,6 +62,8 @@ export type AnswerResult = {
   agent: AgentSummary
   status: 'accepted' | 'rejected' | 'unknown'
   inputSent: boolean
+  /** A background Ask: the worker never stopped, so there is no settlement to wait for. */
+  background?: boolean
   record?: WorkerRecord
 }
 
@@ -88,10 +94,13 @@ export async function call<T>(
   return reply.result
 }
 
-export type WatchLine =
+/** Every line carries `machine` when it came from a remote machine's watcher. */
+export type WatchLine = { machine?: string } & (
   | { type: 'ready' }
   | { type: 'event'; event: string; pane: string | null; status?: string }
-  | { type: 'session'; path: string }
+  | { type: 'session'; path: string; ask?: Ask }
+  | { type: 'error'; message: string }
+)
 
 /** Starts the session-lifetime watcher; the returned function stops it. */
 export function watchWorkers(
@@ -103,7 +112,7 @@ export function watchWorkers(
   const stream = bridge.spawn({
     argv: ['node', `${bridge.root}/bridge/watch.mjs`],
     input: JSON.stringify({
-      targets: records.map(({ terminalId, sessionPath }) => ({ terminalId, sessionPath })),
+      targets: records.map(({ machine, terminalId, sessionPath }) => ({ machine, terminalId, sessionPath })),
     }),
   })
   let stopped = false
@@ -122,8 +131,9 @@ export function watchWorkers(
           const line = buffer.slice(0, newline)
           buffer = buffer.slice(newline + 1)
           if (!line) continue
-          const value = JSON.parse(line) as WatchLine | { type: 'error'; message: string }
-          if (value.type === 'error') error = value.message
+          const value = JSON.parse(line) as WatchLine
+          // A local failure ends the watcher; a remote machine's is one line.
+          if (value.type === 'error' && !value.machine) error = value.message
           else onLine(value)
         }
       }
