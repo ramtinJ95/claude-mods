@@ -25,7 +25,8 @@ The main conversation is `/root`; a subagent is `/root/<agentId>`. Relative note
 
 A new window replaces the conversation with one marker message; no summary is generated. The full transcript stays in the session, which `history` reads.
 
-- Reminders ride on tool results at 85% and 90% context use, once each per window.
+- Reminders ride on tool results at 85% and 90% of the context Claude Code compacts at, once each per window. With an auto-compact window set (for example 400k), that is its threshold, so the checkpoint comes first; otherwise it is the model's window. `get_context_remaining` measures against the same limit.
+- Ask the agent for a new window in plain words; it saves a checkpoint and calls `new_context`.
 - `/compact` asks the agent to save a checkpoint, then opens a new window only if that turn completed with a saved note. If the latest turn already saved notes and no instructions were given, it opens the new window at once. Instructions after `/compact` become checkpoint guidance.
 - Automatic compaction stays Claude Code's own summary.
 - Interrupting a turn that called `new_context`, or the checkpoint turn, cancels the rollover and keeps the old context.

@@ -272,12 +272,29 @@ function roll($: EngineInterface) {
   })
 }
 
+/**
+ * Where Claude Code compacts on its own (an auto-compact window such as 400k), refreshed each turn.
+ * Reminders and remaining context measure against it, so checkpoints come before that compaction.
+ */
+let compactThreshold: number | undefined
+
+async function refreshThreshold($: EngineInterface) {
+  const breakdown = (await $.session.usage({ breakdown: 'summary' })).context.breakdown
+  compactThreshold = breakdown?.isAutoCompactEnabled ? breakdown.autoCompactThreshold : undefined
+}
+
+async function contextUsed($: EngineInterface): Promise<{ limit: number; tokens?: number }> {
+  const { context } = await $.session.usage()
+  return { limit: Math.min(context.window, compactThreshold ?? context.window), tokens: context.tokens }
+}
+
 /** Context reminders ride on tool results, the one mid-turn channel to the model. Each fires once per window. */
 async function remind($: EngineInterface, agentId: string | undefined, called: ToolCallResult): Promise<ToolCallResult> {
   if (agentId !== undefined || called.deny !== undefined) return called
   try {
     const { dir, state } = await session($)
-    const reminder = reminderFor(state, (await $.session.usage()).context.percent)
+    const { limit, tokens } = await contextUsed($)
+    const reminder = reminderFor(state, tokens === undefined || limit <= 0 ? undefined : (100 * tokens) / limit)
     if (!reminder) return called
     await saveState($, dir, state)
     return { ...called, context: [...(called.context ?? []), reminder] }
@@ -423,6 +440,8 @@ export const register: Register = (on) => {
 
   on('turn.start', async ($, e, next) => {
     turn = { id: e.turnId, saved: 0, failed: false }
+    // /config and /model can move the threshold between turns; the previous figure stands meanwhile.
+    refreshThreshold($).catch(() => undefined)
     return next(e)
   })
 
@@ -509,14 +528,13 @@ export const register: Register = (on) => {
   on('tool.call', { tool: 'mcp__notes-compaction__get_context_remaining' }, async ($, e) => {
     if (e.agentId !== undefined) return { deny: 'Context usage is reported for the main conversation only.' }
     const { state } = await session($)
-    const { context } = await $.session.usage()
-    const remainingTokens =
-      typeof context.tokens === 'number' && context.window > 0 ? Math.max(0, context.window - context.tokens) : null
+    const { limit, tokens } = await contextUsed($)
+    const remainingTokens = typeof tokens === 'number' && limit > 0 ? Math.max(0, limit - tokens) : null
     return result({
-      contextWindow: context.window,
+      contextWindow: limit,
       windowId: state.window.currentWindowId,
       remainingTokens,
-      remainingPercent: remainingTokens === null ? null : Math.round((remainingTokens / context.window) * 1000) / 10,
+      remainingPercent: remainingTokens === null ? null : Math.round((remainingTokens / limit) * 1000) / 10,
     })
   })
 
