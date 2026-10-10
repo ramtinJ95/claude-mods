@@ -1,0 +1,5 @@
+{
+  "name": "notes-compaction",
+  "version": "0.1.0",
+  "description": "Checkpoint notes and fresh context windows that continue from them, with searchable history of earlier windows"
+}

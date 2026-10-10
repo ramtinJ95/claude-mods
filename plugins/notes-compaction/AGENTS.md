@@ -1,0 +1,6 @@
+- `claude plugin validate` follows `$` only into functions declared at the top level of `hooks/register.ts`, never across imports. Keep every function that takes `$` there; the other modules stay pure.
+- `tool.call` matchers must be string literals (`'mcp__notes-compaction__notes'`), not computed names.
+- `$.session.compact()` skips the calling plugin's own `session.compact` hook, so core summarizes instead of opening a window. Rollover runs `/compact` through `$.command.run`, and the hook answers only while `rolling` is set.
+- A `tool.call` hook that answers without `next` never reaches the generic reminder hook, so the plugin's own tools call `remind` themselves.
+- Classic hooks (`classic.SessionStart`, `classic.PreCompact`, `classic.PostCompact`) did not fire for this mod on 2.1.296; the window message carries everything the new window needs.
+- Reminder thresholds can be lowered temporarily to exercise them in a live session (`claude --plugin-dir`); there is no test suite.

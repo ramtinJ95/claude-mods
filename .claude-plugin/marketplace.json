@@ -1,0 +1,12 @@
+{
+  "name": "claude-mods",
+  "description": "Claude Code mods",
+  "owner": { "name": "ramtinJ95" },
+  "plugins": [
+    {
+      "name": "notes-compaction",
+      "source": "./plugins/notes-compaction",
+      "description": "Checkpoint notes and fresh context windows that continue from them"
+    }
+  ]
+}
