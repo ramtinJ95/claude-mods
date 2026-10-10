@@ -1,4 +1,12 @@
-import type { EngineInterface, Register, SessionCompacted, ToolCallInput, ToolCallResult } from 'claude-code'
+import type {
+  EngineInterface,
+  Register,
+  RenderElement,
+  SessionCompacted,
+  SessionMessage,
+  ToolCallInput,
+  ToolCallResult,
+} from 'claude-code'
 import { MESSAGE_LIMIT, useHistory } from './history.ts'
 import {
   agentIdOf,
@@ -163,6 +171,8 @@ const CHECKPOINT_PROMPT =
 
 /** One successful root write: root's whole note set after it, its window, and the session's subagents. */
 interface Revision {
+  /** The writing session, so /notes can prune its records with it. */
+  session?: string
   notes: Note[]
   window?: WindowIdentity
   agents?: string[]
@@ -186,6 +196,11 @@ let pending: { kind: 'requested' } | { kind: 'checkpoint'; windowId: string } | 
 let compactThreshold: number | undefined
 /** Parallel calls in one batch would otherwise read the same note before either append lands. */
 let notesQueue: Promise<unknown> = Promise.resolve()
+/** The /notes setting: run Claude Code's summary before each new window, as Pi's normal compaction does. */
+let normalCompaction = false
+/** What the /notes pane shows; a change redraws it. */
+let panel: { status: string[]; confirmPrune: boolean; message?: string } = { status: [], confirmPrune: false }
+const PANE = 'notes-compaction'
 
 // The engine follows $ only into functions declared in this file, so all I/O lives here.
 
@@ -197,6 +212,11 @@ function storageRoot($: EngineInterface): Promise<string> {
 
 async function dataHome($: EngineInterface): Promise<string> {
   return `${(await $.env.get('XDG_DATA_HOME')) || `${await $.env.get('HOME')}/.local/share`}/claude-notes-compaction`
+}
+
+/** Where Claude Code keeps this profile's transcripts, one folder per project. */
+async function transcriptsDir($: EngineInterface): Promise<string> {
+  return `${(await $.env.get('CLAUDE_CONFIG_DIR')) || `${await $.env.get('HOME')}/.claude`}/projects`
 }
 
 async function revisionPath($: EngineInterface, toolUseId: string): Promise<string> {
@@ -240,7 +260,12 @@ async function loadSession($: EngineInterface, dir: string) {
   const messages = await $.session.messages()
   const markers = messages.map(windowMarker)
   const state = newState()
+  state.projects = await transcriptsDir($)
+  // A fork inherits the subagents its copied transcript launched, with their notes.
+  const launched = messages.flatMap((m) => m.toolUses.flatMap((use) => (use.agentId ? [agentName(use.agentId)] : [])))
+  if (launched.length) state.agents = [...new Set(launched)]
   let restored: Revision | undefined
+  let restoredFrom: string | undefined
   let markerWindow: WindowIdentity | undefined
   let sawWrite = false
   for (let i = messages.length - 1; i >= 0 && !restored; i--) {
@@ -258,13 +283,15 @@ async function loadSession($: EngineInterface, dir: string) {
       const file = await revisionPath($, use.tool_use_id)
       if (!(await $.fs.exists(file))) continue
       restored = JSON.parse(await $.fs.read(file)) as Revision
+      restoredFrom = use.tool_use_id
       break
     }
   }
   state.window = markerWindow ?? restored?.window ?? state.window
   if (restored) {
     await Promise.all(restored.notes.map((note) => writeNote($, rootNotesDir(dir), note)))
-    if (restored.agents?.length) state.agents = restored.agents
+    state.agents = [...new Set([...(state.agents ?? []), ...(restored.agents ?? [])])]
+    state.restoredFrom = restoredFrom
   } else if (sawWrite || messages.length >= MESSAGE_LIMIT)
     $.ui.toast("This session's earlier notes could not be restored. Notes start empty; earlier history remains.")
   // Persist before use: history and notes may cite the first window's ID before anything else is saved.
@@ -304,8 +331,11 @@ async function isSessionAgent($: EngineInterface, self: string, agent: string): 
   return (await $.session.messages()).some((m) => m.toolUses.some((use) => use.agentId && agentName(use.agentId) === agent))
 }
 
-/** The window's opening message; the conversation continues once it stands. */
-async function openWindow($: EngineInterface): Promise<SessionCompacted> {
+/**
+ * The window's opening message, after `kept` (normal compaction's summary, or nothing for a
+ * notes-only window); the conversation continues once it stands.
+ */
+async function openWindow($: EngineInterface, kept: readonly SessionMessage[] = []): Promise<SessionCompacted> {
   const { dir, state } = await session($)
   const ids = nextWindow(state.window)
   const recent = recentPaths(await readNotes($, rootNotesDir(dir)), ROOT)
@@ -315,6 +345,7 @@ async function openWindow($: EngineInterface): Promise<SessionCompacted> {
   $.clock.after(100, () => $.prompt.submit({ text: 'Continue.' }))
   return {
     messages: [
+      ...kept,
       { role: 'user', text: windowText(ROOT, ids, recent), toolUses: [] },
       { role: 'assistant', text: 'New context window opened.', toolUses: [] },
     ],
@@ -392,7 +423,12 @@ async function runNotes($: EngineInterface, e: ToolCallInput): Promise<ToolCallR
     notes.set(write.path, write)
     const revision =
       e.tool_use_id && main
-        ? JSON.stringify({ notes: [...notes.values()], window: state.window, agents: state.agents } satisfies Revision)
+        ? JSON.stringify({
+            session: sessionId,
+            notes: [...notes.values()],
+            window: state.window,
+            agents: state.agents,
+          } satisfies Revision)
         : undefined
     if (revision && new TextEncoder().encode(revision).length > REVISION_LIMIT)
       throw new Error('Notes exceed 4 MB in total. Shorten or replace existing notes, then save again.')
@@ -443,14 +479,133 @@ async function callHistory($: EngineInterface, e: ToolCallInput): Promise<ToolCa
   }
 }
 
+function showPanel($: EngineInterface, change: Partial<typeof panel>) {
+  panel = { ...panel, ...change }
+  $.ui.invalidate('ui.render')
+}
+
+async function childNames($: EngineInterface, dir: string, kind: 'file' | 'dir'): Promise<string[]> {
+  if (!(await $.fs.exists(dir))) return []
+  return (await $.fs.list(dir)).filter((entry) => entry.kind === kind).map((entry) => entry.name)
+}
+
+async function refreshPanel($: EngineInterface) {
+  const base = await storageRoot($)
+  const { dir, state } = await session($)
+  const notes = (await childNames($, rootNotesDir(dir), 'file')).length
+  const sessions = (await childNames($, `${base}/sessions`, 'dir')).length
+  const records = (await childNames($, `${base}/revisions`, 'file')).length
+  const { limit } = await contextUsed($)
+  showPanel($, {
+    status: [
+      `Continuity active · window ${state.window.windowNumber + 1} · ${notes} notes in this session`,
+      `Reminders at 85% and 90% of ${limit} tokens (${compactThreshold ? 'the auto-compact threshold' : 'the model window'})`,
+      `${sessions} sessions · ${records} fork records`,
+    ],
+  })
+}
+
+async function toggleNormalCompaction($: EngineInterface) {
+  normalCompaction = !normalCompaction
+  await $.store.set('settings', { normalCompaction })
+  showPanel($, { message: undefined })
+}
+
+/** A session this recently active stays: one that saves no transcript may still be running. */
+const PRUNE_GRACE_MS = 24 * 60 * 60 * 1000
+
+/**
+ * Removes stored sessions of this profile whose Claude Code transcript is gone, with their fork
+ * records and the subagent notes no remaining session names. The active session, recently active
+ * ones, other profiles' sessions and records a remaining fork restored from stay.
+ */
+async function prune($: EngineInterface): Promise<string> {
+  const base = await storageRoot($)
+  const projects = await transcriptsDir($)
+  if (!(await $.fs.exists(projects))) return `No Claude Code transcripts found at ${projects}. Nothing was pruned.`
+  const live = new Set([sessionId])
+  for (const project of await childNames($, projects, 'dir'))
+    for (const file of await childNames($, `${projects}/${project}`, 'file'))
+      if (file.endsWith('.jsonl')) live.add(file.slice(0, -'.jsonl'.length))
+  const now = await $.clock.now()
+  const removed = new Set<string>()
+  const kept: SessionState[] = []
+  let retained = 0
+  for (const id of await childNames($, `${base}/sessions`, 'dir')) {
+    const dir = `${base}/sessions/${id}`
+    const entries = await $.fs.list(dir)
+    const stateFile = entries.find((entry) => entry.name === 'state.json')
+    const state = stateFile ? (JSON.parse(await $.fs.read(`${dir}/state.json`)) as SessionState) : undefined
+    const recent = entries.some((entry) => now - entry.mtimeMs < PRUNE_GRACE_MS)
+    if (live.has(id) || !state || state.projects !== projects || recent) {
+      if (state) kept.push(state)
+      if (!live.has(id)) retained++
+    } else removed.add(id)
+  }
+  const keptAgents = new Set(kept.flatMap((state) => state.agents ?? []))
+  const keptRecords = new Set(kept.flatMap((state) => (state.restoredFrom ? [`${state.restoredFrom}.json`] : [])))
+  const records: string[] = []
+  for (const file of await childNames($, `${base}/revisions`, 'file')) {
+    if (keptRecords.has(file)) continue
+    const owner = (JSON.parse(await $.fs.read(`${base}/revisions/${file}`)) as Revision).session
+    if (owner && removed.has(owner)) records.push(`${base}/revisions/${file}`)
+  }
+  const agents = (await childNames($, `${base}/agents`, 'dir')).filter((id) => !keptAgents.has(agentName(id)))
+  const paths = [
+    ...[...removed].map((id) => `${base}/sessions/${id}`),
+    ...records,
+    ...agents.map((id) => `${base}/agents/${id}`),
+  ]
+  const retainedNote = retained
+    ? ` Retained ${retained} sessions without a transcript that are recent, from another profile or of unknown origin.`
+    : ''
+  if (!paths.length) return `Nothing to prune.${retainedNote}`
+  for (let i = 0; i < paths.length; i += 200) {
+    let run: { exitCode: number; stderr: string }
+    try {
+      run = await $.process.run(['rm', '-rf', ...paths.slice(i, i + 200)])
+    } catch (error) {
+      return `Prune needs the rm command, which could not run: ${message(error)}. Nothing further was removed.`
+    }
+    if (run.exitCode !== 0) return `Prune stopped: ${run.stderr.trim() || `rm exited ${run.exitCode}`}.`
+  }
+  return `Pruned ${removed.size} sessions, ${records.length} fork records and ${agents.length} subagent note sets.${retainedNote}`
+}
+
+async function confirmPrune($: EngineInterface) {
+  showPanel($, { confirmPrune: false, message: 'Pruning…' })
+  let outcome: string
+  try {
+    outcome = await prune($)
+  } catch (error) {
+    outcome = `Prune failed: ${message(error)}`
+  }
+  showPanel($, { message: outcome })
+  await refreshPanel($)
+}
+
 export const register: Register = (on) => {
   // First registered is outermost: this wraps every tool's result, the plugin's own included.
   on('tool.call', async ($, e, next) => remind($, e.agentId, await next(e)))
 
   on('session.start', async ($, e, next) => {
     const started = await next(e)
+    const settings = (await $.store.get('settings')) as { normalCompaction?: boolean } | undefined
+    normalCompaction = settings?.normalCompaction === true
     for (const tool of TOOLS) await $.tool.register(tool)
+    await $.command.register({ name: 'notes', description: 'Notes continuity status and settings' })
     return started
+  })
+
+  // After new_context, the turn ends at its next model request, once the whole tool batch ran,
+  // as Pi's new_context ends the run; the rollover then follows the turn's completion.
+  // A note that failed this turn keeps the turn going, so the model sees the error; the rollover is then cancelled.
+  on('turn.step', async function* ($, e, next) {
+    if (e.agentId !== undefined || pending?.kind !== 'requested' || turn?.notes === 'failed') return yield* next(e)
+    const answer = 'Starting a new context window.'
+    yield { kind: 'text', index: 0, text: answer }
+    yield { kind: 'stop', stopReason: 'end_turn', usage: null }
+    return { turnId: e.turnId, index: e.index, answer, toolUses: [], stopReason: 'end_turn', usage: null }
   })
 
   // /clear ends this session in the same process, under a new ID.
@@ -490,6 +645,8 @@ export const register: Register = (on) => {
     } else if (was?.kind === 'requested') {
       pending = undefined
       if (e.isAborted) $.ui.toast('Rollover cancelled by the interruption. The old context remains.')
+      else if (turn?.id === e.turnId && turn.notes === 'failed')
+        $.ui.toast('Rollover did not start: a note failed to save this turn. The old context remains.')
       else roll($)
     }
     return completed
@@ -497,8 +654,13 @@ export const register: Register = (on) => {
 
   on('session.compact', async ($, e, next) => {
     if (e.agentId !== undefined || e.trigger === 'precompute') return next(e)
-    if (pending?.kind === 'rolling') return openWindow($)
-    if (e.trigger === 'manual') {
+    if (pending?.kind === 'rolling') {
+      if (!normalCompaction) return openWindow($)
+      const compacted = await next(e)
+      return compacted.skip ? compacted : openWindow($, compacted.messages)
+    }
+    // With normal compaction on, /compact is Claude Code's own, as in Pi.
+    if (e.trigger === 'manual' && !normalCompaction) {
       if (pending) return { skip: 'A notes checkpoint or rollover is already pending.' }
       const windowId = (await session($)).state.window.currentWindowId
       const instructions = e.instructions?.trim()
@@ -508,7 +670,7 @@ export const register: Register = (on) => {
       $.clock.after(100, () => $.prompt.submit({ text: CHECKPOINT_PROMPT + guidance }))
       return { skip: 'Saving a notes checkpoint first. The new window opens after it completes.' }
     }
-    // Automatic compaction stays Claude Code's own; reminders restart in the compacted context.
+    // Other compaction stays Claude Code's own; reminders restart in the compacted context.
     const compacted = await next(e)
     if (!compacted.skip) {
       const { dir, state } = await session($)
@@ -532,8 +694,53 @@ export const register: Register = (on) => {
     pending = { kind: 'requested' }
     return result({
       started: true,
-      message: 'Finish your response now. A new window will continue from your notes after this turn',
+      message: normalCompaction
+        ? 'Normal compaction will run before the new window opens'
+        : 'A new window will continue from your notes after this turn',
     })
+  })
+
+  on('command.run', { command: 'notes' }, async ($, e) => {
+    if (e.args.trim()) return { text: 'Use /notes to open the notes panel.' }
+    showPanel($, { confirmPrune: false, message: undefined })
+    await refreshPanel($)
+    await $.ui.open({ id: PANE, title: 'Notes continuity' })
+    return { text: 'Notes panel opened.' }
+  })
+
+  on('ui.render', { component: 'Pane', requestId: PANE }, async ($, e) => {
+    const { Box, Text, Button } = $.ui.resolve(e)
+    const prune = panel.confirmPrune
+      ? h(
+          Box,
+          { flexDirection: 'row', gap: 1 },
+          h(
+            Button,
+            { key: 'confirm', hotkey: 'y', variant: 'primary', onPress: () => void confirmPrune($) },
+            'Confirm prune',
+          ),
+          h(Button, { key: 'cancel', hotkey: 'c', onPress: () => showPanel($, { confirmPrune: false }) }, 'Cancel'),
+        )
+      : h(
+          Button,
+          { key: 'prune', hotkey: 'p', onPress: () => showPanel($, { confirmPrune: true, message: undefined }) },
+          'Prune missing sessions',
+        )
+    return h(
+      Box,
+      { flexDirection: 'column' },
+      ...panel.status.map((line) => h(Text, null, line)),
+      h(
+        Button,
+        { key: 'normal', hotkey: 'n', onPress: () => void toggleNormalCompaction($) },
+        `Normal compaction before new windows: ${normalCompaction ? 'on' : 'off'}`,
+      ),
+      prune,
+      panel.confirmPrune &&
+        h(Text, { dimColor: true }, 'Removes stored notes of sessions whose Claude Code transcript no longer exists.'),
+      panel.message && h(Text, { dimColor: true }, panel.message),
+      h(Button, { key: 'close', hotkey: 'x', role: 'dismiss', onPress: () => void $.ui.close({ id: PANE }) }, 'Close'),
+    ) as RenderElement
   })
 
   on('tool.call', { tool: 'mcp__notes-compaction__get_context_remaining' }, async ($, e) => {

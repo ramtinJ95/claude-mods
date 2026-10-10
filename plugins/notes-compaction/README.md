@@ -11,7 +11,7 @@ Keep working across fresh context windows. The agent saves checkpoint notes, sta
 ## What the agent gets
 
 - `notes`: list, read, search, write and append on virtual paths. `write_file` replaces; `append_to_file` adds.
-- `new_context`: starts a new context window after the current turn. The new window opens with the agent name, window IDs and recent note paths, then the agent is told to continue.
+- `new_context`: ends the turn once its tool batch has run, then opens a new context window with the agent name, window IDs and recent note paths, and tells the agent to continue.
 - `history`: lists, searches and reads earlier windows of this session, or a subagent's transcript. Loaded on demand.
 - `get_context_remaining`: remaining tokens in the current window. Loaded on demand.
 
@@ -30,6 +30,13 @@ A new window replaces the conversation with one marker message; no summary is ge
 - `/compact` asks the agent to save a checkpoint, then opens a new window only if that turn completed with a saved note. If the latest turn already saved notes and no instructions were given, it opens the new window at once. Instructions after `/compact` become checkpoint guidance.
 - Automatic compaction stays Claude Code's own summary.
 - Interrupting a turn that called `new_context`, or the checkpoint turn, cancels the rollover and keeps the old context.
+
+## Management
+
+`/notes` opens a panel with continuity status and storage counts. Changes save immediately; with the panel focused (ctrl+x tab), the bracketed letters press its buttons.
+
+- **Normal compaction before new windows** (`n`): off by default. On, each new window keeps Claude Code's summary ahead of the window message, and `/compact` is Claude Code's own.
+- **Prune missing sessions** (`p`, then `y` to confirm): removes stored notes and fork records of sessions whose Claude Code transcript no longer exists, and subagent notes no remaining session names. The active session stays. Uses the `rm` command.
 
 ## Sessions and storage
 

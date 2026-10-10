@@ -8,8 +8,12 @@ export interface SessionState {
   window: WindowIdentity
   /** `<windowId>:reminder` and `<windowId>:urgent`, each sent once per window. */
   reminded: string[]
-  /** Subagents that wrote notes in this session, kept beyond the transcript's sliding view. */
+  /** Subagents that wrote notes in this session or that its transcript launched, kept beyond the sliding view. */
   agents?: string[]
+  /** The Claude Code transcripts folder this session belongs to; prune judges only its own profile's sessions. */
+  projects?: string
+  /** The fork record this session was restored from, which prune keeps while the session stays. */
+  restoredFrom?: string
 }
 
 export const GUIDANCE = `<context_window_guidance>
