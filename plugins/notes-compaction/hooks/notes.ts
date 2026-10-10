@@ -11,40 +11,64 @@ export async function noteFileName(path: string): Promise<string> {
   return `${[...new Uint8Array(digest)].map((b) => b.toString(16).padStart(2, '0')).join('')}.json`
 }
 
-export function recentPaths(notes: ReadonlyMap<string, Note>): string[] {
+/** The main conversation's agent name; a subagent is `/root/<agentId>`. */
+export const ROOT = '/root'
+
+export function agentName(agentId: string | undefined): string {
+  return agentId === undefined ? ROOT : `${ROOT}/${agentId}`
+}
+
+export function recentPaths(notes: ReadonlyMap<string, Note>, agent: string): string[] {
   return [...notes.values()]
     .sort((a, b) => b.updatedAt - a.updatedAt)
     .slice(0, 5)
-    .map((note) => note.path)
+    .map((note) => `${agent}/notes/${note.path}`)
 }
 
-function canonicalPath(path: unknown, required: boolean): string {
+/**
+ * Virtual paths: relative belongs to the calling agent; `<agent>/notes[/path]` names any agent
+ * of this session. The shortest agent prefix wins, so `/root/notes/notes/x` is root's `notes/x`.
+ */
+export function resolvePath(path: unknown, self: string, required: boolean): { agent: string; path: string } {
   if (typeof path !== 'string' || !path.trim()) {
     if (required) throw new Error('Supply a note path')
-    return ''
+    return { agent: self, path: '' }
+  }
+  let agent = self
+  let value = path
+  if (path.startsWith('/')) {
+    const match = /^(\/root(?:\/[A-Za-z0-9_-]+)*?)\/notes(?:\/(.*))?$/.exec(path)
+    if (!match) throw new Error("Use a relative path for your own notes, or <agent>/notes/<path> for another agent's")
+    agent = match[1]!
+    value = match[2] ?? ''
   }
   if (
-    path.startsWith('/') ||
-    path.split('/').some((part) => part === '..' || part === '.') ||
-    /[\0\r\n]/.test(path)
+    (required && !value) ||
+    value.split('/').some((part) => part === '..' || part === '.') ||
+    /[\0\r\n]/.test(value)
   )
-    throw new Error('Use a relative virtual note path without dot segments or control characters')
-  return path
+    throw new Error('Use a virtual note path without dot segments or control characters')
+  return { agent, path: value }
 }
 
 function integer(value: unknown, fallback: number, max: number): number {
   return typeof value === 'number' && Number.isInteger(value) ? Math.max(1, Math.min(value, max)) : fallback
 }
 
-/** Returns the action's JSON payload, and for a write the note the caller must persist. */
+/**
+ * Runs one action on one agent's notes. Path fields arrive resolved relative to that agent
+ * (resolvePath); `root` (`<agent>/notes/`) prefixes every path shown back.
+ * Returns the action's JSON payload, and for a write the note the caller must persist.
+ */
 export function useNotes(
   notes: ReadonlyMap<string, Note>,
   params: Record<string, unknown>,
   now: number,
+  root: string,
 ): { payload: Record<string, unknown>; write?: Note } {
   const action = params['action']
   if (action === 'write_file' || action === 'append_to_file') {
-    const path = canonicalPath(params['path'], true)
+    const path = String(params['path'])
     const text = params['text']
     if (typeof text !== 'string') throw new Error('Supply note text')
     const previous = notes.get(path)
@@ -52,14 +76,14 @@ export function useNotes(
     if (new TextEncoder().encode(next).length > 1_000_000)
       throw new Error('Note exceeds 1 MB. Split it into separate paths.')
     return {
-      payload: { path, chars: next.length },
+      payload: { path: `${root}${path}`, chars: next.length },
       write: { path, text: next, createdAt: previous?.createdAt ?? now, updatedAt: now },
     }
   }
   if (action === 'read_file') {
-    const path = canonicalPath(params['path'], true)
+    const path = String(params['path'])
     const note = notes.get(path)
-    if (!note) return { payload: { path, file: null } }
+    if (!note) return { payload: { path: `${root}${path}`, file: null } }
     const lines = note.text.split('\n')
     const start = integer(params['start_line'], 1, lines.length + 1)
     const stop = integer(params['stop_line'], lines.length, lines.length)
@@ -76,7 +100,7 @@ export function useNotes(
     }
     return {
       payload: {
-        path,
+        path: `${root}${path}`,
         text,
         start_line: start,
         total_lines: lines.length,
@@ -85,7 +109,7 @@ export function useNotes(
     }
   }
   if (action === 'list_files_by_prefix') {
-    const prefix = canonicalPath(params['prefix'], false)
+    const prefix = String(params['prefix'] ?? '')
     const files = [...notes.values()].filter((note) => note.path.startsWith(prefix))
     const by = params['file_order_by']
     files.sort((a, b) =>
@@ -101,7 +125,7 @@ export function useNotes(
       payload: {
         files: files
           .slice(0, maximum)
-          .map((note) => ({ path: note.path, chars: note.text.length, updated_at: note.updatedAt })),
+          .map((note) => ({ path: `${root}${note.path}`, chars: note.text.length, updated_at: note.updatedAt })),
         truncated: files.length > maximum,
       },
     }
@@ -109,7 +133,7 @@ export function useNotes(
   const query = params['query']
   if (action !== 'search_contents' || typeof query !== 'string' || !query)
     throw new Error('Supply a nonempty search query')
-  const prefix = canonicalPath(params['path_prefix'], false)
+  const prefix = String(params['path_prefix'] ?? '')
   const files = [...notes.values()].filter((note) => note.path.startsWith(prefix))
   if (params['recent_file_first'] === true) files.sort((a, b) => b.updatedAt - a.updatedAt)
   const found: { path: string; matches: { line: number; text: string }[]; truncated: boolean }[] = []
@@ -126,7 +150,7 @@ export function useNotes(
       truncated = true
       break
     }
-    found.push({ path: note.path, matches, truncated: matches.length < all.length })
+    found.push({ path: `${root}${note.path}`, matches, truncated: matches.length < all.length })
     chars += size
   }
   return { payload: { files: found, truncated } }

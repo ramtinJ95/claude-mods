@@ -8,6 +8,8 @@ export interface SessionState {
   window: WindowIdentity
   /** `<windowId>:reminder` and `<windowId>:urgent`, each sent once per window. */
   reminded: string[]
+  /** Subagents that wrote notes in this session, kept beyond the transcript's sliding view. */
+  agents?: string[]
 }
 
 export const GUIDANCE = `<context_window_guidance>
@@ -17,6 +19,7 @@ Save changed state after substantial work, before replying, and before new_conte
 </context_window_guidance>`
 
 export const WINDOW_OPEN = '<context_window>'
+const FIRST = 'First context window id: '
 const CURRENT = 'Current context window id: '
 const PREVIOUS = 'Previous context window id: '
 
@@ -34,15 +37,15 @@ export function nextWindow(current: WindowIdentity): WindowIdentity {
   }
 }
 
-export function windowText(ids: WindowIdentity, recentNotes: readonly string[]): string {
-  const lines = [`First context window id: ${ids.firstWindowId}`, `${CURRENT}${ids.currentWindowId}`]
+export function windowText(agent: string, ids: WindowIdentity, recentNotes: readonly string[]): string {
+  const lines = [`Agent name: ${agent}`, `${FIRST}${ids.firstWindowId}`, `${CURRENT}${ids.currentWindowId}`]
   if (ids.previousWindowId) lines.push(`${PREVIOUS}${ids.previousWindowId}`)
   if (recentNotes.length) lines.push(`Recent notes: ${recentNotes.join(', ')}`)
   return `${WINDOW_OPEN}\n${lines.join('\n')}\n</context_window>`
 }
 
 /** Window boundary written by windowText, read back from the transcript. */
-export function parseWindow(text: string): { current: string; previous?: string } | undefined {
+export function parseWindow(text: string): { first?: string; current: string; previous?: string } | undefined {
   if (!text.startsWith(WINDOW_OPEN)) return
   const field = (prefix: string) =>
     text
@@ -51,7 +54,7 @@ export function parseWindow(text: string): { current: string; previous?: string 
       ?.slice(prefix.length)
       .trim()
   const current = field(CURRENT)
-  return current ? { current, previous: field(PREVIOUS) } : undefined
+  return current ? { first: field(FIRST), current, previous: field(PREVIOUS) } : undefined
 }
 
 export function reminderFor(state: SessionState, percentUsed: number | undefined): string | undefined {

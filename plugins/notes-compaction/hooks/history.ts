@@ -21,7 +21,7 @@ function hash(text: string): string {
 }
 
 /** $.session.messages() answers the newest 4096 messages; past that, positions shift and old rows drop. */
-const MESSAGE_LIMIT = 4096
+export const MESSAGE_LIMIT = 4096
 
 /**
  * The session's own transcript is the archive: compaction replaces what the model reads,
