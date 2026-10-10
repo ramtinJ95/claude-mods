@@ -113,8 +113,8 @@ const EMPTY_SCHEMA = { type: 'object', properties: {}, additionalProperties: fal
 const TOOLS = [
   {
     name: 'notes',
-    description:
-      'Cross-window notes. write_file replaces; append_to_file adds. Virtual paths: relative uses current agent; cross-agent uses <agent>/notes[/path], read-only. Call with no arguments for help.',
+    // The description carries the checkpoint guidance: prompt events do not reach this mod (see AGENTS.md).
+    description: `Cross-window notes. write_file replaces; append_to_file adds. Virtual paths: relative uses current agent; cross-agent uses <agent>/notes[/path], read-only. Call with no arguments for help.\n\n${GUIDANCE}`,
     inputSchema: NOTES_SCHEMA,
     isDeferred: false,
   },
@@ -376,14 +376,24 @@ async function contextUsed($: EngineInterface): Promise<{ limit: number; tokens?
   return { limit: Math.min(context.window, compactThreshold ?? context.window), tokens: context.tokens }
 }
 
+/**
+ * Characters of tool results since the model's last request. Measured usage stops at that request,
+ * so a large batch (several file reads) would otherwise cross the limit unseen.
+ */
+let batchChars = 0
+/** A rough, early-leaning conversion for code and prose alike. */
+const CHARS_PER_TOKEN = 3
+
 /** Context reminders ride on tool results, the one mid-turn channel to the model. Each fires once per window. */
 async function remind($: EngineInterface, agentId: string | undefined, called: ToolCallResult): Promise<ToolCallResult> {
   if (agentId !== undefined || called.deny !== undefined) return called
+  batchChars += (called.text ?? (typeof called.result === 'string' ? called.result : JSON.stringify(called.result ?? ''))).length
   try {
     const { dir, state } = await session($)
     if (remindersDone(state)) return called
     const { limit, tokens } = await contextUsed($)
-    const reminder = reminderFor(state, tokens === undefined || limit <= 0 ? undefined : (100 * tokens) / limit)
+    const estimate = tokens === undefined ? undefined : tokens + batchChars / CHARS_PER_TOKEN
+    const reminder = reminderFor(state, estimate === undefined || limit <= 0 ? undefined : (100 * estimate) / limit)
     if (!reminder) return called
     await saveState($, dir, state)
     return { ...called, context: [...(called.context ?? []), reminder] }
@@ -601,6 +611,7 @@ export const register: Register = (on) => {
   // as Pi's new_context ends the run; the rollover then follows the turn's completion.
   // A note that failed this turn keeps the turn going, so the model sees the error; the rollover is then cancelled.
   on('turn.step', async function* ($, e, next) {
+    if (e.agentId === undefined) batchChars = 0
     if (e.agentId !== undefined || pending?.kind !== 'requested' || turn?.notes === 'failed') return yield* next(e)
     const answer = 'Starting a new context window.'
     yield { kind: 'text', index: 0, text: answer }
@@ -612,12 +623,6 @@ export const register: Register = (on) => {
   on('session.end', async ($, e, next) => {
     sessionId = loaded = turn = freshWindowId = pending = undefined
     return next(e)
-  })
-
-  on('prompt.compose', async ($, e, next) => {
-    const composed = await next(e)
-    if (!e.tools.includes(NOTES_TOOL)) return composed
-    return { sections: [...composed.sections, { id: 'notes-compaction:guidance', text: GUIDANCE, scope: 'session' }] }
   })
 
   on('turn.start', async ($, e, next) => {

@@ -3,4 +3,6 @@
 - A fork copies its parent's transcript under a new session ID and nothing else. `loadSession` rebuilds root notes from the `revisions/<tool_use_id>.json` the copied write calls name, so every root write must save its revision before reporting success.
 - `new_context` ends its turn from `turn.step`: the next model request is answered with a made-up closing message, so the whole tool batch runs first and the turn completes normally, not as an interruption.
 - `$.fs` cannot delete. Prune removes files through `$.process.run(['rm', '-rf', ...])`, with paths built only under the storage root.
+- `prompt.compose`, `prompt.section` and `prompt.context` hooks never fired for this mod on 2.1.296, so the checkpoint guidance lives in the `notes` tool description. Verify with a fresh session asked to quote the `<context_window_guidance>` block.
+- `$.session.usage()` reports the context of the model's last request, before the current batch's tool results. Reminders add those results' size, or a large read batch crosses the limit unseen.
 - Classic hooks (`classic.SessionStart`, `classic.PreCompact`, `classic.PostCompact`) did not fire for this mod on 2.1.296; the window message carries everything the new window needs.
