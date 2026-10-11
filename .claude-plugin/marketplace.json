@@ -12,6 +12,11 @@
       "name": "shepherdr",
       "source": "./plugins/shepherdr",
       "description": "Spawn, delegate to and monitor Pi agents in Herdr, with results pushed back into the session"
+    },
+    {
+      "name": "review-pane",
+      "source": "./plugins/review-pane",
+      "description": "Review the working diff or the last response in a pane: annotate lines, ask questions inline and prepare a follow-up prompt"
     }
   ]
 }
