@@ -384,19 +384,24 @@ let batchChars = 0
 /** A rough, early-leaning conversion for code and prose alike. */
 const CHARS_PER_TOKEN = 3
 
-/** Context reminders ride on tool results, the one mid-turn channel to the model. Each fires once per window. */
+/** The context reminder due once `unsentChars` more reach the model, marked sent. Each fires once per window. */
+async function dueReminder($: EngineInterface, unsentChars: number): Promise<string | undefined> {
+  const { dir, state } = await session($)
+  if (remindersDone(state)) return
+  const { limit, tokens } = await contextUsed($)
+  const estimate = tokens === undefined ? undefined : tokens + unsentChars / CHARS_PER_TOKEN
+  const reminder = reminderFor(state, estimate === undefined || limit <= 0 ? undefined : (100 * estimate) / limit)
+  if (reminder) await saveState($, dir, state)
+  return reminder
+}
+
+/** Mid-turn, reminders ride on tool results, the one channel to the model. */
 async function remind($: EngineInterface, agentId: string | undefined, called: ToolCallResult): Promise<ToolCallResult> {
   if (agentId !== undefined || called.deny !== undefined) return called
   batchChars += (called.text ?? (typeof called.result === 'string' ? called.result : JSON.stringify(called.result ?? ''))).length
   try {
-    const { dir, state } = await session($)
-    if (remindersDone(state)) return called
-    const { limit, tokens } = await contextUsed($)
-    const estimate = tokens === undefined ? undefined : tokens + batchChars / CHARS_PER_TOKEN
-    const reminder = reminderFor(state, estimate === undefined || limit <= 0 ? undefined : (100 * estimate) / limit)
-    if (!reminder) return called
-    await saveState($, dir, state)
-    return { ...called, context: [...(called.context ?? []), reminder] }
+    const reminder = await dueReminder($, batchChars)
+    return reminder ? { ...called, context: [...(called.context ?? []), reminder] } : called
   } catch {
     return called
   }
@@ -605,6 +610,17 @@ export const register: Register = (on) => {
     for (const tool of TOOLS) await $.tool.register(tool)
     await $.command.register({ name: 'notes', description: 'Notes continuity status and settings' })
     return started
+  })
+
+  // A turn without tool calls gets its reminder with the prompt. Our own prompts are skipped:
+  // "Continue." arrives while usage still measures the old window, and the checkpoint prompt already asks for notes.
+  on('prompt.submit', async ($, e, next) => {
+    if (e.origin.kind === 'plugin' && e.origin.name === 'notes-compaction') return next(e)
+    // This runs before turn.start refreshes the threshold, which a resumed session has yet to read.
+    const reminder = await refreshThreshold($)
+      .then(() => dueReminder($, e.text.length))
+      .catch(() => undefined)
+    return next(reminder ? { ...e, context: [...(e.context ?? []), reminder] } : e)
   })
 
   // After new_context, the turn ends at its next model request, once the whole tool batch ran,
