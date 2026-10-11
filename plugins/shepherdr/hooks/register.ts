@@ -1,20 +1,39 @@
 import type { EngineInterface, Register } from 'claude-code'
 
-import { type AgentSummary, type AnswerResult, type Bridge, type Delivery, type Tracked, call, message } from './bridge'
+import {
+  type AgentSummary,
+  type AnswerResult,
+  type AnswerStatus,
+  type Bridge,
+  type Delivery,
+  type Tracked,
+  call,
+  message,
+  sendRoute,
+} from './bridge'
 import { type AgentsRequest, type ProfileSummary, TOOL_SPEC, helpText, orchestrationGuidance, parseRequest } from './contract'
 import { Fleet, type SessionIo } from './fleet'
 import { CallRow, PushedReports, ResultRow, parseReports } from './render'
+import { awaitAnswer, takeAnswer } from './worker'
 
 const COMMAND = 'shepherdr'
 
 type Machine = { id: string; label: string; enabled: boolean }
-type Profiles = { source: string; profiles: ProfileSummary[] }
+type Profiles = { sources: Record<string, string>; profiles: ProfileSummary[] }
 
 let fleet: Fleet | undefined
+/** Texts this mod is sending to Claude Code workers right now, for its own permission check. */
+const sending = new Map<string, number>()
 
 function requireFleet(): Fleet {
   if (!fleet) throw new Error('Shepherdr is still starting; retry')
   return fleet
+}
+
+/** This session's open-question file; askFile in bridge/workers/claude.mjs reads it. */
+async function askFile($: EngineInterface): Promise<string> {
+  const [xdg, home, sessionId] = await Promise.all([$.env.get('XDG_DATA_HOME'), $.env.get('HOME'), $.session.id()])
+  return `${xdg || `${home}/.local/share`}/claude-shepherdr/asks/${sessionId}.json`
 }
 
 /** A hook's own process calls: a blocking wait pauses only that hook's budget. */
@@ -23,6 +42,16 @@ function bridgeOf($: EngineInterface): Bridge {
     root: $.plugin.root,
     run: (argv, init) => $.process.run(argv, init),
     spawn: request => $.process.spawn(request),
+    send: async (sessionId, text) => {
+      sending.set(text, (sending.get(text) ?? 0) + 1)
+      try {
+        return await $.session.send({ to: { sessionId }, text })
+      } finally {
+        const left = (sending.get(text) ?? 1) - 1
+        if (left) sending.set(text, left)
+        else sending.delete(text)
+      }
+    },
   }
 }
 
@@ -83,12 +112,21 @@ async function handle(bridge: Bridge, cwd: string, request: AgentsRequest, signa
     }
     case 'spawn': {
       const delivery = await call<Delivery>(bridge, 'spawn', { ...request, fallbackCwd: cwd }, 240_000)
+      try {
+        await sendRoute(bridge, delivery.session)
+      } catch (error) {
+        const worker = delivery.agent.name ?? delivery.agent.target
+        throw new Error(
+          `${worker} started but did not receive its task: ${message(error)}. Assign the task to ${worker}, or close it with send "/quit"`,
+        )
+      }
       const blocking = delivery.profileBlocking ?? request.blocking ?? true
       return dispatchWork(bridge, current, delivery, request.message!, blocking, signal)
     }
     case 'assign': {
       const params = { machine, target: request.target, message: request.message, kind: 'task' }
       const delivery = await call<Delivery>(bridge, 'deliver', params, 90_000)
+      await sendRoute(bridge, delivery.session)
       return dispatchWork(bridge, current, delivery, request.message!, request.blocking ?? true, signal)
     }
     case 'answer': {
@@ -97,7 +135,12 @@ async function handle(bridge: Bridge, cwd: string, request: AgentsRequest, signa
       try {
         const params = { machine, target: request.target, ask_id: askId, answers: request.answers }
         const answered = await call<AnswerResult>(bridge, 'answer', params, 150_000)
-        const result = { target: answered.agent.target, ask_id: askId, status: answered.status }
+        let { status } = answered
+        if (answered.session) {
+          await sendRoute(bridge, answered.session)
+          ;({ status } = await call<AnswerStatus>(bridge, 'answered', params, 30_000))
+        }
+        const result = { target: answered.agent.target, ask_id: askId, status }
         if (!answered.record) return JSON.stringify({ ...result, input_sent: false })
         const record = current.track({ agent: answered.agent, record: answered.record }, undefined, true)
         // A background Ask never stopped its worker: there is nothing to wait for.
@@ -110,6 +153,7 @@ async function handle(bridge: Bridge, cwd: string, request: AgentsRequest, signa
     case 'send': {
       const params = { machine, target: request.target, message: request.message, kind: 'message' }
       const delivery = await call<Delivery>(bridge, 'deliver', params, 90_000)
+      await sendRoute(bridge, delivery.session)
       return JSON.stringify({
         target: delivery.agent.target,
         delivery: delivery.delivery,
@@ -227,6 +271,52 @@ export const register: Register = on => {
     }
     fleet.compacted()
     return compacted
+  }).catch(($, e, next) => next(e))
+
+  // A delivery to a Claude Code worker is part of the agents call the session
+  // already approved; auto mode's classifier cannot judge it on its own. Only
+  // this mod's own send of a text it is delivering right now is allowed.
+  on('tool.check', { tool: 'SendMessage' }, ($, e, next) => {
+    // $.session.send runs as this mod's SendMessage call with { to, message }.
+    const text = (e.input as { message?: unknown }).message
+    return next.origin.plugin === $.plugin.name && typeof text === 'string' && sending.has(text)
+      ? { decision: 'allow', reason: 'Shepherdr delivery for an approved agents call' }
+      : next(e)
+  }).catch(($, e, next) => next(e))
+
+  // Worker side: a controller's answer settles this session's open question
+  // in place of its dialog, whichever comes first; the dialog then closes.
+  on('tool.call', { tool: 'AskUserQuestion' }, async ($, e, next) => {
+    if (e.agentId || !e.tool_use_id) return next(e)
+    const file = await askFile($)
+    await $.fs.write(file, JSON.stringify({ toolCallId: e.tool_use_id, questions: e.questions }))
+    const remote = awaitAnswer(e.tool_use_id)
+    try {
+      const winner = await Promise.race([
+        next(e).then(local => ({ local })),
+        remote.answered.then(payload => ({ payload })),
+      ])
+      if ('local' in winner) return winner.local
+      const { answers, annotations } = winner.payload
+      return {
+        result: {
+          questions: e.questions,
+          answers,
+          ...(annotations && Object.keys(annotations).length ? { annotations } : {}),
+        },
+      }
+    } finally {
+      remote.cancel()
+      await $.fs.write(file, '{}')
+    }
+  }).catch(($, e, next) => (next.called ? { deny: 'The question was interrupted; ask it again.' } : next(e)))
+
+  // A frame for a question already settled is dropped too: it was never for the model.
+  on('session.receive', ($, e, next) => {
+    if (e.origin.kind !== 'peer') return next(e)
+    const taken = takeAnswer(e.text)
+    if (!taken) return next(e)
+    return { consumed: taken === 'answered' ? 'answered an open question' : 'answer for a question no longer open' }
   }).catch(($, e, next) => next(e))
 
   on('command.run', { command: COMMAND }, ($, e) => runCommand($, e.args))

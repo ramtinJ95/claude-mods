@@ -1,0 +1,11 @@
+{
+	"description": "Read-only review",
+	"blocking": true,
+	"model": "claude-opus-5-5",
+	"effort": "high",
+	"permission_mode": "auto",
+	"prompt": "prompt.md",
+	"prepare": "../../profiles/reviewer/prepare.mjs",
+	"accepts": ["base"],
+	"claude_args": []
+}

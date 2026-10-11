@@ -1,0 +1,9 @@
+{
+	"description": "General implementation",
+	"model": "claude-opus-5-5",
+	"effort": "high",
+	"permission_mode": "auto",
+	"prompt": "prompt.md",
+	"accepts": [],
+	"claude_args": []
+}

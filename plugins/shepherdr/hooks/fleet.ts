@@ -84,7 +84,7 @@ function bodyFor({ record, status, reply, ask }: Report): string[] {
       ]
     }
     case 'interrupted':
-      return ['Its Pi session changed before the task finished; the watch continues on the new session.']
+      return ['Its session changed before the task finished; the watch continues on the new session.']
     case 'closed':
       return ['The pane closed; its watch ended.']
   }

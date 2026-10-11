@@ -1,5 +1,5 @@
-// Starts a Pi worker in a new Herdr tab, workspace or existing pane on the
-// machine this runs on.
+// Starts a Pi or Claude Code worker in a new Herdr tab, workspace or existing
+// pane on the machine this runs on.
 import { stat } from "node:fs/promises";
 import { homedir } from "node:os";
 import { resolve } from "node:path";
@@ -169,16 +169,42 @@ export async function spawnDirectory(params, fallbackCwd = homedir()) {
 	return pane.foreground_cwd || pane.cwd || fallbackCwd;
 }
 
+const AGENT_NAMES = { pi: "Pi", claude: "Claude Code" };
+
+/** A start that stalls at the folder trust prompt says so: trusting a folder is the user's decision. */
+async function startupError(paneId, cwd, agent, error) {
+	let screen;
+	try {
+		screen = (
+			await request("pane.read", {
+				pane_id: paneId,
+				source: "visible",
+				lines: 40,
+				strip_ansi: true,
+			})
+		).read?.text;
+	} catch {
+		return error;
+	}
+	if (!/\btrust\b/i.test(screen ?? "")) return error;
+	const program = AGENT_NAMES[agent];
+	return new Error(
+		`${program} stopped at its folder trust prompt for ${cwd}; ask the user to trust that folder in ${program}, or choose a trusted cwd`,
+	);
+}
+
 /**
- * Starts Pi on this machine with the controller's profile arguments.
- * `controllerWorkspace` is set only when the controller runs here.
+ * Starts the profile's agent on this machine with the controller's profile
+ * arguments. `controllerWorkspace` is set only when the controller runs here.
  */
-export async function startAgent({ params, args: profile, cwd, controllerWorkspace }) {
+export async function startAgent({ params, agent, args: profile, cwd, controllerWorkspace }) {
 	const label = params.label.trim();
 	const { agents, workspaces } = await snapshot();
 	const name = allocateName(agents, label, params.name);
-	const args = ["--name", label, ...profile];
-	if (args.includes("--no-session"))
+	// Claude Code's name bar pushes its question dialog off the screen region
+	// Herdr reads, which then misses the blocked state.
+	const args = agent === "pi" ? ["--name", label, ...profile] : profile;
+	if (agent === "pi" && args.includes("--no-session"))
 		throw new Error(
 			"spawn requires a persistent Pi session; remove --no-session from the profile",
 		);
@@ -186,12 +212,15 @@ export async function startAgent({ params, args: profile, cwd, controllerWorkspa
 	try {
 		return await startWhenShellReady({
 			name,
-			kind: "pi",
+			kind: agent,
 			pane_id: location.paneId,
 			args,
 			timeout_ms: 30_000,
 		});
 	} catch (error) {
-		return rollback(location.cleanup, error);
+		return rollback(
+			location.cleanup,
+			await startupError(location.paneId, cwd, agent, error),
+		);
 	}
 }
