@@ -76,6 +76,7 @@ export function reminderFor(state: SessionState, percentUsed: number | undefined
   if (!kind || state.reminded.includes(`${id}:${kind}`)) return
   state.reminded.push(`${id}:reminder`)
   if (kind === 'urgent') state.reminded.push(`${id}:urgent`)
-  const remaining = Math.round((100 - percentUsed) * 10) / 10
+  // Estimates lean early and can pass the limit.
+  const remaining = Math.max(0, Math.round((100 - percentUsed) * 10) / 10)
   return `<context_window_reminder>\n${kind === 'urgent' ? 'Urgent: ' : ''}${remaining}% remaining. Checkpoint the active request, state and known history IDs in notes, then call new_context ${kind === 'urgent' ? 'now, before other work' : 'before continuing work'}.\n</context_window_reminder>`
 }
