@@ -36,7 +36,7 @@ const REQUIRED: Record<Action, readonly string[]> = {
 export const TOOL_SPEC = {
   name: TOOL_NAME,
   description:
-    'Spawn, delegate to and monitor Pi agents running in Herdr. Call with {} first for profiles and rules.',
+    'Spawn, delegate to and monitor Pi and Claude Code agents running in Herdr. Call with {} first for profiles and rules.',
   isDeferred: false,
   inputSchema: {
     type: 'object',
@@ -145,17 +145,20 @@ export function orchestrationGuidance(enabled: boolean, general: boolean): strin
 
 export type ProfileSummary = {
   name: string
+  /** Present for Claude Code profiles; Pi otherwise. */
+  agent?: 'claude'
   description: string
   model: string
-  thinking: string
+  thinking?: string
+  effort?: string
   accepts?: string[]
   blocking?: boolean
 }
 
-export function helpText(profiles: { source: string; profiles: ProfileSummary[] }): string {
+export function helpText(profiles: { sources: Record<string, string>; profiles: ProfileSummary[] }): string {
   return JSON.stringify({
     profiles: profiles.profiles,
-    profile_source: profiles.source,
+    profile_sources: profiles.sources,
     requests: {
       list: '{action:"list", machine?, query?, status?} — this machine and every connected machine unless machine is given',
       commands: '{commands:true, target, machine?} — the slash commands that agent accepts',
@@ -174,7 +177,7 @@ export function helpText(profiles: { source: string; profiles: ProfileSummary[] 
       'Delegation and watch keep reporting later work until unwatch or the pane closes',
       'A question report carries its ask_id and prompts; answer it with answer, asking the user first when the choice is theirs. A background question does not stop the worker, and answering it does not wait for its task',
       'Messages starting with / run as the worker\'s slash commands without a watch; list them first with commands:true',
-      'Agents on another machine need its machine ID from list with every request; omit machine for this one',
+      'Agents on another machine need its machine ID from list with every request; omit machine for this one. Claude Code agents work on this machine only',
       'For work in this repository, create a dedicated worktree and pass it as cwd',
       'Close finished workers by sending "/quit"; do not send acknowledgements',
     ],

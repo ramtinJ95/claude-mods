@@ -1,12 +1,31 @@
 // The mod has no Node APIs; Herdr sockets, transcripts and processes go
 // through the Node helpers under ../bridge. A Bridge carries one hook's own
 // process calls, since `$` stays in the hooks module's top-level functions.
-import type { HookStream, ProcessRunInit, ProcessRunResult, ProcessSpawnChunk, ProcessSpawnRequest, ProcessSpawnResult } from 'claude-code'
+import type {
+  HookStream,
+  ProcessRunInit,
+  ProcessRunResult,
+  ProcessSpawnChunk,
+  ProcessSpawnRequest,
+  ProcessSpawnResult,
+  SessionSendResult,
+} from 'claude-code'
 
 export type Bridge = {
   root: string
   run: (argv: readonly string[], init: ProcessRunInit) => Promise<ProcessRunResult>
   spawn: (request: ProcessSpawnRequest) => HookStream<ProcessSpawnChunk, ProcessSpawnResult>
+  /** Claude Code's own cross-session message, which the Node bridge cannot send. */
+  send: (sessionId: string, text: string) => Promise<SessionSendResult>
+}
+
+/** A message for a Claude Code worker's session that the bridge prepared and the hooks send. */
+export type SessionRoute = { sessionId: string; text: string }
+
+export async function sendRoute(bridge: Bridge, route: SessionRoute | undefined): Promise<void> {
+  if (!route) return
+  const sent = await bridge.send(route.sessionId, route.text)
+  if (!sent.isDelivered) throw new Error(`The worker's Claude Code session did not take the message: ${sent.reason}`)
 }
 
 export type WorkerRecord = {
@@ -48,16 +67,21 @@ export type Delivery = {
   agent: AgentSummary
   /** Present for tasks: the watch that reports the outcome. */
   record?: WorkerRecord
-  delivery: 'peer' | 'terminal'
+  delivery: 'peer' | 'terminal' | 'session'
   command?: true
   profileBlocking?: boolean
+  session?: SessionRoute
 }
 
 export type Tracked = { agent: AgentSummary; record: WorkerRecord }
 
+export type AnswerStatus = { agent: AgentSummary; status: 'accepted' | 'rejected' | 'unknown' }
+
 export type AnswerResult = {
   agent: AgentSummary
-  status: 'accepted' | 'rejected' | 'unknown'
+  /** Absent while a `session` route is unsent; `answered` reads it afterwards. */
+  status?: AnswerStatus['status']
+  session?: SessionRoute
   /** A background Ask: the worker never stopped, so there is no settlement to wait for. */
   background?: boolean
   /** Present only when answers were entered; a recorded retry sends nothing. */

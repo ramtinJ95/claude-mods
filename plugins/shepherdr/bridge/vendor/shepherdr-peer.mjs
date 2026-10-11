@@ -189,7 +189,8 @@ function deliverFrame(request, expected, message, port, sessionFile, id, frame) 
 	});
 }
 
-async function closeExitedPane(request, expected, sessionFile) {
+/** Closes an exited worker's pane, refusing when another terminal or session holds it now. */
+export async function closeExitedPane(request, expected, sessionFile) {
 	const { pane } = await request("pane.current", {
 		caller_pane_id: expected.pane_id,
 	});

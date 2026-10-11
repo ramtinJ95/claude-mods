@@ -24,12 +24,17 @@ import {
 } from "./profiles.mjs";
 import { check, wait } from "./settle.mjs";
 import { spawnDirectory, startAgent } from "./spawn.mjs";
-import { isWorker, workerFor } from "./workers/index.mjs";
+import { workerTrigger } from "./trigger.mjs";
+import { isWorker, workerFor, workerOfKind } from "./workers/index.mjs";
 
 const DELEGATED_WORKER_GUIDANCE =
 	"If blocked mid-run, use a question-asking tool, not peer messages. Without one, end with the blocker. Finish with an assistant reply, not a separate send report; never watch your parent.";
 // Room to return a result before the caller stops waiting.
 const MARGIN_MS = 3_000;
+// A worker records a sent answer within moments of receiving it.
+const ANSWER_RECORD_MS = 10_000;
+const REMOTE_CLAUDE =
+	"Claude Code agents on another machine are not supported; use Pi agents there or Claude Code agents on this machine";
 
 function xml(value) {
 	return value
@@ -98,7 +103,7 @@ const MACHINE_OPS = {
 	"machine.directory"({ params, fallbackCwd }) {
 		return spawnDirectory(params, fallbackCwd);
 	},
-	/** Starts Pi and delivers its first task in one call. */
+	/** Starts the worker and delivers its first task in one call. */
 	async "machine.start"({ message, ...start }) {
 		const agent = await startAgent(start);
 		return deliver(agent.pane_id, message, "task");
@@ -122,23 +127,45 @@ const MACHINE_OPS = {
 		return { agent: agentSummary(agent), commands: await worker.commands(agent) };
 	},
 	/**
-	 * Enters the answers unless Pi already recorded them; the status is Pi's
-	 * record. A record comes back only when input was sent.
+	 * Enters the answers unless the worker already recorded them; the status is
+	 * the worker's record. A record comes back only when input was sent. A
+	 * `session` route still has to be sent, and its status read with
+	 * `machine.answered`.
 	 */
 	async "machine.answer"({ target, ask_id: askId, answers }) {
 		const { agent, worker } = await resolveWorker(target);
 		const prior = await worker.answerStatus(agent, askId, answers);
 		if (prior) return { agent: agentSummary(agent), status: prior };
-		const [record, { status, background }] = await Promise.all([
+		const [record, { status, background, session }] = await Promise.all([
 			recordFor(agent, worker, true),
 			worker.answer(agent, askId, answers),
 		]);
 		return {
 			agent: agentSummary(agent),
-			status: status ?? "unknown",
+			...(session ? { session } : { status: status ?? "unknown" }),
 			background,
 			record,
 		};
+	},
+	/** Waits for the worker to record answers sent through its session. */
+	async "machine.answered"({ target, ask_id: askId, answers }, deadline) {
+		const { agent, worker } = await resolveWorker(target);
+		const trigger = await workerTrigger(agent.pane_id, worker.sessionPath(agent));
+		try {
+			const recordBy = Math.min(deadline - MARGIN_MS, Date.now() + ANSWER_RECORD_MS);
+			for (;;) {
+				const status = await worker.answerStatus(agent, askId, answers);
+				if (status) return { agent: agentSummary(agent), status };
+				const remaining = recordBy - Date.now();
+				if (remaining <= 0)
+					throw new Error(
+						"The answers were sent, but the worker recorded no result; inspect it with read before retrying",
+					);
+				await trigger.next(remaining);
+			}
+		} finally {
+			trigger.close();
+		}
 	},
 	"machine.check"({ record }) {
 		return check(record);
@@ -173,6 +200,8 @@ const MACHINE_OPS = {
 async function onMachine(machine, op, params, deadline) {
 	if (!machine) return MACHINE_OPS[op](params, deadline);
 	const result = await remoteCall(machine, op, params, deadline, MARGIN_MS);
+	// Claude Code's session messages reach only sessions on this machine.
+	if (result?.session) throw new Error(REMOTE_CLAUDE);
 	return result?.record
 		? { ...result, record: { ...result.record, machine: machine.id } }
 		: result;
@@ -245,13 +274,20 @@ const CONTROLLER_OPS = {
 						!needle ||
 						JSON.stringify(Object.values(agent)).toLowerCase().includes(needle)
 					)
-						agents.push({ ...agent, ...where });
+						agents.push({
+							...agent,
+							...where,
+							...(source && workerOfKind(agent.kind)?.localOnly
+								? { unsupported: true }
+								: {}),
+						});
 		});
 		return { agents, ...(unavailable.length ? { unavailable } : {}) };
 	},
 	async spawn(params, deadline) {
 		const machine = await machineEntry(params.machine);
 		const profile = await loadProfile(params.agent_type.trim());
+		if (machine && workerOfKind(profile.agent).localOnly) throw new Error(REMOTE_CLAUDE);
 		const [context, cwd] = await Promise.all([
 			controller(),
 			onMachine(
@@ -275,6 +311,7 @@ const CONTROLLER_OPS = {
 			"machine.start",
 			{
 				params,
+				agent: profile.agent,
 				args,
 				cwd,
 				message: attribute(context, task, "task"),
@@ -309,6 +346,9 @@ const CONTROLLER_OPS = {
 	},
 	async answer({ machine, ...params }, deadline) {
 		return onMachine(await machineEntry(machine), "machine.answer", params, deadline);
+	},
+	async answered({ machine, ...params }, deadline) {
+		return onMachine(await machineEntry(machine), "machine.answered", params, deadline);
 	},
 	async check({ record }, deadline) {
 		return onMachine(await machineEntry(record.machine), "machine.check", { record }, deadline);

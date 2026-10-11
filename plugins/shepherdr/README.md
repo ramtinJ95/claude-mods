@@ -1,6 +1,6 @@
 # shepherdr
 
-Spawn, delegate to and monitor Pi agents running in [Herdr](https://herdr.dev) from Claude Code, on this machine or on Herdr's saved SSH machines. It is the Claude Code controller for [pi-shepherdr](https://github.com/IgorWarzocha/howaboua-pi-stuff/tree/main/packages/pi-shepherdr): results of background work arrive in the session on their own, so the agent never polls.
+Spawn, delegate to and monitor Pi and Claude Code agents running in [Herdr](https://herdr.dev) from Claude Code: Pi agents on this machine or on Herdr's saved SSH machines, Claude Code agents on this machine. It is the Claude Code controller for [pi-shepherdr](https://github.com/IgorWarzocha/howaboua-pi-stuff/tree/main/packages/pi-shepherdr): results of background work arrive in the session on their own, so the agent never polls.
 
 ## Install
 
@@ -23,10 +23,10 @@ One tool, `agents`. Called with `{}` it returns the available profiles, request 
 | Action | Result |
 | --- | --- |
 | `list` | Agents on this machine and every enabled remote machine, or on one `machine`, optionally filtered by `query` or `status`; watched ones are marked and unreachable machines listed |
-| `spawn` | Start a profiled Pi worker in a new tab (or `new_workspace`, or an existing `pane`) and give it a task |
-| `assign` | Give an existing Pi agent a task whose result is needed |
+| `spawn` | Start a profiled Pi or Claude Code worker in a new tab (or `new_workspace`, or an existing `pane`) and give it a task |
+| `assign` | Give an existing Pi or Claude Code agent a task whose result is needed |
 | `send` | Deliver a message without waiting or watching |
-| `answer` | Answer a worker's Pi Ask question by its `ask_id` |
+| `answer` | Answer a worker's question (Pi Ask or Claude Code's `AskUserQuestion`) by its `ask_id` |
 | `read` | The worker's latest reply, or its `visible` or `recent` terminal output |
 | `watch` / `unwatch` | Start or stop reporting an agent's work |
 | `{commands: true, target}` | The slash commands that worker accepts, without running any |
@@ -34,6 +34,14 @@ One tool, `agents`. Called with `{}` it returns the available profiles, request 
 `spawn` and `assign` wait for the worker's reply by default. With `blocking: false` they return at once, and the result arrives later as an `agent_report` message: added before the running turn's next model request, or starting a new turn when the session is idle. Watched agents also report questions, blockage and closed panes; reports of failed or blocked workers say how to inspect and recover them. Delegation keeps a watch until `unwatch` or the pane closes. Messages starting with `/` run as the worker's slash commands; `/quit` closes it.
 
 A worker's Pi Ask question is reported with its `ask_id` and prompts. A blocking question stops the worker; a background one (asked while it continues) is reported at once and the worker keeps going. `answer` takes one entry per prompt, in order: `selections` with exact choice labels, `other` for a custom answer, and an optional `comment`. It types the answers into the Ask, checking the dialog at every step and stopping rather than guessing, then reports what Pi recorded: `accepted`, `rejected`, or `unknown` when it differs from the answers sent. If Pi records nothing, the call fails instead. A blocking question's answer then waits for the worker to settle; a background one's returns at once. Retrying an answer Pi already recorded sends no input.
+
+## Claude Code workers
+
+Claude Code agents in Herdr panes on this machine are workers too: spawned from a Claude profile or any Claude Code session already running there. Tasks and messages arrive through Claude Code's own cross-session messages (`delivery: "session"`), so they show in the worker as a message from another session, never as typed input. Slash commands are typed into the worker when it is idle; `/quit` exits Claude Code and closes its pane.
+
+The worker needs this mod installed too. When it asks with `AskUserQuestion`, the question is reported like a Pi Ask, and `answer` settles the dialog in its place; whoever answers first, the person in the worker's pane or the controller, wins. `selections` and `other` join into the question's answer and `comment` becomes its note. The status reported is what the worker recorded.
+
+Spawned Claude Code workers accept their controller's messages whatever either side's permission mode, so tasks are never held for approval in the worker's pane. A profile's own `--settings` (inline JSON or an absolute path) is merged in; setting `crossSessionInbound` there overrides this, as does managed policy. A Claude Code worker also stops at its folder trust prompt in a folder it has not been trusted in; spawn reports that instead of starting it.
 
 ## Remote machines
 
@@ -52,6 +60,21 @@ Each machine needs `node` on its noninteractive SSH `PATH`, Herdr with the Pi in
 ## Profiles
 
 Profiles set a worker's model, thinking level, system prompt and optional message preparation. When pi-shepherdr is installed, its profiles in `~/.pi/agent/shepherdr/profiles/` are used, so both controllers launch the same agent types. Otherwise the bundled copies of its defaults are used: `general` for implementation, `explorer` for read-only discovery, `reviewer` for read-only review.
+
+Claude Code profiles are separate, since pi-shepherdr does not read their fields. The bundled `claude-general`, `claude-explorer` and `claude-reviewer` mirror the Pi set on Claude Opus 5.5 with high effort in auto mode. To change them, put your own profiles in `$XDG_CONFIG_HOME/claude-shepherdr/profiles/` (default `~/.config`), which then replaces the bundled set. Each profile is a folder holding `profile.json`:
+
+```json
+{
+	"description": "General implementation",
+	"model": "claude-opus-5-5",
+	"effort": "high",
+	"permission_mode": "auto",
+	"prompt": "prompt.md",
+	"claude_args": []
+}
+```
+
+`prompt` is appended to Claude Code's system prompt; `blocking`, `accepts` and `prepare` work as in Pi profiles, and `claude_args` are passed to `claude` as given.
 
 ## Sessions and storage
 

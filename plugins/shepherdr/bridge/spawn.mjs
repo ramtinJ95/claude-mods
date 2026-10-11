@@ -1,11 +1,11 @@
-// Starts a Pi worker in a new Herdr tab, workspace or existing pane on the
-// machine this runs on.
+// Starts a Pi or Claude Code worker in a new Herdr tab, workspace or existing
+// pane on the machine this runs on.
 import { stat } from "node:fs/promises";
 import { homedir } from "node:os";
 import { resolve } from "node:path";
 import { setTimeout as sleep } from "node:timers/promises";
 import { getAgent, isHerdrErrorCode, request, snapshot } from "./herdr.mjs";
-import { workerFor } from "./workers/index.mjs";
+import { workerFor, workerOfKind } from "./workers/index.mjs";
 
 const AGENT_NAME = /^[a-z][a-z0-9_-]{0,31}$/;
 
@@ -169,29 +169,50 @@ export async function spawnDirectory(params, fallbackCwd = homedir()) {
 	return pane.foreground_cwd || pane.cwd || fallbackCwd;
 }
 
+/** A start that stalls at the folder trust prompt says so: trusting a folder is the user's decision. */
+async function startupError(paneId, cwd, program, error) {
+	let screen;
+	try {
+		screen = (
+			await request("pane.read", {
+				pane_id: paneId,
+				source: "visible",
+				lines: 40,
+				strip_ansi: true,
+			})
+		).read?.text;
+	} catch {
+		return error;
+	}
+	if (!/\btrust\b/i.test(screen ?? "")) return error;
+	return new Error(
+		`${program} stopped at its folder trust prompt for ${cwd}; ask the user to trust that folder in ${program}, or choose a trusted cwd`,
+	);
+}
+
 /**
- * Starts Pi on this machine with the controller's profile arguments.
- * `controllerWorkspace` is set only when the controller runs here.
+ * Starts the profile's agent on this machine with the controller's profile
+ * arguments. `controllerWorkspace` is set only when the controller runs here.
  */
-export async function startAgent({ params, args: profile, cwd, controllerWorkspace }) {
+export async function startAgent({ params, agent, args: profile, cwd, controllerWorkspace }) {
 	const label = params.label.trim();
 	const { agents, workspaces } = await snapshot();
 	const name = allocateName(agents, label, params.name);
-	const args = ["--name", label, ...profile];
-	if (args.includes("--no-session"))
-		throw new Error(
-			"spawn requires a persistent Pi session; remove --no-session from the profile",
-		);
+	const worker = workerOfKind(agent);
+	const args = worker.launchArgs(label, profile);
 	const location = await createLocation(params, cwd, label, workspaces, controllerWorkspace);
 	try {
 		return await startWhenShellReady({
 			name,
-			kind: "pi",
+			kind: agent,
 			pane_id: location.paneId,
 			args,
 			timeout_ms: 30_000,
 		});
 	} catch (error) {
-		return rollback(location.cleanup, error);
+		return rollback(
+			location.cleanup,
+			await startupError(location.paneId, cwd, worker.program, error),
+		);
 	}
 }

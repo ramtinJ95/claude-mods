@@ -9,9 +9,8 @@ import {
 	getAgent,
 	isHerdrErrorCode,
 	snapshot,
-	workerSubscriptions,
 } from "./herdr.mjs";
-import { openTrigger } from "./trigger.mjs";
+import { workerTrigger } from "./trigger.mjs";
 import { workerFor } from "./workers/index.mjs";
 
 // Herdr can report a settled status before the worker writes its reply.
@@ -49,26 +48,21 @@ async function inspect(record) {
 			inputId: view.input?.id ?? null,
 		};
 	}
+	// A worker spawned with a known session writes its transcript with its
+	// first turn; the record learns it then.
+	const found = !record.sessionPath && path ? { sessionPath: path } : {};
 	if (status === "working" || status === "unknown")
-		return { state: "working", agent };
+		return { state: "working", agent, ...found };
 	const view = await worker.view(agent);
 	const inputId = view.input?.id ?? null;
 	if (status === "blocked")
 		return view.ask
-			? { state: "question", agent, inputId, ask: view.ask }
-			: { state: "blocked", agent, inputId };
-	if (inputId === record.seenInputId) return { state: "idle", agent };
+			? { state: "question", agent, inputId, ask: view.ask, ...found }
+			: { state: "blocked", agent, inputId, ...found };
+	if (inputId === record.seenInputId) return { state: "idle", agent, ...found };
 	if (view.assistantAfterInput && view.assistant)
-		return { state: "done", agent, inputId, reply: view.assistant };
-	return { state: "replying", agent, inputId };
-}
-
-/** Fires on the worker's status changes, pane moves and closes, and transcript writes. */
-function workerTrigger(paneId, path) {
-	return openTrigger({
-		subscriptions: workerSubscriptions([paneId]),
-		paths: path ? [path] : [],
-	});
+		return { state: "done", agent, inputId, reply: view.assistant, ...found };
+	return { state: "replying", agent, inputId, ...found };
 }
 
 function finalResult({ agent, ...rest }) {
@@ -110,8 +104,10 @@ export async function wait(record, deadline) {
 		for (;;) {
 			const result = await check(current, trigger);
 			if (result.state !== "working" && result.state !== "idle") return result;
-			if (result.agent && result.agent.target !== current.paneId) {
-				current = { ...current, paneId: result.agent.target };
+			const paneId = result.agent?.target ?? current.paneId;
+			const sessionPath = result.sessionPath ?? current.sessionPath;
+			if (paneId !== current.paneId || sessionPath !== current.sessionPath) {
+				current = { ...current, paneId, sessionPath };
 				trigger.close();
 				trigger = await workerTrigger(current.paneId, current.sessionPath);
 				continue;

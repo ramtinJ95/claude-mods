@@ -84,7 +84,7 @@ function bodyFor({ record, status, reply, ask }: Report): string[] {
       ]
     }
     case 'interrupted':
-      return ['Its Pi session changed before the task finished; the watch continues on the new session.']
+      return ['Its session changed before the task finished; the watch continues on the new session.']
     case 'closed':
       return ['The pane closed; its watch ended.']
   }
@@ -406,6 +406,8 @@ export class Fleet {
       record.status = result.agent.status
       if (result.agent.name) record.name = result.agent.name
     }
+    // A transcript first written after the watch began.
+    if (result.state !== 'replaced' && result.sessionPath) record.sessionPath = result.sessionPath
     let report: Report | undefined
     switch (result.state) {
       case 'closed':

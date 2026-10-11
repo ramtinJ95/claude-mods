@@ -4,9 +4,20 @@
 import { request } from "../herdr.mjs";
 import { sendPeerMessage } from "../vendor/shepherdr-peer.mjs";
 import { readSessionView } from "../vendor/shepherdr-session.mjs";
+import { envelopeText } from "./envelope.mjs";
 import { answerAsk, answersMatch } from "./pi-ask.mjs";
 
 export const kind = "pi";
+export const program = "Pi";
+
+/** Spawn's launch arguments: Shepherdr follows the worker through its saved session. */
+export function launchArgs(label, args) {
+	if (args.includes("--no-session"))
+		throw new Error(
+			"spawn requires a persistent Pi session; remove --no-session from the profile",
+		);
+	return ["--name", label, ...args];
+}
 
 export function sessionPath(agent) {
 	return agent.agent_session?.kind === "path"
@@ -67,15 +78,7 @@ export async function deliver(agent, message) {
 		return { delivery: "peer", ...(receipt.command ? { command: true } : {}) };
 	// Slash commands must reach Pi's editor bare to expand.
 	const command = message.text.trimStart().startsWith("/");
-	const text = command
-		? message.text
-		: [
-				message.sender,
-				message.context && `<herdr_guidance>${message.context}</herdr_guidance>`,
-				message.text,
-			]
-				.filter(Boolean)
-				.join("\n\n");
+	const text = command ? message.text : envelopeText(message);
 	await request("agent.prompt", { target: agent.pane_id, text }, 30_000);
 	return { delivery: "terminal", ...(command ? { command: true } : {}) };
 }
