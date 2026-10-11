@@ -4,8 +4,10 @@ import type { EngineInterface, Register } from 'claude-code'
 import type { AnnotationKind, DiffBase, ReviewDoc, ReviewView } from '../types'
 import { DIFF_FLAGS, GIT_CONFIG, parseDiff } from './diff'
 import { describeTarget, formatQuestion, formatReview } from './format'
-import { halfPage, layoutRows, sanitize, splitLines, visibleOffset, wrap } from './layout'
+import { halfPage, layoutRows, splitLines, visibleOffset } from './layout'
 import type { Layout } from './layout'
+import { diffLook, hangAt, lookText, markdownLooks, plainLook, sliceLook, wrapLook } from './style'
+import type { Look } from './style'
 import {
   KINDS,
   activeAnnotation,
@@ -229,12 +231,14 @@ function keyRows(keys: readonly Key[], width: number): Key[][] {
   return rows
 }
 
-type PreviewLine = { text: string; color?: string; dim?: boolean }
-
-function previewLines(doc: ReviewDoc, view: ReviewView, width: number): PreviewLine[] {
-  const lines: PreviewLine[] = []
-  const push = (text: string, style: Omit<PreviewLine, 'text'> = {}) => {
-    for (const part of splitLines(text)) for (const chunk of wrap(sanitize(part), width)) lines.push({ text: chunk, ...style })
+/** The preview's display lines: labels plain, an annotation's body and answer drawn as markdown. */
+function previewLines(doc: ReviewDoc, view: ReviewView, width: number): Look[] {
+  const lines: Look[] = []
+  const push = (text: string, style: { color?: string; dim?: boolean } = {}) => {
+    for (const part of splitLines(text)) lines.push(...wrapLook(plainLook(part, style), width))
+  }
+  const pushMarkdown = (text: string) => {
+    for (const look of markdownLooks(splitLines(text))) lines.push(...wrapLook(look, width))
   }
   if (view.mode.kind === 'draft') {
     const { draft } = view.mode
@@ -250,7 +254,7 @@ function previewLines(doc: ReviewDoc, view: ReviewView, width: number): PreviewL
   const ordered = sortAnnotations(view.annotations)
   const position = `${ordered.findIndex(one => one.id === active.id) + 1}/${ordered.length}`
   push(`${KINDS[active.kind].label} · ${describeTarget(doc, active.target)} · ${position}`, { color: KINDS[active.kind].color })
-  push(active.body)
+  pushMarkdown(active.body)
   switch (active.reply?.state) {
     case 'pending':
       push('Asking…', { dim: true })
@@ -259,14 +263,14 @@ function previewLines(doc: ReviewDoc, view: ReviewView, width: number): PreviewL
       push(active.reply.error, { color: 'error' })
       break
     case 'answered':
-      lines.push({ text: '' })
-      push(active.reply.text, { color: 'text' })
+      lines.push({ spans: [] })
+      pushMarkdown(active.reply.text)
       break
   }
   return lines
 }
 
-type Geometry = { version: number; width: number; labels: string[]; numberWidth: number; contentWidth: number; layout: Layout }
+type Geometry = { version: number; width: number; labels: string[]; looks: Look[]; numberWidth: number; contentWidth: number; layout: Layout }
 
 /** The drawn rows depend only on the doc and the width, so they are laid out once per pair, not per key. */
 let geometry: Geometry | undefined
@@ -278,7 +282,10 @@ function geometryFor(doc: ReviewDoc, version: number, width: number): Geometry {
   )
   const numberWidth = labels.reduce((widest, label) => Math.max(widest, label.length), 3)
   const contentWidth = Math.max(10, width - (numberWidth + 3))
-  geometry = { version, width, labels, numberWidth, contentWidth, layout: layoutRows(doc.rows, contentWidth) }
+  const isProse = doc.source === 'response'
+  const looks = isProse ? markdownLooks(doc.rows.map(row => row.text)) : doc.rows.map(row => diffLook(row, doc.files))
+  const layout = layoutRows(looks.map(look => ({ text: lookText(look), hang: hangAt(look, contentWidth) })), contentWidth, isProse)
+  geometry = { version, width, labels, looks, numberWidth, contentWidth, layout }
   return geometry
 }
 
@@ -312,14 +319,25 @@ export const register: Register = on => {
       const { Text } = $.ui.resolve(e)
       return <Text dimColor>The review pane needs a surface with text fields.</Text>
     }
-    const { Box, Text, Button, Input } = $.ui.resolve(e)
+    const { Box, Text, Button, Input, Code } = $.ui.resolve(e)
     const [docRead, { value: view }] = await Promise.all([$.state.get(DOC), $.state.get(VIEW)])
     const doc = docRead.value
     if (!doc || !view) return <Text dimColor>No review open. Run /review-diff or /review-response.</Text>
 
     const width = Math.max(20, e.props.bodyColumns)
     const height = Math.max(8, e.props.scroll.bodyRows)
-    const { labels, numberWidth, contentWidth, layout } = geometryFor(doc, docRead.version, width)
+    const { labels, looks, numberWidth, contentWidth, layout } = geometryFor(doc, docRead.version, width)
+    // One display line: its spans, then any code, cut at the edge (wrapping already happened).
+    const drawLook = (look: Look) => [
+      <Text key="spans" wrap="truncate-end">
+        {look.spans.map((one, index) => (
+          <Text key={`span-${index}`} color={one.color} bold={one.bold} italic={one.italic} underline={one.underline} strikethrough={one.strikethrough} dimColor={one.dim}>
+            {one.text}
+          </Text>
+        ))}
+      </Text>,
+      ...(look.code ? [<Code key="code" source={look.code.text} language={look.code.language} path={look.code.path} wrap="truncate-end" />] : []),
+    ]
     const { mode } = view
     const draft = mode.kind === 'draft' ? mode.draft : undefined
     const active = activeAnnotation(view)
@@ -423,28 +441,23 @@ export const register: Register = on => {
 
     const target = draft ? draft.target : mode.kind === 'select' ? currentTarget(view) : undefined
     const lines = layout.display.slice(offset, offset + viewport).map((line, index) => {
-      const row = doc.rows[line.row]!
       const marks = line.isContinuation ? [] : annotationsAtRow(view.annotations, line.row)
       const mark = PRIORITY.find(kind => marks.some(one => one.kind === kind))
       const isCursor = line.row === view.cursor
       const isSelected = target?.kind === 'rows' && line.row >= target.start && line.row <= target.end
       const number = line.isContinuation ? '' : labels[line.row]!
-      const fill = row.kind === 'add' || row.kind === 'del' ? line.text.padEnd(contentWidth) : line.text
       return (
-        <Text key={`row-${offset + index}`} wrap="truncate-end">
-          <Text color={mark ? KINDS[mark].color : undefined}>{mark ? KINDS[mark].glyph : ' '}</Text>
-          <Text color="claude" bold>{isCursor && !line.isContinuation ? '›' : ' '}</Text>
-          <Text dimColor={!isCursor && !isSelected} inverse={isCursor || isSelected}>{number.padStart(numberWidth)}</Text>
-          <Text> </Text>
-          <Text
-            bold={row.kind === 'file' || isCursor}
-            dimColor={row.kind === 'note'}
-            color={row.kind === 'file' ? 'suggestion' : row.kind === 'hunk' ? 'subtle' : undefined}
-            backgroundColor={row.kind === 'add' ? 'diffAdded' : row.kind === 'del' ? 'diffRemoved' : undefined}
-          >
-            {fill}
+        <Box key={`row-${offset + index}`} flexDirection="row" height={1}>
+          <Text>
+            <Text color={mark ? KINDS[mark].color : undefined}>{mark ? KINDS[mark].glyph : ' '}</Text>
+            <Text color="claude" bold>{isCursor && !line.isContinuation ? '›' : ' '}</Text>
+            <Text dimColor={!isCursor && !isSelected} inverse={isCursor || isSelected}>{number.padStart(numberWidth)}</Text>
+            <Text> </Text>
           </Text>
-        </Text>
+          <Box flexDirection="row" width={contentWidth}>
+            {drawLook(sliceLook(looks[line.row]!, line.start, line.end, line.isContinuation ? hangAt(looks[line.row]!, contentWidth) : 0))}
+          </Box>
+        </Box>
       )
     })
 
@@ -459,7 +472,9 @@ export const register: Register = on => {
           <Box flexDirection="column">
             <Text dimColor>{'─'.repeat(width)}</Text>
             {shown.map((line, index) => (
-              <Text key={`preview-${index}`} color={line.color} dimColor={line.dim} wrap="truncate-end">{line.text || ' '}</Text>
+              <Box key={`preview-${index}`} flexDirection="row" height={1}>
+                {drawLook(line)}
+              </Box>
             ))}
             {isCut && <Text dimColor>{cutLine}</Text>}
             {draft && (
