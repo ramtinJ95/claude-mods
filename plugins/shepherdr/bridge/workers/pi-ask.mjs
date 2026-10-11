@@ -4,10 +4,11 @@
 import { readFile } from "node:fs/promises";
 import { join } from "node:path";
 import { setTimeout as sleep } from "node:timers/promises";
-import { getAgent, request, workerSubscriptions } from "../herdr.mjs";
+import { getAgent, request } from "../herdr.mjs";
 import { piAgentDir } from "../profiles.mjs";
-import { openTrigger } from "../trigger.mjs";
+import { workerTrigger } from "../trigger.mjs";
 import { readSessionView } from "../vendor/shepherdr-session.mjs";
+import { checkAnswers } from "./answers.mjs";
 
 // Pi records the Ask's outcome in its transcript right after the final key.
 const RECORD_TIMEOUT_MS = 10_000;
@@ -45,27 +46,13 @@ const down = (count, key) =>
 	Array.from({ length: Math.max(0, count) }, () => key);
 
 function answerPlan(prompts, answers, controls) {
-	if (answers.length !== prompts.length)
-		throw new Error(
-			`answer requires ${prompts.length} response${prompts.length === 1 ? "" : "s"}, in prompt order`,
-		);
+	checkAnswers(prompts, answers);
 	const steps = [];
 	for (const [promptIndex, prompt] of prompts.entries()) {
 		const answer = answers[promptIndex];
-		const indexes = (answer.selections ?? []).map((label) => {
-			const index = prompt.choices.findIndex(
-				(choice) => choice.label === label,
-			);
-			if (index < 0)
-				throw new Error(
-					`unknown choice ${JSON.stringify(label)} for ${JSON.stringify(prompt.title)}`,
-				);
-			return index;
-		});
-		if (new Set(indexes).size !== indexes.length)
-			throw new Error(`duplicate choice for ${JSON.stringify(prompt.title)}`);
-		if (!prompt.multiple && indexes.length > 1)
-			throw new Error(`${JSON.stringify(prompt.title)} accepts one choice`);
+		const indexes = (answer.selections ?? []).map((label) =>
+			prompt.choices.findIndex((choice) => choice.label === label),
+		);
 		if (!prompt.multiple && indexes.length > 0 && answer.other !== undefined)
 			throw new Error(
 				`${JSON.stringify(prompt.title)} cannot combine a choice with Other/rephrase`,
@@ -270,10 +257,7 @@ export async function answerAsk(agent, sessionPath, askId, answers) {
 		throw new Error(
 			"ask UI is not ready to submit; stopped without retrying input",
 		);
-	const trigger = await openTrigger({
-		subscriptions: workerSubscriptions([agent.pane_id]),
-		paths: [sessionPath],
-	});
+	const trigger = await workerTrigger(agent.pane_id, sessionPath);
 	try {
 		await sendInput(agent, final);
 		await settledAfterAnswer(agent, sessionPath, askId, background, trigger);

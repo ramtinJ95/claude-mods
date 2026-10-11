@@ -1,7 +1,15 @@
 // A wake-up for waits: fires on Herdr events and transcript writes, and
 // remembers firing between waits so no change is missed.
-import { subscribe } from "./herdr.mjs";
+import { subscribe, workerSubscriptions } from "./herdr.mjs";
 import { watchSessions } from "./vendor/shepherdr-session-watch.mjs";
+
+/** Fires on the worker's status changes, pane moves and closes, and writes to its transcript. */
+export function workerTrigger(paneId, path) {
+	return openTrigger({
+		subscriptions: workerSubscriptions([paneId]),
+		paths: path ? [path] : [],
+	});
+}
 
 /**
  * @param {{ subscriptions?: object[], paths?: string[] }} sources

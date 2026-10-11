@@ -30,10 +30,13 @@ function requireFleet(): Fleet {
   return fleet
 }
 
-/** This session's open-question file; askFile in bridge/workers/claude.mjs reads it. */
-async function askFile($: EngineInterface): Promise<string> {
+/**
+ * This session's file in a Shepherdr data folder: `sessions` holds its saved
+ * watches, `asks` its open question, which askFile in bridge/workers/claude.mjs reads.
+ */
+async function sessionFile($: EngineInterface, folder: 'sessions' | 'asks'): Promise<string> {
   const [xdg, home, sessionId] = await Promise.all([$.env.get('XDG_DATA_HOME'), $.env.get('HOME'), $.session.id()])
-  return `${xdg || `${home}/.local/share`}/claude-shepherdr/asks/${sessionId}.json`
+  return `${xdg || `${home}/.local/share`}/claude-shepherdr/${folder}/${sessionId}.json`
 }
 
 /** A hook's own process calls: a blocking wait pauses only that hook's budget. */
@@ -207,8 +210,7 @@ export const register: Register = on => {
     ])
     const started = await next(e)
     fleet?.stop()
-    const [xdg, home, sessionId] = await Promise.all([$.env.get('XDG_DATA_HOME'), $.env.get('HOME'), $.session.id()])
-    const file = `${xdg || `${home}/.local/share`}/claude-shepherdr/sessions/${sessionId}.json`
+    const file = await sessionFile($, 'sessions')
     fleet = new Fleet(sessionIo($, file))
     try {
       await fleet.load()
@@ -288,7 +290,7 @@ export const register: Register = on => {
   // in place of its dialog, whichever comes first; the dialog then closes.
   on('tool.call', { tool: 'AskUserQuestion' }, async ($, e, next) => {
     if (e.agentId || !e.tool_use_id) return next(e)
-    const file = await askFile($)
+    const file = await sessionFile($, 'asks')
     await $.fs.write(file, JSON.stringify({ toolCallId: e.tool_use_id, questions: e.questions }))
     const remote = awaitAnswer(e.tool_use_id)
     try {

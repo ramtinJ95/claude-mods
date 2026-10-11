@@ -406,6 +406,8 @@ export class Fleet {
       record.status = result.agent.status
       if (result.agent.name) record.name = result.agent.name
     }
+    // A transcript first written after the watch began.
+    if (result.state !== 'replaced' && result.sessionPath) record.sessionPath = result.sessionPath
     let report: Report | undefined
     switch (result.state) {
       case 'closed':

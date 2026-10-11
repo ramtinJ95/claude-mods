@@ -14,7 +14,6 @@ import {
 	getAgent,
 	request,
 	snapshot,
-	workerSubscriptions,
 } from "./herdr.mjs";
 import { catalog, remoteCall, resolveMachine } from "./machines.mjs";
 import {
@@ -25,8 +24,8 @@ import {
 } from "./profiles.mjs";
 import { check, wait } from "./settle.mjs";
 import { spawnDirectory, startAgent } from "./spawn.mjs";
-import { openTrigger } from "./trigger.mjs";
-import { isWorker, workerFor } from "./workers/index.mjs";
+import { workerTrigger } from "./trigger.mjs";
+import { isWorker, workerFor, workerOfKind } from "./workers/index.mjs";
 
 const DELEGATED_WORKER_GUIDANCE =
 	"If blocked mid-run, use a question-asking tool, not peer messages. Without one, end with the blocker. Finish with an assistant reply, not a separate send report; never watch your parent.";
@@ -151,11 +150,7 @@ const MACHINE_OPS = {
 	/** Waits for the worker to record answers sent through its session. */
 	async "machine.answered"({ target, ask_id: askId, answers }, deadline) {
 		const { agent, worker } = await resolveWorker(target);
-		const path = worker.sessionPath(agent);
-		const trigger = await openTrigger({
-			subscriptions: workerSubscriptions([agent.pane_id]),
-			paths: path ? [path] : [],
-		});
+		const trigger = await workerTrigger(agent.pane_id, worker.sessionPath(agent));
 		try {
 			const recordBy = Math.min(deadline - MARGIN_MS, Date.now() + ANSWER_RECORD_MS);
 			for (;;) {
@@ -282,7 +277,9 @@ const CONTROLLER_OPS = {
 						agents.push({
 							...agent,
 							...where,
-							...(source && agent.kind === "claude" ? { unsupported: true } : {}),
+							...(source && workerOfKind(agent.kind)?.localOnly
+								? { unsupported: true }
+								: {}),
 						});
 		});
 		return { agents, ...(unavailable.length ? { unavailable } : {}) };
@@ -290,7 +287,7 @@ const CONTROLLER_OPS = {
 	async spawn(params, deadline) {
 		const machine = await machineEntry(params.machine);
 		const profile = await loadProfile(params.agent_type.trim());
-		if (machine && profile.agent === "claude") throw new Error(REMOTE_CLAUDE);
+		if (machine && workerOfKind(profile.agent).localOnly) throw new Error(REMOTE_CLAUDE);
 		const [context, cwd] = await Promise.all([
 			controller(),
 			onMachine(

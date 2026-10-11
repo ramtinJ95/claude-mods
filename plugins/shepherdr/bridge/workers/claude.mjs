@@ -6,11 +6,22 @@ import { existsSync, readdirSync } from "node:fs";
 import { readFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join } from "node:path";
-import { getAgent, isHerdrErrorCode, request, workerSubscriptions } from "../herdr.mjs";
-import { openTrigger } from "../trigger.mjs";
+import { getAgent, isHerdrErrorCode, request } from "../herdr.mjs";
+import { workerTrigger } from "../trigger.mjs";
+import { closeExitedPane } from "../vendor/shepherdr-peer.mjs";
+import { checkAnswers } from "./answers.mjs";
 import { askPrompts, readClaudeSessionView } from "./claude-session.mjs";
+import { envelopeText } from "./envelope.mjs";
 
 export const kind = "claude";
+export const program = "Claude Code";
+/** Tasks and answers travel as Claude Code cross-session messages, which stay on one machine. */
+export const localOnly = true;
+
+/** Spawn's launch arguments, without `--name`: its name bar leaves the question dialog outside the screen region Herdr reads. */
+export function launchArgs(_label, args) {
+	return args;
+}
 
 // Claude Code exits within moments of /exit; its pane then holds a shell.
 const EXIT_TIMEOUT_MS = 15_000;
@@ -38,22 +49,29 @@ function askFile(id) {
 /** Claude Code names a project's directory after its path, every other character a dash. */
 const projectDir = (cwd) => cwd.replace(/[^A-Za-z0-9]/g, "-");
 
+const transcripts = new Map();
+
 /** The transcript once Claude Code has written it; a new session has none yet. */
 export function sessionPath(agent) {
 	const id = sessionId(agent);
 	if (!id) return undefined;
+	if (transcripts.has(id)) return transcripts.get(id);
 	const projects = projectsDir();
 	const file = `${id}.jsonl`;
-	const direct = [agent.cwd, agent.foreground_cwd]
-		.filter(Boolean)
-		.map((cwd) => join(projects, projectDir(cwd), file))
-		.find((path) => existsSync(path));
-	if (direct) return direct;
-	// Long paths are shortened; any session directory may hold it.
-	if (!existsSync(projects)) return undefined;
-	return readdirSync(projects)
-		.map((dir) => join(projects, dir, file))
-		.find((path) => existsSync(path));
+	const path =
+		[agent.cwd, agent.foreground_cwd]
+			.filter(Boolean)
+			.map((cwd) => join(projects, projectDir(cwd), file))
+			.find((candidate) => existsSync(candidate)) ??
+		// Long paths are shortened; any session directory may hold it.
+		(existsSync(projects)
+			? readdirSync(projects)
+					.map((dir) => join(projects, dir, file))
+					.find((candidate) => existsSync(candidate))
+			: undefined);
+	// A session's transcript never moves; one not written yet is looked up again.
+	if (path) transcripts.set(id, path);
+	return path;
 }
 
 /**
@@ -77,6 +95,8 @@ async function publishedAsk(id) {
 export async function view(agent) {
 	const transcript = await readClaudeSessionView(sessionPath(agent));
 	const id = sessionId(agent);
+	// Not gated on Herdr's status: an attached session started with --name
+	// shows its open dialog as idle.
 	const ask = id && (await publishedAsk(id));
 	// A result in the transcript outranks a file its hook could not clear.
 	return ask && !transcript.askResults?.[ask.toolCallId]
@@ -90,21 +110,12 @@ export function isReady(agent) {
 
 /** AskUserQuestion's answers object, keyed by question, for shared-shape answers. */
 function questionAnswers(prompts, answers) {
-	if (answers.length !== prompts.length)
-		throw new Error(
-			`answer requires ${prompts.length} response${prompts.length === 1 ? "" : "s"}, in prompt order`,
-		);
+	checkAnswers(prompts, answers);
 	const result = { answers: {}, annotations: {} };
 	for (const [index, prompt] of prompts.entries()) {
 		const answer = answers[index];
-		const selections = answer.selections ?? [];
-		for (const label of selections)
-			if (!prompt.choices.some((choice) => choice.label === label))
-				throw new Error(
-					`unknown choice ${JSON.stringify(label)} for ${JSON.stringify(prompt.title)}`,
-				);
 		const other = answer.other?.trim();
-		const parts = [...new Set(selections), ...(other ? [other] : [])];
+		const parts = [...(answer.selections ?? []), ...(other ? [other] : [])];
 		if (parts.length === 0)
 			throw new Error(`${JSON.stringify(prompt.title)} needs a selection or other`);
 		if (!prompt.multiple && parts.length > 1)
@@ -152,17 +163,12 @@ export async function answer(agent, askId, answers) {
 	if (ask.toolCallId !== askId)
 		throw new Error(`${agent.pane_id} has a different open question`);
 	const payload = questionAnswers(ask.prompts, answers);
-	return {
-		background: false,
-		session: { sessionId: id, text: answerFrame(askId, payload) },
-	};
+	return { session: { sessionId: id, text: answerFrame(askId, payload) } };
 }
 
 /** Waits for Claude Code to leave the pane, then closes it. */
 async function closeAfterExit(agent) {
-	const trigger = await openTrigger({
-		subscriptions: workerSubscriptions([agent.pane_id]),
-	});
+	const trigger = await workerTrigger(agent.pane_id);
 	try {
 		const deadline = Date.now() + EXIT_TIMEOUT_MS;
 		for (;;) {
@@ -188,11 +194,7 @@ async function closeAfterExit(agent) {
 	} finally {
 		trigger.close();
 	}
-	// The pane ID may now hold another terminal; only the worker's own closes.
-	const { pane } = await request("pane.get", { pane_id: agent.pane_id });
-	if (pane.terminal_id !== agent.terminal_id)
-		throw new Error(`${agent.pane_id} now holds another terminal; Claude Code exited, its pane was left open`);
-	await request("pane.close", { pane_id: agent.pane_id });
+	await closeExitedPane(request, agent, sessionId(agent));
 }
 
 async function command(agent, text) {
@@ -218,15 +220,6 @@ export async function deliver(agent, message) {
 	if (text.startsWith("/")) return command(agent, text);
 	return {
 		delivery: "session",
-		session: {
-			sessionId: id,
-			text: [
-				message.sender,
-				message.context && `<herdr_guidance>${message.context}</herdr_guidance>`,
-				message.text,
-			]
-				.filter(Boolean)
-				.join("\n\n"),
-		},
+		session: { sessionId: id, text: envelopeText(message) },
 	};
 }

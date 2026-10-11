@@ -4,7 +4,6 @@
 import { open, stat } from "node:fs/promises";
 
 const READ_CHUNK_BYTES = 64 * 1024;
-const sessionCache = new Map();
 
 function textOf(message) {
 	if (typeof message.content === "string") return message.content;
@@ -167,7 +166,6 @@ function askResult(message) {
 }
 
 async function sessionView(path, size) {
-	const file = await open(path, "r");
 	let targetId;
 	let assistant;
 	let assistantDepth;
@@ -283,6 +281,13 @@ async function sessionView(path, size) {
 		return false;
 	};
 
+	await scanBackward(path, size, inspect);
+	return result();
+}
+
+/** Feeds `inspect` the first `size` bytes' lines, newest first, until it returns true. */
+export async function scanBackward(path, size, inspect) {
+	const file = await open(path, "r");
 	try {
 		let position = size;
 		let partial = Buffer.alloc(0);
@@ -295,35 +300,36 @@ async function sessionView(path, size) {
 			let lineEnd = data.length;
 			for (let index = data.length - 1; index >= 0; index -= 1) {
 				if (data[index] !== 0x0a) continue;
-				if (inspect(data.subarray(index + 1, lineEnd))) return result();
+				if (inspect(data.subarray(index + 1, lineEnd))) return;
 				lineEnd = index;
 			}
 			partial = data.subarray(0, lineEnd);
 		}
 		inspect(partial);
-		return result();
 	} finally {
 		await file.close();
 	}
 }
 
-export async function readSessionView(path) {
-	if (!path) return {};
-	let metadata;
-	try {
-		metadata = await stat(path);
-	} catch (error) {
-		if (error.code === "ENOENT") return {};
-		throw error;
-	}
-	const cached = sessionCache.get(path);
-	if (cached?.size === metadata.size && cached.mtimeMs === metadata.mtimeMs)
-		return cached.result;
-	const result = await sessionView(path, metadata.size);
-	sessionCache.set(path, {
-		size: metadata.size,
-		mtimeMs: metadata.mtimeMs,
-		result,
-	});
-	return result;
+/** Wraps `read(path, size)`: `{}` without a file, rereading only when its size or mtime changed. */
+export function cachedView(read) {
+	const cache = new Map();
+	return async (path) => {
+		if (!path) return {};
+		let metadata;
+		try {
+			metadata = await stat(path);
+		} catch (error) {
+			if (error.code === "ENOENT") return {};
+			throw error;
+		}
+		const cached = cache.get(path);
+		if (cached?.size === metadata.size && cached.mtimeMs === metadata.mtimeMs)
+			return cached.result;
+		const result = await read(path, metadata.size);
+		cache.set(path, { size: metadata.size, mtimeMs: metadata.mtimeMs, result });
+		return result;
+	};
 }
+
+export const readSessionView = cachedView(sessionView);

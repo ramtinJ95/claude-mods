@@ -2,13 +2,11 @@
 // uuid/parentUuid chain for the latest input, reply and AskUserQuestion
 // results, in the SessionView shape the Pi reader returns. Claude Code records
 // a question only once it is settled; the worker's hook publishes open ones.
-import { open, stat } from "node:fs/promises";
+import { cachedView, scanBackward } from "../vendor/shepherdr-session.mjs";
 
-const READ_CHUNK_BYTES = 64 * 1024;
 // Local slash commands and interruptions are recorded as user rows, but they
 // are not work given to the worker.
 const NOT_INPUT = /^\s*(?:<command-name>|<local-command-|\[Request interrupted)/;
-const sessionCache = new Map();
 
 function blocks(message) {
 	return Array.isArray(message?.content) ? message.content : [];
@@ -31,7 +29,7 @@ function inputText(entry) {
 		const queued = entry.attachment;
 		if (queued?.type !== "queued_command" || queued.commandMode !== "prompt")
 			return undefined;
-		const text = typeof queued.prompt === "string" ? queued.prompt : textOf({ content: queued.prompt });
+		const text = textOf({ content: queued.prompt });
 		return text && !NOT_INPUT.test(text) ? text : undefined;
 	}
 	if (entry.type !== "user" || entry.isCompactSummary || entry.toolUseResult)
@@ -70,7 +68,6 @@ function askResult(block, entry) {
 }
 
 async function sessionView(path, size) {
-	const file = await open(path, "r");
 	let targetId;
 	let input;
 	let assistant;
@@ -152,48 +149,9 @@ async function sessionView(path, size) {
 		return false;
 	};
 
-	try {
-		let position = size;
-		let partial = Buffer.alloc(0);
-		scan: while (position > 0) {
-			const length = Math.min(READ_CHUNK_BYTES, position);
-			position -= length;
-			const chunk = Buffer.allocUnsafe(length);
-			const { bytesRead } = await file.read(chunk, 0, length, position);
-			const data = Buffer.concat([chunk.subarray(0, bytesRead), partial]);
-			let lineEnd = data.length;
-			for (let index = data.length - 1; index >= 0; index -= 1) {
-				if (data[index] !== 0x0a) continue;
-				if (inspect(data.subarray(index + 1, lineEnd))) break scan;
-				lineEnd = index;
-			}
-			partial = data.subarray(0, lineEnd);
-			if (position === 0) inspect(partial);
-		}
-		closeReply();
-		return result();
-	} finally {
-		await file.close();
-	}
+	await scanBackward(path, size, inspect);
+	closeReply();
+	return result();
 }
 
-export async function readClaudeSessionView(path) {
-	if (!path) return {};
-	let metadata;
-	try {
-		metadata = await stat(path);
-	} catch (error) {
-		if (error.code === "ENOENT") return {};
-		throw error;
-	}
-	const cached = sessionCache.get(path);
-	if (cached?.size === metadata.size && cached.mtimeMs === metadata.mtimeMs)
-		return cached.result;
-	const result = await sessionView(path, metadata.size);
-	sessionCache.set(path, {
-		size: metadata.size,
-		mtimeMs: metadata.mtimeMs,
-		result,
-	});
-	return result;
-}
+export const readClaudeSessionView = cachedView(sessionView);

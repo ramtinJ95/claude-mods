@@ -109,9 +109,11 @@ async function profileEntries({ directory }) {
 
 export async function loadProfile(name) {
 	if (!PROFILE_NAME.test(name)) throw new Error(`invalid agent_type: ${name}`);
-	const matches = [];
-	for (const source of await profilesSources())
-		if ((await profileEntries(source)).includes(name)) matches.push(source);
+	const sources = await profilesSources();
+	const found = await Promise.all(
+		sources.map(({ directory }) => isDirectory(join(directory, name))),
+	);
+	const matches = sources.filter((_, index) => found[index]);
 	if (matches.length === 0)
 		throw new Error(`unknown agent_type ${name}; call help for available profiles`);
 	if (matches.length > 1)
@@ -154,7 +156,8 @@ export async function listProfiles() {
  */
 async function workerSettings(name, claudeArgs) {
 	const args = [];
-	let settings = {};
+	// Claude Code reads only the last flag; earlier ones do not apply.
+	let last;
 	for (let index = 0; index < claudeArgs.length; index += 1) {
 		const arg = claudeArgs[index];
 		const inline = arg.startsWith("--settings=");
@@ -162,16 +165,18 @@ async function workerSettings(name, claudeArgs) {
 			args.push(arg);
 			continue;
 		}
-		const value = inline ? arg.slice("--settings=".length) : claudeArgs[++index];
-		if (value === undefined) throw new Error(`${name}.claude_args --settings needs a value`);
-		let text = value.trim();
+		last = inline ? arg.slice("--settings=".length) : claudeArgs[++index];
+		if (last === undefined) throw new Error(`${name}.claude_args --settings needs a value`);
+	}
+	let settings = {};
+	if (last !== undefined) {
+		let text = last.trim();
 		if (!text.startsWith("{")) {
 			const path = text.startsWith("~/") ? join(homedir(), text.slice(2)) : text;
 			if (!path.startsWith("/"))
 				throw new Error(`${name}.claude_args --settings needs inline JSON or an absolute path`);
 			text = await readFile(path, "utf8");
 		}
-		// Claude Code reads only the last flag; earlier ones do not apply.
 		try {
 			settings = JSON.parse(text);
 		} catch (error) {
