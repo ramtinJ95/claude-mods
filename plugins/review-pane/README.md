@@ -17,6 +17,8 @@ A port of [pi-comment-editor](https://github.com/ramtinJ95/pi-comment-editor) to
 
 In fullscreen the pane docks beside the transcript; otherwise it opens above the prompt. One review is open at a time. Running the same command again while the review has annotations or an open draft resumes it; a different command, or `/review-diff` with the other base, is refused until you finish or discard that review. With no work in the review, a command reloads.
 
+Code is highlighted with Claude Code's own highlighter, by file name in diffs and by the fence's language in responses. Responses, annotations and answers render their markdown (emphasis, inline code, headings, lists, quotes, tables) one source line per row, so line numbers still match what you annotate. All colours come from your Claude Code theme; with an "ANSI colors only" theme they are your terminal's palette.
+
 ## Keys
 
 The pane takes the keyboard when it opens. `Esc` hands the keys back to the prompt and keeps the review; run the command again, or click the pane, to continue. Keys that do not apply right now are drawn dim and say why when pressed.

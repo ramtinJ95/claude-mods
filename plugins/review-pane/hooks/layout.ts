@@ -1,5 +1,3 @@
-import type { Row } from '../types'
-
 const TAB = '    '
 
 /** Tabs as spaces and control characters made visible, so a row draws as one line of known width. */
@@ -32,41 +30,70 @@ function cells(code: number): number {
     : 1
 }
 
-/** Splits text into chunks of at most `width` cells; an empty text is one empty chunk. */
-export function wrap(text: string, width: number): string[] {
-  const room = Math.max(1, width)
-  const chunks: string[] = []
-  let chunk = ''
+export function textWidth(text: string): number {
+  let width = 0
+  for (const char of text) width += cells(char.codePointAt(0) ?? 0)
+  return width
+}
+
+/**
+ * Cuts text into lines of at most `width` cells, as `[start, end)` offsets; an empty text is one
+ * empty line. With `byWords` a line breaks at its last space, as prose wraps, and the space it
+ * breaks at is drawn on neither line. Lines after the first leave `hang` cells for an indent.
+ */
+export function wrap(text: string, width: number, byWords = false, hang = 0): Array<[number, number]> {
+  let room = Math.max(1, width)
+  const lines: Array<[number, number]> = []
+  let start = 0
   let used = 0
-  for (const char of text) {
-    const size = cells(char.codePointAt(0) ?? 0)
-    if (used + size > room && chunk !== '') {
-      chunks.push(chunk)
-      chunk = ''
-      used = 0
+  let space = -1
+  for (let at = 0; at < text.length; ) {
+    const code = text.codePointAt(at) ?? 0
+    const length = code > 0xffff ? 2 : 1
+    const size = cells(code)
+    if (used + size > room && at > start) {
+      room = Math.max(1, width - hang)
+      if (byWords && code === 0x20) {
+        lines.push([start, at])
+        start = at + 1
+        used = 0
+        space = -1
+        at += 1
+        continue
+      }
+      // The word carried down must fit beside the indent, or the line is cut where it stands.
+      const breaksAtSpace =
+        byWords && space > start && text.slice(start, space).trim() !== '' && textWidth(text.slice(space + 1, at)) + size <= room
+      lines.push([start, breaksAtSpace ? space : at])
+      start = breaksAtSpace ? space + 1 : at
+      used = textWidth(text.slice(start, at))
+      space = -1
     }
-    chunk += char
+    if (code === 0x20) space = at
     used += size
+    at += length
   }
-  chunks.push(chunk)
-  return chunks
+  lines.push([start, text.length])
+  return lines
 }
 
 export function splitLines(text: string): string[] {
   return text.split(/\r\n|\r|\n/)
 }
 
-type DisplayRow = { row: number; text: string; isContinuation: boolean }
+/** One wrapped line: its row, and where in the row's drawn text it starts and ends. */
+type DisplayRow = { row: number; start: number; end: number; isContinuation: boolean }
 
 /** The rows as drawn at one width, and where each logical row's first display row is. */
 export type Layout = { display: DisplayRow[]; first: number[] }
 
-export function layoutRows(rows: readonly Row[], width: number): Layout {
+/** Wraps each row's drawn text (sanitized, markers already styled away) at `width`, leaving its `hang`. */
+export function layoutRows(rows: ReadonlyArray<{ text: string; hang: number }>, width: number, byWords: boolean): Layout {
   const display: DisplayRow[] = []
   const first: number[] = []
-  rows.forEach((row, index) => {
+  rows.forEach(({ text, hang }, index) => {
     first.push(display.length)
-    wrap(sanitize(row.text), width).forEach((text, part) => display.push({ row: index, text, isContinuation: part > 0 }))
+    wrap(text, width, byWords, hang).forEach(([start, end], part) => display.push({ row: index, start, end, isContinuation: part > 0 }))
   })
   return { display, first }
 }
