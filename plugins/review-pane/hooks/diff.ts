@@ -1,4 +1,12 @@
-import type { Row } from '../types'
+/** One line of `git diff`: a file or hunk header, or a line numbered on the old and new side. */
+export type DiffRow = {
+  kind: 'file' | 'hunk' | 'add' | 'del' | 'ctx' | 'note'
+  text: string
+  /** Index into the parsed `files`. */
+  file: number
+  oldLine?: number
+  newLine?: number
+}
 
 /**
  * What `parseDiff` reads is pinned against user config that changes its shape:
@@ -65,9 +73,9 @@ function headerPath(rest: string): string | undefined {
  * Parses `git diff` output (with DIFF_FLAGS) into rows: a `file` row per file,
  * a `hunk` row per hunk, and its lines numbered on the old and new side.
  */
-export function parseDiff(text: string): { files: string[]; rows: Row[] } {
+export function parseDiff(text: string): { files: string[]; rows: DiffRow[] } {
   const files: string[] = []
-  const rows: Row[] = []
+  const rows: DiffRow[] = []
   let file = -1
   let oldLine = 0
   let newLine = 0

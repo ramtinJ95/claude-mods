@@ -1,4 +1,3 @@
-import type { Row } from '../types'
 import { sanitize, textWidth, wrap } from './layout'
 
 /** A run of text drawn in one style; colours are theme keys, so they follow the person's theme. */
@@ -14,8 +13,8 @@ export type Span = {
 
 type Style = Omit<Span, 'text'>
 
-/** Code the engine's highlighter colours, by `language` or else by `path`. */
-export type CodeText = { text: string; language?: string; path?: string }
+/** Code the engine's highlighter colours by `language`. */
+export type CodeText = { text: string; language?: string }
 
 /**
  * How one row draws: styled spans, then code when the row holds some. Its text is what wraps;
@@ -49,29 +48,6 @@ export function sliceLook(look: Look, start: number, end: number, indent = 0): L
   if (!look.code) return { spans }
   const text = look.code.text.slice(Math.max(0, start - at), Math.max(0, end - at))
   return text ? { spans, code: { ...look.code, text } } : { spans }
-}
-
-/**
- * A diff row as Claude Code draws an edit under an ANSI theme, which reads in every theme: no
- * backgrounds, the marker coloured, added and context code highlighted by the file's name,
- * removed code dim.
- */
-export function diffLook(row: Row, files: readonly string[]): Look {
-  const code = (text: string): CodeText => ({ text: sanitize(text), path: row.file === undefined ? undefined : files[row.file] })
-  switch (row.kind) {
-    case 'file':
-      return { spans: [span(row.text, { bold: true, color: 'suggestion' })] }
-    case 'hunk':
-      return { spans: [span(row.text, { color: 'subtle' })] }
-    case 'add':
-      return { spans: [span('+', { color: 'success' })], code: code(row.text.slice(1)) }
-    case 'del':
-      return { spans: [span('-', { color: 'error' }), span(row.text.slice(1), { dim: true })] }
-    case 'ctx':
-      return { spans: [span(' ')], code: code(row.text.slice(1)) }
-    default:
-      return { spans: [span(row.text, { dim: row.kind === 'note' })] }
-  }
 }
 
 // A backtick fence's info string holds no backtick, so ```a``` on one line is inline code, not a fence.
