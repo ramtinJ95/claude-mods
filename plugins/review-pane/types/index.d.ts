@@ -1,23 +1,8 @@
-/** One logical line under review: a diff line, a file or hunk header, or a line of a response. */
-export type Row = {
-  kind: 'file' | 'hunk' | 'add' | 'del' | 'ctx' | 'note' | 'text'
-  text: string
-  /** Index into `ReviewDoc.files`; absent on a response's rows. */
-  file?: number
-  oldLine?: number
-  newLine?: number
-}
+/** One line of the response under review. */
+export type Row = { text: string }
 
-export type DiffBase = 'head' | 'merge-base'
-
-export type ReviewDoc = {
-  source: 'diff' | 'response'
-  /** What the rows are, for the pane's header and the prepared prompt. */
-  title: string
-  base?: DiffBase
-  files: string[]
-  rows: Row[]
-}
+/** The response the pane reviews, one row per source line. */
+export type ReviewDoc = { rows: Row[] }
 
 export type AnnotationKind = 'comment' | 'suggestion' | 'issue' | 'question'
 
@@ -67,8 +52,19 @@ export type ReviewView = {
   notice?: string
 }
 
+/** A /review-diff open in Neovim, or closed there with annotations it will reopen with. */
+export type NvimReview = {
+  /** Holds review.json, open.sh, events.jsonl, annotations.json and the socket. */
+  dir: string
+  root: string
+  title: string
+  /** Bytes of events.jsonl already handled, where a restarted follower picks up. */
+  offset: number
+  isOpen: boolean
+}
+
 declare module 'claude-code' {
   interface PluginState {
-    'review-pane': { doc: ReviewDoc | null; view: ReviewView | null }
+    'review-pane': { doc: ReviewDoc | null; view: ReviewView | null; nvim: NvimReview | null }
   }
 }

@@ -1,7 +1,7 @@
 {
 	"name": "review-pane",
-	"version": "0.2.0",
-	"description": "Review the working diff or the last response in a pane: annotate lines, ask questions inline and prepare a follow-up prompt",
+	"version": "0.3.0",
+	"description": "Review the working diff in Neovim beside Claude Code, or the last response in a pane: annotate lines, ask questions inline and prepare a follow-up prompt",
 	"author": { "name": "ramtinJ95" },
 	"types": "./types/index.d.ts"
 }

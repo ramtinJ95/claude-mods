@@ -16,7 +16,7 @@
     {
       "name": "review-pane",
       "source": "./plugins/review-pane",
-      "description": "Review the working diff or the last response in a pane: annotate lines, ask questions inline and prepare a follow-up prompt"
+      "description": "Review the working diff in Neovim beside Claude Code, or the last response in a pane: annotate lines, ask questions inline and prepare a follow-up prompt"
     }
   ]
 }

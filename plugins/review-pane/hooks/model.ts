@@ -48,7 +48,6 @@ export function currentTarget(view: ReviewView): ReviewTarget {
 function targetProblem(doc: ReviewDoc, target: ReviewTarget): string | undefined {
   if (target.kind === 'overall') return undefined
   if (doc.rows.length === 0) return 'Nothing to annotate'
-  if (doc.rows[target.start]?.file !== doc.rows[target.end]?.file) return 'A range must stay within one file'
   return undefined
 }
 
@@ -76,14 +75,6 @@ export function activeAnnotation(view: ReviewView): Annotation | undefined {
 export function moveTo(doc: ReviewDoc, view: ReviewView, row: number): ReviewView {
   if (view.mode.kind !== 'browse' && view.mode.kind !== 'select') return view
   return { ...clearActive(view), cursor: clampRow(doc, row) }
-}
-
-/** The first row of the next (`delta` 1) or previous (-1) file from the cursor. */
-export function fileRow(doc: ReviewDoc, cursor: number, delta: 1 | -1): number {
-  const starts = doc.rows.flatMap((row, index) => (row.kind === 'file' ? [index] : []))
-  if (delta > 0) return starts.find(index => index > cursor) ?? cursor
-  const before = starts.filter(index => index < cursor)
-  return before[before.length - 1] ?? cursor
 }
 
 export function toggleSelection(view: ReviewView): ReviewView {
@@ -180,15 +171,4 @@ export function setReply(view: ReviewView, id: string, reply: Reply, token?: str
 export function targetRows(doc: ReviewDoc, target: ReviewTarget): Row[] {
   if (target.kind === 'overall') return []
   return doc.rows.slice(target.start, target.end + 1)
-}
-
-/** The whole hunks a target touches, for the context a question is asked with. */
-export function hunkContext(doc: ReviewDoc, target: ReviewTarget): Row[] {
-  if (target.kind === 'overall' || doc.source !== 'diff') return targetRows(doc, target)
-  const isHeader = (row: Row) => row.kind === 'hunk' || row.kind === 'file'
-  let start = target.start
-  while (start > 0 && !isHeader(doc.rows[start]!)) start--
-  let end = target.end
-  while (end + 1 < doc.rows.length && !isHeader(doc.rows[end + 1]!)) end++
-  return doc.rows.slice(start, end + 1)
 }
