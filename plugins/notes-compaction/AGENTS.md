@@ -6,3 +6,4 @@
 - `prompt.compose`, `prompt.section` and `prompt.context` hooks never fired for this mod on 2.1.296, so the checkpoint guidance lives in the `notes` tool description. Verify with a fresh session asked to quote the `<context_window_guidance>` block.
 - `$.session.usage()` reports the context of the model's last request, before the current batch's tool results. Reminders add those results' size, or a large read batch crosses the limit unseen.
 - Classic hooks (`classic.SessionStart`, `classic.PreCompact`, `classic.PostCompact`) did not fire for this mod on 2.1.296; the window message carries everything the new window needs.
+- Claude Code's idle compaction (2.1.296) reaches `session.compact` as trigger `auto`, like threshold compaction, but with no turn running; threshold compaction comes after `turn.start` (probed with `claude -p` and `CLAUDE_CODE_AUTO_COMPACT_WINDOW=100000`, its floor). A skip leaves the idle compactor silent: no notice line.
