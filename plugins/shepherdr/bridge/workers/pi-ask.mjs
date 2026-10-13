@@ -32,7 +32,10 @@ export function answersMatch(answers, responses) {
 				custom,
 			];
 		}
-		if (selections.length === 0) selections.push(REPHRASE_REQUEST_RESPONSE);
+		// Older Ask's dialog records an answer without a selection as
+		// Other/rephrase; current Ask records a comment-only one with none.
+		if (selections.length === 0 && response.selections.length > 0)
+			selections.push(REPHRASE_REQUEST_RESPONSE);
 		if (
 			[...selections].sort().join("\0") !==
 			[...response.selections].sort().join("\0")
@@ -269,8 +272,7 @@ export async function answerAsk(agent, sessionPath, askId, answers) {
 
 /**
  * Waits until Pi records the Ask's outcome, so a final key that did not take
- * fails here. A blocking Ask then waits out Herdr's lag: the worker stays
- * `blocked` while the Ask's UI closes, which must not read as a new block.
+ * fails here, then a blocking Ask's unblocking.
  */
 async function settledAfterAnswer(agent, sessionPath, askId, background, trigger) {
 	const recordBy = Date.now() + RECORD_TIMEOUT_MS;
@@ -282,8 +284,15 @@ async function settledAfterAnswer(agent, sessionPath, askId, background, trigger
 			);
 		await trigger.next(remaining);
 	}
-	if (background) return;
-	// Past the bound the worker is reported as it stands, blocked or not.
+	if (!background) await unblockedAfterAnswer(agent, sessionPath, askId, trigger);
+}
+
+/**
+ * Waits out Herdr's lag after a blocking Ask was answered: the worker stays
+ * `blocked` while the Ask's UI closes, which must not read as a new block.
+ * Past the bound the worker is reported as it stands, blocked or not.
+ */
+export async function unblockedAfterAnswer(agent, sessionPath, askId, trigger) {
 	const unblockBy = Date.now() + UNBLOCK_TIMEOUT_MS;
 	for (;;) {
 		const current = await getAgent(agent.pane_id);

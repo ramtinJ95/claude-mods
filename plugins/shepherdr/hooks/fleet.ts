@@ -61,6 +61,13 @@ function attribute(value: string): string {
   return value.replaceAll('&', '&amp;').replaceAll('"', '&quot;').replaceAll('<', '&lt;').replaceAll('>', '&gt;')
 }
 
+function questionHint(ask: Ask | undefined): string {
+  if (ask?.handoff) return 'The worker waits on an action only the user can take. Tell the user; they complete it in its pane.'
+  if (ask?.delivery === 'steer')
+    return 'The worker continues meanwhile. Answer with answer and this ask_id, asking the user first when the choice is theirs.'
+  return 'The worker waits. Answer with answer and this ask_id, asking the user first when the choice is theirs, or let them answer in its pane.'
+}
+
 function bodyFor({ record, status, reply, ask }: Report): string[] {
   switch (status) {
     case 'done':
@@ -72,10 +79,11 @@ function bodyFor({ record, status, reply, ask }: Report): string[] {
       ]
     case 'question':
       return [
-        JSON.stringify({ ask_id: ask?.toolCallId, prompts: ask?.prompts ?? [] }),
-        ask?.delivery === 'steer'
-          ? 'The worker continues meanwhile. Answer with answer and this ask_id, asking the user first when the choice is theirs.'
-          : 'The worker waits. Answer with answer and this ask_id, asking the user first when the choice is theirs, or let them answer in its pane.',
+        JSON.stringify({
+          ask_id: ask?.toolCallId,
+          ...(ask?.question ? { question: ask.question } : { prompts: ask?.prompts ?? [] }),
+        }),
+        questionHint(ask),
       ]
     case 'blocked': {
       const herdr = record.machine ? `herdr --machine ${record.machine}` : 'herdr'

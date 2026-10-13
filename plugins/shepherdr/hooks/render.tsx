@@ -129,10 +129,11 @@ function prompts({ Box, Text }: Draw, list: readonly Prompt[], askId?: string) {
 function questionBody(draw: Draw, body: string) {
   const [json = '', ...hint] = body.split('\n').filter(line => !line.startsWith('Task: '))
   try {
-    const ask = JSON.parse(json) as { ask_id?: string; prompts: Prompt[] }
+    const ask = JSON.parse(json) as { ask_id?: string; prompts?: Prompt[]; question?: string }
     return (
       <draw.Box flexDirection="column">
-        {prompts(draw, ask.prompts, ask.ask_id)}
+        {ask.question && <draw.Text>{ask.question}</draw.Text>}
+        {prompts(draw, ask.prompts ?? [], ask.ask_id)}
         <draw.Text dimColor>{hint.join(' ')}</draw.Text>
       </draw.Box>
     )

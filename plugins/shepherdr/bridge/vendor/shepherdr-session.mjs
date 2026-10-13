@@ -4,6 +4,10 @@
 import { open, stat } from "node:fs/promises";
 
 const READ_CHUNK_BYTES = 64 * 1024;
+const EXTENSION_MESSAGE = "shepherdr-extension-message";
+export const ASK_EXTENSION = "@howaboua/pi-ask";
+/** Text an appended write holds when it can open an Ask: older Ask's entry, or current Ask's name. */
+export const ASK_ENTRY_MARKERS = ["pi-ask-active", ASK_EXTENSION];
 
 function textOf(message) {
 	if (typeof message.content === "string") return message.content;
@@ -113,6 +117,26 @@ function askFromInput(toolCallId, input) {
 	};
 }
 
+/**
+ * Current Pi Ask publishes each open question as an extension message: its
+ * own text and a reply template, reported as written. One with no template is
+ * a handoff only the user can complete.
+ */
+function askFromExtensionMessage(update) {
+	if (typeof update.message !== "string") return undefined;
+	return {
+		toolCallId: update.id,
+		handoff: typeof update.reply !== "string",
+		...(update.blocking === false ? { delivery: "steer" } : {}),
+		prompts: [],
+		// Ask's text ends by pointing at "the reply below".
+		question:
+			typeof update.reply === "string"
+				? `${update.message}\n\n${update.reply}`
+				: update.message,
+	};
+}
+
 function askResult(message) {
 	if (message.role !== "toolResult" || message.toolName !== "ask")
 		return undefined;
@@ -170,6 +194,9 @@ async function sessionView(path, size) {
 	let assistant;
 	let assistantDepth;
 	let ask;
+	// Every unanswered extension-published Ask by ID: an older one stays
+	// answerable while a newer one is reported.
+	const openAsks = new Map();
 	const askResults = new Map();
 	let depth = 0;
 	let input;
@@ -178,6 +205,7 @@ async function sessionView(path, size) {
 	const result = () => ({
 		...(assistant ? { assistant } : {}),
 		...(ask ? { ask } : {}),
+		...(openAsks.size > 0 ? { openAsks: Object.fromEntries(openAsks) } : {}),
 		...(askResults.size > 0
 			? { askResults: Object.fromEntries(askResults) }
 			: {}),
@@ -199,6 +227,22 @@ async function sessionView(path, size) {
 		if (entry.id !== targetId) return false;
 		const currentDepth = depth;
 		depth += 1;
+		if (entry.type === "custom" && entry.customType === EXTENSION_MESSAGE) {
+			const update = entry.data;
+			if (
+				update?.version === 1 &&
+				update.extension === ASK_EXTENSION &&
+				typeof update.id === "string"
+			) {
+				if (update.state === "closed") resolved.add(update.id);
+				else if (update.state === "pending" && !resolved.has(update.id)) {
+					const pending = askFromExtensionMessage(update);
+					if (pending && !openAsks.has(update.id))
+						openAsks.set(update.id, pending);
+					ask ??= pending;
+				}
+			}
+		}
 		if (entry.type === "custom" && entry.customType === "pi-ask-active") {
 			const update = entry.data;
 			if (update?.version === 1 && typeof update.id === "string") {
