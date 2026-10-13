@@ -7,6 +7,8 @@ import { createConnection } from "node:net";
 
 const MAX_PEER_FRAME_BYTES = 8 * 1024 * 1024;
 export const PEER_PROTOCOL = 4;
+// The receiver gives an extension a minute to act on a reply.
+const EXTENSION_REPLY_TIMEOUT_MS = 60_000;
 
 /** @param {string} sessionFile @param {string} terminalId */
 export function peerInboxPath(sessionFile, terminalId) {
@@ -27,16 +29,11 @@ function deliveryError(message, rejected) {
 }
 
 /**
- * Sends one message frame. Resolves undefined when the worker publishes no
- * receiver, so the caller can choose another route.
- * @param {(method: string, params: object) => Promise<any>} request
- * @param {{ pane_id: string, terminal_id: string, agent_session?: { kind: string, value: string } | null }} expected
- * @param {{ text: string, sender: string, context?: string }} message
- * @param {{ commands?: boolean }} [options] commands asks for the slash
- *   commands the worker accepts instead of delivering text; it works while blocked.
- * @returns {Promise<{ command: boolean, commands?: { name: string, description: string }[] } | undefined>}
+ * The worker's Shepherdr receiver: its descriptor and session file, after
+ * checking the pane still hosts the expected Pi session. Undefined when the
+ * worker publishes none.
  */
-export async function sendPeerMessage(request, expected, message, options = {}) {
+async function resolveReceiver(request, expected, { allowBlocked }) {
 	const { agent } = await request("agent.get", { target: expected.pane_id });
 	const session = agent?.agent_session;
 	const sessionFile = session?.kind === "path" ? session.value : undefined;
@@ -51,7 +48,7 @@ export async function sendPeerMessage(request, expected, message, options = {}) 
 			"Target Pi session changed or is not ready; resolve the target again",
 			true,
 		);
-	if (!options.commands && agent.agent_status === "blocked")
+	if (!allowBlocked && agent.agent_status === "blocked")
 		throw deliveryError(
 			"Target is blocked; answer its pending question first",
 			true,
@@ -79,24 +76,71 @@ export async function sendPeerMessage(request, expected, message, options = {}) 
 			"Target Shepherdr receiver is invalid; reload the target Pi session",
 			true,
 		);
+	return { descriptor, sessionFile, terminalId: agent.terminal_id };
+}
+
+/** A frame for `receiver` under a fresh request ID. */
+function peerFrame(receiver, fields) {
 	const id = randomUUID();
 	const frame = `${JSON.stringify({
 		protocol: PEER_PROTOCOL,
-		kind: options.commands ? "commands" : "message",
 		id,
-		token: descriptor.token,
-		sessionFile,
-		terminalId: agent.terminal_id,
-		text: message.text,
-		sender: message.sender,
-		context: message.context,
+		token: receiver.descriptor.token,
+		sessionFile: receiver.sessionFile,
+		terminalId: receiver.terminalId,
+		...fields,
 	})}\n`;
 	if (Buffer.byteLength(frame) > MAX_PEER_FRAME_BYTES)
 		throw deliveryError("Peer message is too large", true);
-	return deliverFrame(request, expected, message, descriptor.port, sessionFile, id, frame);
+	return { id, frame };
 }
 
-function deliverFrame(request, expected, message, port, sessionFile, id, frame) {
+/**
+ * Sends one message frame. Resolves undefined when the worker publishes no
+ * receiver, so the caller can choose another route.
+ * @param {(method: string, params: object) => Promise<any>} request
+ * @param {{ pane_id: string, terminal_id: string, agent_session?: { kind: string, value: string } | null }} expected
+ * @param {{ text: string, sender: string, context?: string }} message
+ * @param {{ commands?: boolean }} [options] commands asks for the slash
+ *   commands the worker accepts instead of delivering text; it works while blocked.
+ * @returns {Promise<{ command: boolean, commands?: { name: string, description: string }[] } | undefined>}
+ */
+export async function sendPeerMessage(request, expected, message, options = {}) {
+	const receiver = await resolveReceiver(request, expected, {
+		allowBlocked: options.commands === true,
+	});
+	if (!receiver) return undefined;
+	const { id, frame } = peerFrame(receiver, {
+		kind: options.commands ? "commands" : "message",
+		text: message.text,
+		sender: message.sender,
+		context: message.context,
+	});
+	return deliverFrame(request, expected, message, receiver.descriptor.port, receiver.sessionFile, id, frame);
+}
+
+/**
+ * Hands a reply to the extension that published a pending extension message
+ * (`shepherdr-extension-message`). It reaches a blocked worker without a
+ * turn and resolves once the extension accepted it; a refusal rejects with
+ * its reason. Resolves false when the worker publishes no receiver.
+ * @param {{ extension: string, id: string, message: string }} reply
+ * @returns {Promise<boolean>}
+ */
+export async function sendPeerExtensionReply(request, expected, reply) {
+	const receiver = await resolveReceiver(request, expected, { allowBlocked: true });
+	if (!receiver) return false;
+	const { id, frame } = peerFrame(receiver, {
+		kind: "extension-reply",
+		extension: reply.extension,
+		messageId: reply.id,
+		message: reply.message,
+	});
+	await deliverFrame(request, expected, { text: "" }, receiver.descriptor.port, receiver.sessionFile, id, frame, EXTENSION_REPLY_TIMEOUT_MS);
+	return true;
+}
+
+function deliverFrame(request, expected, message, port, sessionFile, id, frame, timeoutMs = 10_000) {
 	return new Promise((resolve, reject) => {
 		let attempted = false;
 		let settled = false;
@@ -120,7 +164,7 @@ function deliverFrame(request, expected, message, port, sessionFile, id, frame) 
 					!attempted,
 				),
 			);
-		const timer = setTimeout(failed, 10_000);
+		const timer = setTimeout(failed, timeoutMs);
 		timer.unref();
 		socket.setEncoding("utf8");
 		socket.on("error", failed);

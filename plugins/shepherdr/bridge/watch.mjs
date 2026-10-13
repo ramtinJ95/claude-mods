@@ -13,7 +13,10 @@ import {
 	workerSubscriptions,
 } from "./herdr.mjs";
 import { resolveMachine, spawnRemoteWatcher } from "./machines.mjs";
-import { readSessionView } from "./vendor/shepherdr-session.mjs";
+import {
+	ASK_ENTRY_MARKERS,
+	readSessionView,
+} from "./vendor/shepherdr-session.mjs";
 import { watchSessions } from "./vendor/shepherdr-session-watch.mjs";
 
 const emit = (value) => process.stdout.write(`${JSON.stringify(value)}\n`);
@@ -47,7 +50,9 @@ async function appendedAsk(path) {
 	try {
 		const buffer = Buffer.alloc(size - from);
 		await file.read(buffer, 0, buffer.length, from);
-		return buffer.includes("pi-ask-active") ? steerAsk(path) : undefined;
+		return ASK_ENTRY_MARKERS.some((marker) => buffer.includes(marker))
+			? steerAsk(path)
+			: undefined;
 	} finally {
 		await file.close();
 	}
