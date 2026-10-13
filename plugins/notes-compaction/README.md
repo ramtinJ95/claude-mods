@@ -28,7 +28,8 @@ A new window replaces the conversation with one marker message; no summary is ge
 - Reminders ride on tool results, or on your message when a turn starts, at 85% and 90% of the context Claude Code compacts at, once each per window. With an auto-compact window set (for example 400k), that is its threshold, so the checkpoint comes first; otherwise it is the model's window. Use counts the tool results of the current batch and the size of your message, so a run of large file reads or a large paste still triggers them. `get_context_remaining` measures against the same limit.
 - Ask the agent for a new window in plain words; it saves a checkpoint and calls `new_context`.
 - `/compact` asks the agent to save a checkpoint, then opens a new window only if that turn completed with a saved note. If the latest turn already saved notes and no instructions were given, it opens the new window at once. Instructions after `/compact` become checkpoint guidance.
-- Automatic compaction stays Claude Code's own summary.
+- Idle compaction, which Claude Code runs on a long conversation left idle until shortly before the prompt cache expires, opens a new window instead when the latest turn saved notes. Otherwise it asks the agent for a checkpoint and then opens one. That happens once per context: if the checkpoint fails, the next idle compaction is Claude Code's own. A window opened while idle waits for your next prompt. `"idleCompaction": false` in Claude Code's settings turns idle compaction off altogether.
+- Compaction at the auto-compact threshold stays Claude Code's own summary.
 - Interrupting a turn that called `new_context`, or the checkpoint turn, cancels the rollover and keeps the old context.
 
 ## Management

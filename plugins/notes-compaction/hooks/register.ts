@@ -184,11 +184,21 @@ const REVISION_LIMIT = 4_000_000
 let storage: Promise<string> | undefined
 let sessionId: string | undefined
 let loaded: { dir: string; promise: Promise<{ dir: string; state: SessionState }> } | undefined
+/** The running main turn. Between turns, Claude Code compacts on its own only while idle. */
 let turn: { id: string; notes: 'none' | 'saved' | 'failed' } | undefined
 /** The window whose latest completed turn saved fresh notes. */
 let freshWindowId: string | undefined
-/** At most one rollover at a time: requested by new_context, a /compact checkpoint, or the /compact opening it. */
-let pending: { kind: 'requested' } | { kind: 'checkpoint'; windowId: string } | { kind: 'rolling' } | undefined
+/**
+ * At most one rollover at a time: requested by new_context, a checkpoint (/compact or idle compaction), or the
+ * /compact opening it. One started by idle compaction (`idle`) opens a window that waits for the user.
+ */
+let pending:
+  | { kind: 'requested' }
+  | { kind: 'checkpoint'; windowId: string; idle: boolean }
+  | { kind: 'rolling'; idle: boolean }
+  | undefined
+/** The context whose idle compaction already asked for a checkpoint; a later one there stays Claude Code's own. */
+let idleCheckpointWindowId: string | undefined
 /**
  * Where Claude Code compacts on its own (an auto-compact window such as 400k), refreshed each turn.
  * Reminders and remaining context measure against it, so checkpoints come before that compaction.
@@ -333,16 +343,16 @@ async function isSessionAgent($: EngineInterface, self: string, agent: string): 
 
 /**
  * The window's opening message, after `kept` (normal compaction's summary, or nothing for a
- * notes-only window); the conversation continues once it stands.
+ * notes-only window); the conversation continues once it stands, unless the user is idle.
  */
-async function openWindow($: EngineInterface, kept: readonly SessionMessage[] = []): Promise<SessionCompacted> {
+async function openWindow($: EngineInterface, kept: readonly SessionMessage[] = [], idle = false): Promise<SessionCompacted> {
   const { dir, state } = await session($)
   const ids = nextWindow(state.window)
   const recent = recentPaths(await readNotes($, rootNotesDir(dir)), ROOT)
   state.window = ids
   state.reminded = []
   await saveState($, dir, state)
-  $.clock.after(100, () => $.prompt.submit({ text: 'Continue.' }))
+  if (!idle) $.clock.after(100, () => $.prompt.submit({ text: 'Continue.' }))
   return {
     messages: [
       ...kept,
@@ -353,8 +363,8 @@ async function openWindow($: EngineInterface, kept: readonly SessionMessage[] = 
 }
 
 /** Rollover runs between turns through /compact: the one route on which our session.compact hook answers. */
-function roll($: EngineInterface) {
-  pending = { kind: 'rolling' }
+function roll($: EngineInterface, idle = false) {
+  pending = { kind: 'rolling', idle }
   $.clock.after(100, async () => {
     try {
       await $.command.run({ command: 'compact' })
@@ -364,6 +374,12 @@ function roll($: EngineInterface) {
       pending = undefined
     }
   })
+}
+
+/** In place of a compaction: a turn that saves notes, after which turn.complete rolls into the new window. */
+function checkpoint($: EngineInterface, windowId: string, idle: boolean, guidance: string) {
+  pending = { kind: 'checkpoint', windowId, idle }
+  $.clock.after(100, () => $.prompt.submit({ text: CHECKPOINT_PROMPT + guidance }))
 }
 
 async function refreshThreshold($: EngineInterface) {
@@ -637,7 +653,7 @@ export const register: Register = (on) => {
 
   // /clear ends this session in the same process, under a new ID.
   on('session.end', async ($, e, next) => {
-    sessionId = loaded = turn = freshWindowId = pending = undefined
+    sessionId = loaded = turn = freshWindowId = pending = idleCheckpointWindowId = undefined
     return next(e)
   })
 
@@ -651,14 +667,16 @@ export const register: Register = (on) => {
   on('turn.complete', async ($, e, next) => {
     const completed = await next(e)
     if (e.agentId !== undefined) return completed
+    const ended = turn?.id === e.turnId ? turn : undefined
+    turn = undefined
     const windowId = (await session($)).state.window.currentWindowId
-    const fresh = e.reason === 'answer' && turn?.id === e.turnId && turn.notes === 'saved'
+    const fresh = e.reason === 'answer' && ended?.notes === 'saved'
     freshWindowId = fresh ? windowId : undefined
     const was = pending
     if (was?.kind === 'checkpoint') {
       pending = undefined
       if (e.isAborted || was.windowId !== windowId) $.ui.toast('Checkpoint cancelled. The old context remains.')
-      else if (fresh) roll($)
+      else if (fresh) roll($, was.idle)
       else
         $.ui.toast(
           'Rollover did not start. No fresh note was saved in the completed checkpoint. The old context remains.',
@@ -666,7 +684,7 @@ export const register: Register = (on) => {
     } else if (was?.kind === 'requested') {
       pending = undefined
       if (e.isAborted) $.ui.toast('Rollover cancelled by the interruption. The old context remains.')
-      else if (turn?.id === e.turnId && turn.notes === 'failed')
+      else if (ended?.notes === 'failed')
         $.ui.toast('Rollover did not start: a note failed to save this turn. The old context remains.')
       else roll($)
     }
@@ -676,24 +694,29 @@ export const register: Register = (on) => {
   on('session.compact', async ($, e, next) => {
     if (e.agentId !== undefined || e.trigger === 'precompute') return next(e)
     if (pending?.kind === 'rolling') {
-      if (!normalCompaction) return openWindow($)
+      const { idle } = pending
+      if (!normalCompaction) return openWindow($, [], idle)
       const compacted = await next(e)
-      return compacted.skip ? compacted : openWindow($, compacted.messages)
+      return compacted.skip ? compacted : openWindow($, compacted.messages, idle)
     }
-    // With normal compaction on, /compact is Claude Code's own, as in Pi.
-    if (e.trigger === 'manual' && !normalCompaction) {
+    // With normal compaction on, /compact is Claude Code's own, as in Pi. Idle compaction is handled as /compact:
+    // the prompt cache is still warm, so a checkpoint turn costs about what its summary would.
+    const idle = e.trigger === 'auto' && turn === undefined
+    if ((e.trigger === 'manual' || idle) && !normalCompaction) {
       if (pending) return { skip: 'A notes checkpoint or rollover is already pending.' }
       const windowId = (await session($)).state.window.currentWindowId
       const instructions = e.instructions?.trim()
-      if (!instructions && freshWindowId === windowId) return openWindow($)
-      pending = { kind: 'checkpoint', windowId }
-      const guidance = instructions ? `\n\nCheckpoint guidance:\n${e.instructions}` : ''
-      $.clock.after(100, () => $.prompt.submit({ text: CHECKPOINT_PROMPT + guidance }))
-      return { skip: 'Saving a notes checkpoint first. The new window opens after it completes.' }
+      if (!instructions && freshWindowId === windowId) return openWindow($, [], idle)
+      if (!idle || idleCheckpointWindowId !== windowId) {
+        if (idle) idleCheckpointWindowId = windowId
+        checkpoint($, windowId, idle, instructions ? `\n\nCheckpoint guidance:\n${e.instructions}` : '')
+        return { skip: 'Saving a notes checkpoint first. The new window opens after it completes.' }
+      }
     }
-    // Other compaction stays Claude Code's own; reminders restart in the compacted context.
+    // Other compaction stays Claude Code's own; reminders and the idle checkpoint restart in the compacted context.
     const compacted = await next(e)
     if (!compacted.skip) {
+      idleCheckpointWindowId = undefined
       const { dir, state } = await session($)
       state.reminded = []
       await saveState($, dir, state)
