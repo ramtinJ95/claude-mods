@@ -79,7 +79,9 @@ async function resolveReceiver(request, expected, { allowBlocked }) {
 	return { descriptor, sessionFile, terminalId: agent.terminal_id };
 }
 
-function peerFrame(receiver, id, fields) {
+/** A frame for `receiver` under a fresh request ID. */
+function peerFrame(receiver, fields) {
+	const id = randomUUID();
 	const frame = `${JSON.stringify({
 		protocol: PEER_PROTOCOL,
 		id,
@@ -90,7 +92,7 @@ function peerFrame(receiver, id, fields) {
 	})}\n`;
 	if (Buffer.byteLength(frame) > MAX_PEER_FRAME_BYTES)
 		throw deliveryError("Peer message is too large", true);
-	return frame;
+	return { id, frame };
 }
 
 /**
@@ -108,8 +110,7 @@ export async function sendPeerMessage(request, expected, message, options = {}) 
 		allowBlocked: options.commands === true,
 	});
 	if (!receiver) return undefined;
-	const id = randomUUID();
-	const frame = peerFrame(receiver, id, {
+	const { id, frame } = peerFrame(receiver, {
 		kind: options.commands ? "commands" : "message",
 		text: message.text,
 		sender: message.sender,
@@ -121,27 +122,22 @@ export async function sendPeerMessage(request, expected, message, options = {}) 
 /**
  * Hands a reply to the extension that published a pending extension message
  * (`shepherdr-extension-message`). It reaches a blocked worker without a
- * turn; the extension validates the text and the result is its own string.
+ * turn and resolves once the extension accepted it; a refusal rejects with
+ * its reason. Resolves false when the worker publishes no receiver.
  * @param {{ extension: string, id: string, message: string }} reply
- * @returns {Promise<string>}
+ * @returns {Promise<boolean>}
  */
 export async function sendPeerExtensionReply(request, expected, reply) {
 	const receiver = await resolveReceiver(request, expected, { allowBlocked: true });
-	if (!receiver)
-		throw deliveryError(
-			`${expected.pane_id} has no Shepherdr receiver to take the reply; install @howaboua/pi-shepherdr in that Pi`,
-			true,
-		);
-	const id = randomUUID();
-	const frame = peerFrame(receiver, id, {
+	if (!receiver) return false;
+	const { id, frame } = peerFrame(receiver, {
 		kind: "extension-reply",
 		extension: reply.extension,
 		messageId: reply.id,
 		message: reply.message,
 	});
-	// The extension answers once it has acted on the reply.
-	const receipt = await deliverFrame(request, expected, { text: "" }, receiver.descriptor.port, receiver.sessionFile, id, frame, EXTENSION_REPLY_TIMEOUT_MS);
-	return receipt.result ?? "";
+	await deliverFrame(request, expected, { text: "" }, receiver.descriptor.port, receiver.sessionFile, id, frame, EXTENSION_REPLY_TIMEOUT_MS);
+	return true;
 }
 
 function deliverFrame(request, expected, message, port, sessionFile, id, frame, timeoutMs = 10_000) {
@@ -215,7 +211,6 @@ function deliverFrame(request, expected, message, port, sessionFile, id, frame, 
 					} else
 						finish(undefined, {
 							command: reply.command,
-							...(typeof reply.result === "string" ? { result: reply.result } : {}),
 							...(Array.isArray(reply.commands)
 								? {
 										commands: reply.commands

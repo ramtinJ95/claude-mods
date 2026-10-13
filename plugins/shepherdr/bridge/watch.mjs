@@ -13,7 +13,10 @@ import {
 	workerSubscriptions,
 } from "./herdr.mjs";
 import { resolveMachine, spawnRemoteWatcher } from "./machines.mjs";
-import { readSessionView } from "./vendor/shepherdr-session.mjs";
+import {
+	ASK_ENTRY_MARKERS,
+	readSessionView,
+} from "./vendor/shepherdr-session.mjs";
 import { watchSessions } from "./vendor/shepherdr-session-watch.mjs";
 
 const emit = (value) => process.stdout.write(`${JSON.stringify(value)}\n`);
@@ -37,8 +40,6 @@ async function steerAsk(path) {
 
 // Only Pi Ask's own entries can open a background question, so a write that
 // appends none is reported without reparsing the whole transcript.
-// Older Pi Ask writes pi-ask-active; current Ask publishes extension messages.
-const ASK_ENTRIES = ["pi-ask-active", "shepherdr-extension-message"];
 const sizes = new Map();
 async function appendedAsk(path) {
 	const { size } = await stat(path);
@@ -49,7 +50,7 @@ async function appendedAsk(path) {
 	try {
 		const buffer = Buffer.alloc(size - from);
 		await file.read(buffer, 0, buffer.length, from);
-		return ASK_ENTRIES.some((entry) => buffer.includes(entry))
+		return ASK_ENTRY_MARKERS.some((marker) => buffer.includes(marker))
 			? steerAsk(path)
 			: undefined;
 	} finally {

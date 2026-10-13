@@ -52,7 +52,7 @@ export type Ask = {
   /** "steer": asked while the worker continues. */
   delivery?: 'steer'
   prompts: { title: string; multiple: boolean; choices: { label: string; description?: string }[]; body?: string }[]
-  /** The worker's own question text, when it published no prompts. */
+  /** The worker's own question text, in place of prompts. */
   question?: string
   /** Only the user can complete it, in the worker's pane. */
   handoff?: boolean

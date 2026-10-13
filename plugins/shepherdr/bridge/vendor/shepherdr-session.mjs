@@ -5,7 +5,9 @@ import { open, stat } from "node:fs/promises";
 
 const READ_CHUNK_BYTES = 64 * 1024;
 const EXTENSION_MESSAGE = "shepherdr-extension-message";
-const ASK_EXTENSION = "@howaboua/pi-ask";
+export const ASK_EXTENSION = "@howaboua/pi-ask";
+/** Text an appended write holds when it can open an Ask: older Ask's entry, or current Ask's name. */
+export const ASK_ENTRY_MARKERS = ["pi-ask-active", ASK_EXTENSION];
 
 function textOf(message) {
 	if (typeof message.content === "string") return message.content;
@@ -116,16 +118,14 @@ function askFromInput(toolCallId, input) {
 }
 
 /**
- * Pi Ask publishes each open question as an extension message: its text and a
- * reply template, but not the prompts, which a direct call or a background
- * question's pending entry supplies (`withPrompts`). One with no template is
+ * Current Pi Ask publishes each open question as an extension message: its
+ * own text and a reply template, reported as written. One with no template is
  * a handoff only the user can complete.
  */
 function askFromExtensionMessage(update) {
 	if (typeof update.message !== "string") return undefined;
 	return {
 		toolCallId: update.id,
-		extension: update.extension,
 		handoff: typeof update.reply !== "string",
 		...(update.blocking === false ? { delivery: "steer" } : {}),
 		prompts: [],
@@ -135,14 +135,6 @@ function askFromExtensionMessage(update) {
 				? `${update.message}\n\n${update.reply}`
 				: update.message,
 	};
-}
-
-/** Structured prompts replace the question text once found. */
-function withPrompts(ask, source) {
-	if (!ask || ask.prompts.length > 0 || source?.toolCallId !== ask.toolCallId)
-		return ask;
-	const { question, ...rest } = ask;
-	return { ...rest, prompts: source.prompts };
 }
 
 function askResult(message) {
@@ -202,8 +194,8 @@ async function sessionView(path, size) {
 	let assistant;
 	let assistantDepth;
 	let ask;
-	// Every unanswered extension-published Ask, newest first: an older one
-	// stays answerable while a newer one is open.
+	// Every unanswered extension-published Ask by ID: an older one stays
+	// answerable while a newer one is reported.
 	const openAsks = new Map();
 	const askResults = new Map();
 	let depth = 0;
@@ -266,8 +258,6 @@ async function sessionView(path, size) {
 		}
 		if (entry.type === "custom" && entry.customType === "pi-ask-pending") {
 			const update = entry.data;
-			if (update?.version === 1 && update.state === "pending")
-				ask = withPrompts(ask, askFromInput(update.id, update));
 			if (
 				update?.version === 1 &&
 				update.state === "closed" &&
@@ -315,8 +305,6 @@ async function sessionView(path, size) {
 				input = inputFromMessage(entry.id, message);
 				if (input) inputDepth = currentDepth;
 			}
-			if (ask && message.role === "assistant" && Array.isArray(message.content))
-				for (const part of message.content) ask = withPrompts(ask, askCall(part));
 			if (
 				!ask &&
 				message.role === "assistant" &&

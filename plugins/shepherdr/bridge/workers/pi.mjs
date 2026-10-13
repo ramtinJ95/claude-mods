@@ -6,7 +6,10 @@ import {
 	sendPeerExtensionReply,
 	sendPeerMessage,
 } from "../vendor/shepherdr-peer.mjs";
-import { readSessionView } from "../vendor/shepherdr-session.mjs";
+import {
+	ASK_EXTENSION,
+	readSessionView,
+} from "../vendor/shepherdr-session.mjs";
 import { envelopeText } from "./envelope.mjs";
 import { workerTrigger } from "../trigger.mjs";
 import { answerAsk, answersMatch, unblockedAfterAnswer } from "./pi-ask.mjs";
@@ -56,11 +59,14 @@ export async function commands(agent) {
 		{ text: "", sender: "" },
 		{ commands: true },
 	);
-	if (!receipt?.commands)
-		throw new Error(
-			`${agent.pane_id} has no Shepherdr receiver to list its commands; install @howaboua/pi-shepherdr in that Pi`,
-		);
+	if (!receipt?.commands) throw noReceiver(agent, "list its commands");
 	return receipt.commands;
+}
+
+function noReceiver(agent, purpose) {
+	return new Error(
+		`${agent.pane_id} has no Shepherdr receiver to ${purpose}; install @howaboua/pi-shepherdr in that Pi`,
+	);
 }
 
 /**
@@ -75,22 +81,28 @@ export async function answer(agent, askId, answers) {
 			throw new Error(
 				`${agent.pane_id} is waiting on a handoff only the user can complete in its pane`,
 			);
-		const trigger = await workerTrigger(agent.pane_id, sessionPath(agent));
+		const background = open.delivery === "steer";
+		// Opened before sending, so no unblocking is missed.
+		const trigger = background
+			? undefined
+			: await workerTrigger(agent.pane_id, sessionPath(agent));
 		try {
 			// Ask validates the answers and resolves only once it accepted them;
-			// a rejection throws with its reason.
-			await sendPeerExtensionReply(request, agent, {
-				extension: open.extension,
+			// a refusal rejects with its reason.
+			const sent = await sendPeerExtensionReply(request, agent, {
+				extension: ASK_EXTENSION,
 				id: askId,
 				message: JSON.stringify(answers),
 			});
-			if (open.delivery !== "steer")
+			if (!sent) throw noReceiver(agent, "take the answer");
+			if (trigger)
 				await unblockedAfterAnswer(agent, sessionPath(agent), askId, trigger);
 		} finally {
-			trigger.close();
+			trigger?.close();
 		}
-		// Ask's acceptance is the record: it parsed these answers itself.
-		return { status: "accepted", background: open.delivery === "steer" };
+		// Ask's acceptance is the outcome. A Code Mode cell records the Ask
+		// only when the whole cell ends, so there may be no record to wait for.
+		return { status: "accepted", background };
 	}
 	const ask = await answerAsk(agent, sessionPath(agent), askId, answers);
 	return {
