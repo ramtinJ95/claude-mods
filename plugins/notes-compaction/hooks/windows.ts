@@ -44,7 +44,7 @@ export function nextWindow(current: WindowIdentity): WindowIdentity {
 export function windowText(agent: string, ids: WindowIdentity, recentNotes: readonly string[]): string {
   const lines = [`Agent name: ${agent}`, `${FIRST}${ids.firstWindowId}`, `${CURRENT}${ids.currentWindowId}`]
   if (ids.previousWindowId) lines.push(`${PREVIOUS}${ids.previousWindowId}`)
-  if (recentNotes.length) lines.push(`Recent notes: ${recentNotes.join(', ')}`)
+  if (recentNotes.length) lines.push(`Recent notes (read them with the notes tool): ${recentNotes.join(', ')}`)
   return `${WINDOW_OPEN}\n${lines.join('\n')}\n</context_window>`
 }
 
