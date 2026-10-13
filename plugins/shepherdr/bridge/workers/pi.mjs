@@ -2,10 +2,14 @@
 // worker's Shepherdr receiver when it publishes one, else Herdr's terminal
 // prompt.
 import { request } from "../herdr.mjs";
-import { sendPeerMessage } from "../vendor/shepherdr-peer.mjs";
+import {
+	sendPeerExtensionReply,
+	sendPeerMessage,
+} from "../vendor/shepherdr-peer.mjs";
 import { readSessionView } from "../vendor/shepherdr-session.mjs";
 import { envelopeText } from "./envelope.mjs";
-import { answerAsk, answersMatch } from "./pi-ask.mjs";
+import { workerTrigger } from "../trigger.mjs";
+import { answerAsk, answersMatch, unblockedAfterAnswer } from "./pi-ask.mjs";
 
 export const kind = "pi";
 export const program = "Pi";
@@ -59,8 +63,35 @@ export async function commands(agent) {
 	return receipt.commands;
 }
 
-/** Enters the answers; resolves the status Pi recorded and whether the Ask ran in the background. */
+/**
+ * Answers through Pi Ask's extension reply when it published the question,
+ * else enters them in its terminal UI. Resolves the status Pi recorded and
+ * whether the Ask ran in the background.
+ */
 export async function answer(agent, askId, answers) {
+	const open = (await view(agent)).openAsks?.[askId];
+	if (open) {
+		if (open.handoff)
+			throw new Error(
+				`${agent.pane_id} is waiting on a handoff only the user can complete in its pane`,
+			);
+		const trigger = await workerTrigger(agent.pane_id, sessionPath(agent));
+		try {
+			// Ask validates the answers and resolves only once it accepted them;
+			// a rejection throws with its reason.
+			await sendPeerExtensionReply(request, agent, {
+				extension: open.extension,
+				id: askId,
+				message: JSON.stringify(answers),
+			});
+			if (open.delivery !== "steer")
+				await unblockedAfterAnswer(agent, sessionPath(agent), askId, trigger);
+		} finally {
+			trigger.close();
+		}
+		// Ask's acceptance is the record: it parsed these answers itself.
+		return { status: "accepted", background: open.delivery === "steer" };
+	}
 	const ask = await answerAsk(agent, sessionPath(agent), askId, answers);
 	return {
 		status: await answerStatus(agent, askId, answers),

@@ -37,6 +37,8 @@ async function steerAsk(path) {
 
 // Only Pi Ask's own entries can open a background question, so a write that
 // appends none is reported without reparsing the whole transcript.
+// Older Pi Ask writes pi-ask-active; current Ask publishes extension messages.
+const ASK_ENTRIES = ["pi-ask-active", "shepherdr-extension-message"];
 const sizes = new Map();
 async function appendedAsk(path) {
 	const { size } = await stat(path);
@@ -47,7 +49,9 @@ async function appendedAsk(path) {
 	try {
 		const buffer = Buffer.alloc(size - from);
 		await file.read(buffer, 0, buffer.length, from);
-		return buffer.includes("pi-ask-active") ? steerAsk(path) : undefined;
+		return ASK_ENTRIES.some((entry) => buffer.includes(entry))
+			? steerAsk(path)
+			: undefined;
 	} finally {
 		await file.close();
 	}

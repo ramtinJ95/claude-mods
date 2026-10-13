@@ -72,10 +72,15 @@ function bodyFor({ record, status, reply, ask }: Report): string[] {
       ]
     case 'question':
       return [
-        JSON.stringify({ ask_id: ask?.toolCallId, prompts: ask?.prompts ?? [] }),
-        ask?.delivery === 'steer'
-          ? 'The worker continues meanwhile. Answer with answer and this ask_id, asking the user first when the choice is theirs.'
-          : 'The worker waits. Answer with answer and this ask_id, asking the user first when the choice is theirs, or let them answer in its pane.',
+        JSON.stringify({
+          ask_id: ask?.toolCallId,
+          ...(ask?.question ? { question: ask.question } : { prompts: ask?.prompts ?? [] }),
+        }),
+        ask?.handoff
+          ? 'The worker waits on an action only the user can take. Tell the user; they complete it in its pane.'
+          : ask?.delivery === 'steer'
+            ? 'The worker continues meanwhile. Answer with answer and this ask_id, asking the user first when the choice is theirs.'
+            : 'The worker waits. Answer with answer and this ask_id, asking the user first when the choice is theirs, or let them answer in its pane.',
       ]
     case 'blocked': {
       const herdr = record.machine ? `herdr --machine ${record.machine}` : 'herdr'

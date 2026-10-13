@@ -4,6 +4,8 @@
 import { open, stat } from "node:fs/promises";
 
 const READ_CHUNK_BYTES = 64 * 1024;
+const EXTENSION_MESSAGE = "shepherdr-extension-message";
+const ASK_EXTENSION = "@howaboua/pi-ask";
 
 function textOf(message) {
 	if (typeof message.content === "string") return message.content;
@@ -113,6 +115,36 @@ function askFromInput(toolCallId, input) {
 	};
 }
 
+/**
+ * Pi Ask publishes each open question as an extension message: its text and a
+ * reply template, but not the prompts, which a direct call or a background
+ * question's pending entry supplies (`withPrompts`). One with no template is
+ * a handoff only the user can complete.
+ */
+function askFromExtensionMessage(update) {
+	if (typeof update.message !== "string") return undefined;
+	return {
+		toolCallId: update.id,
+		extension: update.extension,
+		handoff: typeof update.reply !== "string",
+		...(update.blocking === false ? { delivery: "steer" } : {}),
+		prompts: [],
+		// Ask's text ends by pointing at "the reply below".
+		question:
+			typeof update.reply === "string"
+				? `${update.message}\n\n${update.reply}`
+				: update.message,
+	};
+}
+
+/** Structured prompts replace the question text once found. */
+function withPrompts(ask, source) {
+	if (!ask || ask.prompts.length > 0 || source?.toolCallId !== ask.toolCallId)
+		return ask;
+	const { question, ...rest } = ask;
+	return { ...rest, prompts: source.prompts };
+}
+
 function askResult(message) {
 	if (message.role !== "toolResult" || message.toolName !== "ask")
 		return undefined;
@@ -170,6 +202,9 @@ async function sessionView(path, size) {
 	let assistant;
 	let assistantDepth;
 	let ask;
+	// Every unanswered extension-published Ask, newest first: an older one
+	// stays answerable while a newer one is open.
+	const openAsks = new Map();
 	const askResults = new Map();
 	let depth = 0;
 	let input;
@@ -178,6 +213,7 @@ async function sessionView(path, size) {
 	const result = () => ({
 		...(assistant ? { assistant } : {}),
 		...(ask ? { ask } : {}),
+		...(openAsks.size > 0 ? { openAsks: Object.fromEntries(openAsks) } : {}),
 		...(askResults.size > 0
 			? { askResults: Object.fromEntries(askResults) }
 			: {}),
@@ -199,6 +235,22 @@ async function sessionView(path, size) {
 		if (entry.id !== targetId) return false;
 		const currentDepth = depth;
 		depth += 1;
+		if (entry.type === "custom" && entry.customType === EXTENSION_MESSAGE) {
+			const update = entry.data;
+			if (
+				update?.version === 1 &&
+				update.extension === ASK_EXTENSION &&
+				typeof update.id === "string"
+			) {
+				if (update.state === "closed") resolved.add(update.id);
+				else if (update.state === "pending" && !resolved.has(update.id)) {
+					const pending = askFromExtensionMessage(update);
+					if (pending && !openAsks.has(update.id))
+						openAsks.set(update.id, pending);
+					ask ??= pending;
+				}
+			}
+		}
 		if (entry.type === "custom" && entry.customType === "pi-ask-active") {
 			const update = entry.data;
 			if (update?.version === 1 && typeof update.id === "string") {
@@ -214,6 +266,8 @@ async function sessionView(path, size) {
 		}
 		if (entry.type === "custom" && entry.customType === "pi-ask-pending") {
 			const update = entry.data;
+			if (update?.version === 1 && update.state === "pending")
+				ask = withPrompts(ask, askFromInput(update.id, update));
 			if (
 				update?.version === 1 &&
 				update.state === "closed" &&
@@ -261,6 +315,8 @@ async function sessionView(path, size) {
 				input = inputFromMessage(entry.id, message);
 				if (input) inputDepth = currentDepth;
 			}
+			if (ask && message.role === "assistant" && Array.isArray(message.content))
+				for (const part of message.content) ask = withPrompts(ask, askCall(part));
 			if (
 				!ask &&
 				message.role === "assistant" &&
