@@ -185,7 +185,7 @@ const MACHINE_OPS = {
 		}
 		const result = await request("agent.read", {
 			target: agent.pane_id,
-			source: source === "recent" ? "recent-unwrapped" : "visible",
+			source: source === "recent" ? "recent_unwrapped" : "visible",
 			lines,
 		});
 		return { agent: agentSummary(agent), text: result.read?.text ?? result };
