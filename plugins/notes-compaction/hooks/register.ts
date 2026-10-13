@@ -722,7 +722,16 @@ export const register: Register = (on) => {
       await saveState($, dir, state)
     }
     return compacted
-  }).catch(() => ({ skip: 'Context rollover failed. The existing context remains.' }))
+  }).catch(async ($, e, next) => {
+    // A called next replays what it settled to: a rejection there is Claude Code's own compaction failing.
+    if (next.called)
+      try {
+        await next(e)
+      } catch (error) {
+        return { skip: `Claude Code's compaction failed: ${message(error)}. The existing context remains.` }
+      }
+    return { skip: 'Context rollover failed. The existing context remains.' }
+  })
 
   on('tool.call', { tool: 'mcp__notes-compaction__notes' }, ($, e) => callNotes($, e))
 
