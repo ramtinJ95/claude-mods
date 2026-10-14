@@ -17,9 +17,9 @@ export interface SessionState {
 }
 
 export const GUIDANCE = `<context_window_guidance>
-Keep one checkpoint per task at a stable notes path: request, constraints, decisions, progress, next steps, history IDs. Replace stale state; mark completion in place. Keep reusable findings and deferred ideas in separate topic notes; link, don't copy. Recording isn't permission to implement.
+Keep one checkpoint per task at a stable notes path: request, constraints, decisions, progress and how it was verified, next steps, identifiers needed to act (history IDs too). Replace stale state; mark completion in place. Keep reusable findings and deferred ideas in separate topic notes; link, don't copy. Recording isn't permission to implement.
 
-Save changed state after substantial work, before replying, and before new_context or handoff. Skip routine or unchanged state. Include checkpoint paths in handoffs. After rollover, read the checkpoint, then linked notes as needed; history only for missing details.
+Save changed state after substantial work, before replying, and before new_context or handoff. Skip routine or unchanged state; raw output stays in history. Include checkpoint paths in handoffs. After rollover, read the checkpoint, then linked notes as needed; history only for missing details.
 </context_window_guidance>`
 
 const WINDOW_OPEN = '<context_window>'
