@@ -166,6 +166,19 @@ const message = (error: unknown) => (error instanceof Error ? error.message : St
 const result = (payload: unknown) => ({ result: JSON.stringify(payload) })
 const failure = (error: unknown) => ({ deny: message(error) })
 
+/**
+ * Where Claude Code keeps plugins out of compaction (2.1.299+ on machines with managed settings and for Team and
+ * Enterprise organizations), a rollover is Claude Code's summary told to defer to the notes.
+ */
+const ROLLOVER_SUMMARY =
+  'The agent saved its working state in notes and continues from them in a new context window. Write at most a few lines: the user\'s latest request in their words, and only what happened after the last notes save that the notes lack. Do not restate saved notes.'
+const BLOCKED_NOTICE =
+  "Claude Code keeps plugins out of compaction here, so each new window starts from a short Claude Code summary and your notes. Idle and automatic compaction stay Claude Code's own."
+
+const PENDING = 'A notes checkpoint or rollover is already pending.'
+const CHECKPOINT_FIRST = 'Saving a notes checkpoint first. The new window opens after it completes.'
+const ROLLOVER_FAILED = 'Context rollover failed. The existing context remains.'
+
 const CHECKPOINT_PROMPT =
   '<context_window_reminder>\nContext checkpoint requested. Save the current state with notes, then finish your response. The new window opens after this turn. Do not call new_context. If saving fails, report the failure without rolling over.\n</context_window_reminder>'
 
@@ -195,7 +208,7 @@ let freshWindowId: string | undefined
 let pending:
   | { kind: 'requested' }
   | { kind: 'checkpoint'; windowId: string; idle: boolean }
-  | { kind: 'rolling'; idle: boolean }
+  | { kind: 'rolling'; idle: boolean; answered: boolean }
   | undefined
 /** The context whose idle compaction already asked for a checkpoint; a later one there stays Claude Code's own. */
 let idleCheckpointWindowId: string | undefined
@@ -208,6 +221,13 @@ let compactThreshold: number | undefined
 let notesQueue: Promise<unknown> = Promise.resolve()
 /** The /notes setting: run Claude Code's summary before each new window, as Pi's normal compaction does. */
 let normalCompaction = false
+/**
+ * Whether our session.compact hook answers (`hooked`) or Claude Code skips it (`blocked`), as the last rollover or
+ * compaction found; unknown until then, and treated as possibly blocked. Kept in the store, so where the hook
+ * answers, rollover's /compact carries no summary instructions; after an upgrade into the block, the first
+ * rollover is therefore Claude Code's full summary.
+ */
+let compaction: 'hooked' | 'blocked' | undefined
 /** What the /notes pane shows; a change redraws it. */
 let panel: { status: string[]; confirmPrune: boolean; message?: string } = { status: [], confirmPrune: false }
 const PANE = 'notes-compaction'
@@ -346,34 +366,67 @@ async function isSessionAgent($: EngineInterface, self: string, agent: string): 
  * notes-only window); the conversation continues once it stands, unless the user is idle.
  */
 async function openWindow($: EngineInterface, kept: readonly SessionMessage[] = [], idle = false): Promise<SessionCompacted> {
+  const marker = await advanceWindow($)
+  if (!idle) $.clock.after(100, () => $.prompt.submit({ text: 'Continue.' }))
+  return {
+    messages: [
+      ...kept,
+      { role: 'user', text: marker, toolUses: [] },
+      { role: 'assistant', text: 'New context window opened.', toolUses: [] },
+    ],
+  }
+}
+
+/** Moves the session into its next window, whose reminders start over, and returns that window's marker. */
+async function advanceWindow($: EngineInterface): Promise<string> {
   const { dir, state } = await session($)
   const ids = nextWindow(state.window)
   const recent = recentPaths(await readNotes($, rootNotesDir(dir)), ROOT)
   state.window = ids
   state.reminded = []
   await saveState($, dir, state)
-  if (!idle) $.clock.after(100, () => $.prompt.submit({ text: 'Continue.' }))
-  return {
-    messages: [
-      ...kept,
-      { role: 'user', text: windowText(ROOT, ids, recent), toolUses: [] },
-      { role: 'assistant', text: 'New context window opened.', toolUses: [] },
-    ],
-  }
+  return windowText(ROOT, ids, recent)
 }
 
-/** Rollover runs between turns through /compact: the one route on which our session.compact hook answers. */
+/**
+ * Rollover runs between turns through /compact: the one route on which our session.compact hook answers.
+ * Where Claude Code skips that hook, its own summary runs instead, guided to defer to the notes.
+ */
 function roll($: EngineInterface, idle = false) {
-  pending = { kind: 'rolling', idle }
+  const rolling = { kind: 'rolling' as const, idle, answered: false }
+  pending = rolling
   $.clock.after(100, async () => {
     try {
-      await $.command.run({ command: 'compact' })
+      const guided = !normalCompaction && compaction !== 'hooked'
+      await $.command.run({ command: 'compact', ...(guided ? { args: ROLLOVER_SUMMARY } : {}) })
+      if (!rolling.answered) await continueAfterSummary($, idle)
     } catch (error) {
       $.ui.toast(`Context rollover failed: ${message(error)}. The existing context remains.`)
     } finally {
       pending = undefined
     }
   })
+}
+
+/**
+ * The window after Claude Code's own summary, when our hook could not answer: the marker that history reads
+ * window boundaries from arrives as the prompt that continues. Usage reads no context until the next request,
+ * so a context still measured means no compaction ran.
+ */
+async function continueAfterSummary($: EngineInterface, idle: boolean) {
+  if ((await $.session.usage()).context.tokens !== undefined)
+    throw new Error('Claude Code did not compact the conversation')
+  if (compaction !== 'blocked') {
+    $.ui.toast(BLOCKED_NOTICE)
+    await setCompaction($, 'blocked')
+  }
+  const marker = await advanceWindow($)
+  if (!idle) $.clock.after(100, () => $.prompt.submit({ text: `${marker}\nContinue.` }))
+}
+
+async function setCompaction($: EngineInterface, found: 'hooked' | 'blocked') {
+  compaction = found
+  await $.store.set('compaction', found)
 }
 
 /** In place of a compaction: a turn that saves notes, after which turn.complete rolls into the new window. */
@@ -399,12 +452,27 @@ async function contextUsed($: EngineInterface): Promise<{ limit: number; tokens?
 let batchChars = 0
 /** A rough, early-leaning conversion for code and prose alike. */
 const CHARS_PER_TOKEN = 3
+/** The context dueReminder last measured, and the share of the limit it must fall by to count as a compaction. */
+let measured: number | undefined
+const UNSEEN_COMPACTION_DROP = 0.1
 
 /** The context reminder due once `unsentChars` more reach the model, marked sent. Each fires once per window. */
 async function dueReminder($: EngineInterface, unsentChars: number): Promise<string | undefined> {
   const { dir, state } = await session($)
-  if (remindersDone(state)) return
+  // Where the hook answers, compaction resets reminders there, so a reminded-out window needs no measuring.
+  if (compaction === 'hooked' && remindersDone(state)) return
   const { limit, tokens } = await contextUsed($)
+  if (compaction !== 'hooked') {
+    // Where Claude Code keeps plugins out of compaction, its own compaction goes unseen here. Measured context only
+    // grows within a window, so a clear fall since the last check, or none measured (also on resume), means one ran.
+    const compacted = tokens === undefined || (measured !== undefined && measured - tokens > limit * UNSEEN_COMPACTION_DROP)
+    measured = tokens
+    if (compacted && state.reminded.length) {
+      state.reminded = []
+      await saveState($, dir, state)
+    }
+  }
+  if (remindersDone(state)) return
   const estimate = tokens === undefined ? undefined : tokens + unsentChars / CHARS_PER_TOKEN
   const reminder = reminderFor(state, estimate === undefined || limit <= 0 ? undefined : (100 * estimate) / limit)
   if (reminder) await saveState($, dir, state)
@@ -530,6 +598,7 @@ async function refreshPanel($: EngineInterface) {
   showPanel($, {
     status: [
       `Continuity active · window ${state.window.windowNumber + 1} · ${notes} notes in this session`,
+      ...(compaction === 'blocked' ? ['Claude Code keeps plugins out of compaction here: new windows start from a short summary'] : []),
       `Reminders at 85% and 90% of ${limit} tokens (${compactThreshold ? 'the auto-compact threshold' : 'the model window'})`,
       `${sessions} sessions · ${records} fork records`,
     ],
@@ -621,8 +690,9 @@ export const register: Register = (on) => {
 
   on('session.start', async ($, e, next) => {
     const started = await next(e)
-    const settings = (await $.store.get('settings')) as { normalCompaction?: boolean } | undefined
-    normalCompaction = settings?.normalCompaction === true
+    const [settings, found] = await Promise.all([$.store.get('settings'), $.store.get('compaction')])
+    normalCompaction = (settings as { normalCompaction?: boolean } | undefined)?.normalCompaction === true
+    compaction = found as typeof compaction
     for (const tool of TOOLS) await $.tool.register(tool)
     await $.command.register({ name: 'notes', description: 'Notes continuity status and settings' })
     return started
@@ -653,7 +723,7 @@ export const register: Register = (on) => {
 
   // /clear ends this session in the same process, under a new ID.
   on('session.end', async ($, e, next) => {
-    sessionId = loaded = turn = freshWindowId = pending = idleCheckpointWindowId = undefined
+    sessionId = loaded = turn = freshWindowId = pending = idleCheckpointWindowId = measured = undefined
     return next(e)
   })
 
@@ -692,25 +762,26 @@ export const register: Register = (on) => {
   })
 
   on('session.compact', async ($, e, next) => {
-    if (e.agentId !== undefined || e.trigger === 'precompute') return next(e)
+    if (e.agentId !== undefined) return next(e)
+    if (compaction !== 'hooked') await setCompaction($, 'hooked')
+    if (e.trigger === 'precompute') return next(e)
     if (pending?.kind === 'rolling') {
       const { idle } = pending
+      pending.answered = true
       if (!normalCompaction) return openWindow($, [], idle)
       const compacted = await next(e)
       return compacted.skip ? compacted : openWindow($, compacted.messages, idle)
     }
-    // With normal compaction on, /compact is Claude Code's own, as in Pi. Idle compaction is handled as /compact:
-    // the prompt cache is still warm, so a checkpoint turn costs about what its summary would.
-    const idle = e.trigger === 'auto' && turn === undefined
-    if ((e.trigger === 'manual' || idle) && !normalCompaction) {
-      if (pending) return { skip: 'A notes checkpoint or rollover is already pending.' }
+    // With normal compaction on, idle compaction is Claude Code's own, as in Pi. Otherwise it is handled as /compact
+    // (the command.run hook): the prompt cache is still warm, so a checkpoint turn costs about what its summary would.
+    if (e.trigger === 'auto' && turn === undefined && !normalCompaction) {
+      if (pending) return { skip: PENDING }
       const windowId = (await session($)).state.window.currentWindowId
-      const instructions = e.instructions?.trim()
-      if (!instructions && freshWindowId === windowId) return openWindow($, [], idle)
-      if (!idle || idleCheckpointWindowId !== windowId) {
-        if (idle) idleCheckpointWindowId = windowId
-        checkpoint($, windowId, idle, instructions ? `\n\nCheckpoint guidance:\n${e.instructions}` : '')
-        return { skip: 'Saving a notes checkpoint first. The new window opens after it completes.' }
+      if (freshWindowId === windowId) return openWindow($, [], true)
+      if (idleCheckpointWindowId !== windowId) {
+        idleCheckpointWindowId = windowId
+        checkpoint($, windowId, true, '')
+        return { skip: CHECKPOINT_FIRST }
       }
     }
     // Other compaction stays Claude Code's own; reminders and the idle checkpoint restart in the compacted context.
@@ -730,7 +801,7 @@ export const register: Register = (on) => {
       } catch (error) {
         return { skip: `Claude Code's compaction failed: ${message(error)}. The existing context remains.` }
       }
-    return { skip: 'Context rollover failed. The existing context remains.' }
+    return { skip: ROLLOVER_FAILED }
   })
 
   on('tool.call', { tool: 'mcp__notes-compaction__notes' }, ($, e) => callNotes($, e))
@@ -752,6 +823,21 @@ export const register: Register = (on) => {
         : 'A new window will continue from your notes after this turn',
     })
   })
+
+  // /compact is decided here, before compaction, since Claude Code may keep plugins out of session.compact. With
+  // normal compaction on it is Claude Code's own, as in Pi. The rollover's own /compact, run by this plugin, skips this hook.
+  on('command.run', { command: 'compact' }, async ($, e, next) => {
+    if (normalCompaction) return next(e)
+    if (pending) return { text: PENDING }
+    const windowId = (await session($)).state.window.currentWindowId
+    const instructions = e.args.trim()
+    if (!instructions && freshWindowId === windowId) {
+      roll($)
+      return { text: 'Opening a new window from your notes.' }
+    }
+    checkpoint($, windowId, false, instructions ? `\n\nCheckpoint guidance:\n${instructions}` : '')
+    return { text: CHECKPOINT_FIRST }
+  }).catch(() => ({ text: ROLLOVER_FAILED }))
 
   on('command.run', { command: 'notes' }, async ($, e) => {
     if (e.args.trim()) return { text: 'Use /notes to open the notes panel.' }

@@ -48,15 +48,19 @@ export function windowText(agent: string, ids: WindowIdentity, recentNotes: read
   return `${WINDOW_OPEN}\n${lines.join('\n')}\n</context_window>`
 }
 
-/** The window boundary windowText wrote, read back from a transcript message. */
+/** The window boundary windowText wrote, read back from a transcript message: on its first or second line. */
 export function windowMarker(message: {
   role: string
   text: string
 }): { first?: string; current: string; previous?: string } | undefined {
-  if (message.role !== 'user' || !message.text.startsWith(WINDOW_OPEN)) return
+  if (message.role !== 'user') return
+  const { text } = message
+  const open = `${WINDOW_OPEN}\n`
+  const start = text.startsWith(open) ? 0 : text.indexOf('\n') + 1
+  if (!text.startsWith(open, start)) return
+  const lines = text.slice(start).split('\n')
   const field = (prefix: string) =>
-    message.text
-      .split('\n')
+    lines
       .find((line) => line.startsWith(prefix))
       ?.slice(prefix.length)
       .trim()

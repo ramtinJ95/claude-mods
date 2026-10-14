@@ -32,6 +32,16 @@ A new window replaces the conversation with one marker message; no summary is ge
 - Compaction at the auto-compact threshold stays Claude Code's own summary.
 - Interrupting a turn that called `new_context`, or the checkpoint turn, cancels the rollover and keeps the old context.
 
+### Where Claude Code keeps plugins out of compaction
+
+From 2.1.299, on a machine with managed settings and for Team and Enterprise organizations, Claude Code's built-in security plugin skips installed plugins' compaction hooks. The mod then runs in a reduced mode and says so once with a notice and in `/notes`:
+
+- A new window starts from Claude Code's own summary, told to keep only what the notes lack, followed by the window marker and "Continue." in place of a notes-only window. The rollover costs one summarization request.
+- `/compact` still asks for a checkpoint first, and instructions after it still become checkpoint guidance.
+- Idle compaction and compaction at the auto-compact threshold are Claude Code's own, with no checkpoint before them. Reminders start over after them.
+
+According to Claude Code's setting descriptions, an administrator can restore the full behavior by enabling the mod in managed settings and seating it with `"appendPlugins": ["notes-compaction@claude-mods"]`; this is untested. Claude Code reads only the highest-priority managed source, so on a machine with an MDM profile these keys belong in that profile.
+
 ## Management
 
 `/notes` opens a panel with continuity status and storage counts. Changes save immediately; with the panel focused (ctrl+x tab), the bracketed letters press its buttons.
