@@ -21,13 +21,30 @@ const COMMAND = 'shepherdr'
 type Machine = { id: string; label: string; enabled: boolean }
 type Profiles = { sources: Record<string, string>; profiles: ProfileSummary[] }
 
-let fleet: Fleet | undefined
+let fleet: { file: string; current: Fleet; ready: Promise<void> } | undefined
 /** Texts this mod is sending to Claude Code workers right now, for its own permission check. */
 const sending = new Map<string, number>()
 
-function requireFleet(): Fleet {
-  if (!fleet) throw new Error('Shepherdr is still starting; retry')
-  return fleet
+async function requireFleet($: EngineInterface): Promise<Fleet> {
+  const file = await sessionFile($, 'sessions')
+  if (fleet?.file !== file) {
+    fleet?.current.stop()
+    const current = new Fleet(sessionIo($, file))
+    fleet = { file, current, ready: loadFleet($, current, file) }
+  }
+  const bound = fleet
+  await bound.ready
+  return bound.current
+}
+
+async function loadFleet($: EngineInterface, current: Fleet, file: string): Promise<void> {
+  try {
+    await current.load()
+  } catch (error) {
+    $.ui.toast(
+      `Shepherdr could not read its saved watches (${message(error)}); fix or remove ${file}. New watches are not saved until then.`,
+    )
+  }
 }
 
 /**
@@ -93,8 +110,7 @@ function dispatchWork(
   return current.waitFor(bridge, record, signal)
 }
 
-async function handle(bridge: Bridge, cwd: string, request: AgentsRequest, signal: AbortSignal): Promise<string> {
-  const current = requireFleet()
+async function handle(bridge: Bridge, current: Fleet, cwd: string, request: AgentsRequest, signal: AbortSignal): Promise<string> {
   const { machine } = request
   switch (request.action) {
     case 'help':
@@ -185,7 +201,7 @@ async function runCommand(
   $: EngineInterface,
   args: string,
 ): Promise<{ text: string; context?: string[] }> {
-  const current = requireFleet()
+  const current = await requireFleet($)
   const bridge = bridgeOf($)
   const choice = args.trim()
   if (choice === 'orchestrate' || choice === 'normal') {
@@ -209,69 +225,65 @@ export const register: Register = on => {
       }),
     ])
     const started = await next(e)
-    fleet?.stop()
-    const file = await sessionFile($, 'sessions')
-    fleet = new Fleet(sessionIo($, file))
-    try {
-      await fleet.load()
-    } catch (error) {
-      $.ui.toast(
-        `Shepherdr could not read its saved watches (${message(error)}); fix or remove ${file}. New watches are not saved until then.`,
-      )
-    }
+    await requireFleet($)
     return started
   })
 
   on('session.end', ($, e, next) => {
-    fleet?.stop()
+    fleet?.current.stop()
+    fleet = undefined
+    $.ui.status(undefined)
     return next(e)
   })
+
+  // Must precede handlers that answer without next, including our own agents.
+  // Its failure must never change another tool's call.
+  on('tool.call', async ($, e, next) => {
+    if (e.agentId) return next(e)
+    const current = await requireFleet($)
+    const ran = await next(e)
+    if (fleet?.current === current) await appendAll($, current.drain())
+    return ran
+  }).catch(($, e, next) => next(e))
 
   on('tool.call', { tool: 'mcp__shepherdr__agents' }, async ($, e, next) => {
     try {
       const request = parseRequest(e as unknown as Record<string, unknown>)
       const cwd = request.action === 'spawn' ? await $.session.cwd() : ''
-      return { result: await handle(bridgeOf($), cwd, request, next.signal) }
+      return { result: await handle(bridgeOf($), await requireFleet($), cwd, request, next.signal) }
     } catch (error) {
       if (next.signal.aborted) return { deny: 'Cancelled; the worker keeps running and reports when it settles.' }
       return { deny: message(error) }
     }
   }).catch(() => ({ deny: 'Shepherdr failed to handle the call; retry or call agents with {} for help.' }))
 
-  // Observes every tool: briefings and reports queued during the call join
-  // the next model request. Its failure must never change another tool's call.
-  on('tool.call', async ($, e, next) => {
-    const ran = await next(e)
-    if (!e.agentId && fleet) await appendAll($, fleet.drain())
-    return ran
-  }).catch(($, e, next) => next(e))
-
   on('turn.start', async ($, e, next) => {
-    if (fleet) await appendAll($, fleet.turnStarted())
+    await appendAll($, (await requireFleet($)).turnStarted())
     return next(e)
   })
 
   // Subagent runs raise turn.complete too (with agentId) but no turn.start.
   on('turn.complete', async ($, e, next) => {
     const done = await next(e)
-    if (!e.agentId) fleet?.turnEnded()
+    if (!e.agentId) fleet?.current.turnEnded()
     return done
   })
 
   on('session.compact', async ($, e, next) => {
     const compacted = await next(e)
-    if (e.agentId || !fleet || compacted.skip !== undefined) return compacted
+    const current = fleet?.current
+    if (e.agentId || !current || compacted.skip !== undefined) return compacted
     // Automatic compaction resumes mid-turn with no turn.start, so the
     // briefing joins the compacted conversation itself. Between turns
     // (/compact, a notes window) another plugin may replace the conversation
     // after this hook, so the next turn's start brings it instead.
     if (e.trigger === 'auto' || e.trigger === 'precompute') {
-      const briefing = fleet.briefing()
+      const briefing = current.briefing()
       return briefing.length
         ? { ...compacted, messages: [...compacted.messages, { role: 'user', text: briefing.join('\n\n'), toolUses: [] }] }
         : compacted
     }
-    fleet.compacted()
+    current.compacted()
     return compacted
   }).catch(($, e, next) => next(e))
 
