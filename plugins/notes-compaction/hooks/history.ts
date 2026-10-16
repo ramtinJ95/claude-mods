@@ -50,11 +50,12 @@ function answer(
     seen.set(`${windowId}:${key}`, n + 1)
     return n ? `${key}~${n}` : key
   }
-  // Rows before the first boundary in view belong to the window it names as previous; with no
-  // boundary in view, every row belongs to the current window.
+  // Rows before the first boundary in view belong to the window it names as previous, or to the first window when
+  // that boundary repeats the first window's marker after a compaction; with no boundary in view, every row
+  // belongs to the current window.
   const markers = messages.map(windowMarker)
   const first = markers.find((marker) => marker !== undefined)
-  let windowId = first ? (first.previous ?? currentWindowId) : currentWindowId
+  let windowId = first ? (first.previous ?? first.current) : currentWindowId
   const windows = new Map<string, HistoryItem[]>([[windowId, []]])
   const toolNames = new Map<string, string>()
   for (const [index, message] of messages.entries()) {

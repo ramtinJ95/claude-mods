@@ -17,9 +17,9 @@ export interface SessionState {
 }
 
 export const GUIDANCE = `<context_window_guidance>
-Keep one checkpoint per task at a stable notes path: request, constraints, decisions, progress and how it was verified, next steps, identifiers needed to act (history IDs too). Replace stale state; mark completion in place. Keep reusable findings and deferred ideas in separate topic notes; link, don't copy. Recording isn't permission to implement.
+Notes persist across windows. Keep one checkpoint per task at a stable notes path, covering the request, constraints, decisions, progress and how it was verified, next steps and identifiers needed to act (history IDs too), so you can resume without rereading the conversation. Replace stale state; mark completion in place. Keep reusable findings and deferred ideas in separate topic notes; link, don't copy. Recording isn't permission to implement.
 
-Save changed state after substantial work, before replying, and before new_context or handoff. Skip routine or unchanged state; raw output stays in history. Include checkpoint paths in handoffs. After rollover, read the checkpoint, then linked notes as needed; history only for missing details.
+Save changed state after substantial work, before replying, and before new_context or handoff. Skip routine or unchanged state; raw output stays in history. Include checkpoint paths in handoffs. After rollover, read the checkpoint, then linked notes as needed. History retrieves earlier conversation; use it only for missing details.
 </context_window_guidance>`
 
 const WINDOW_OPEN = '<context_window>'
@@ -41,10 +41,12 @@ export function nextWindow(current: WindowIdentity): WindowIdentity {
   }
 }
 
-export function windowText(agent: string, ids: WindowIdentity, recentNotes: readonly string[]): string {
+/** `recovery` adds where to look when no checkpoint covers the work, for a window Claude Code compacted on its own. */
+export function windowText(agent: string, ids: WindowIdentity, recentNotes: readonly string[], recovery = false): string {
   const lines = [`Agent name: ${agent}`, `${FIRST}${ids.firstWindowId}`, `${CURRENT}${ids.currentWindowId}`]
   if (ids.previousWindowId) lines.push(`${PREVIOUS}${ids.previousWindowId}`)
   if (recentNotes.length) lines.push(`Recent notes (read them with the notes tool): ${recentNotes.join(', ')}`)
+  if (recovery) lines.push('If no checkpoint is available, use history to recover missing context.')
   return `${WINDOW_OPEN}\n${lines.join('\n')}\n</context_window>`
 }
 
@@ -82,5 +84,5 @@ export function reminderFor(state: SessionState, percentUsed: number | undefined
   if (kind === 'urgent') state.reminded.push(`${id}:urgent`)
   // Estimates lean early and can pass the limit.
   const remaining = Math.max(0, Math.round((100 - percentUsed) * 10) / 10)
-  return `<context_window_reminder>\n${kind === 'urgent' ? 'Urgent: ' : ''}${remaining}% remaining. Checkpoint the active request, state and known history IDs in notes, then call new_context ${kind === 'urgent' ? 'now, before other work' : 'before continuing work'}.\n</context_window_reminder>`
+  return `<context_window_reminder>\n${kind === 'urgent' ? 'Urgent: ' : ''}${remaining}% context remaining. Save the task state in notes, then call new_context ${kind === 'urgent' ? 'now, before other work' : 'before continuing work'}.\n</context_window_reminder>`
 }
