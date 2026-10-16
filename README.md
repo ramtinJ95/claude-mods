@@ -2,6 +2,8 @@
 
 A monorepo for Claude Code mods: plugins built on Claude Code's function-hooks API, published together as one plugin marketplace. New mods are added here as folders under `plugins/`.
 
+notes-compaction and shepherdr are Claude Code ports of Pi extensions by [howaboua](https://github.com/IgorWarzocha): [pi-notes-compaction](https://github.com/IgorWarzocha/howaboua-pi-stuff/tree/main/packages/pi-notes-compaction) and [pi-shepherdr](https://github.com/IgorWarzocha/howaboua-pi-stuff/tree/main/packages/pi-shepherdr) from the [howaboua-pi-stuff](https://github.com/IgorWarzocha/howaboua-pi-stuff) monorepo. The ideas and designs are theirs; this repo adapts them to Claude Code's function-hooks API.
+
 | Mod | What it does |
 | --- | --- |
 | [notes-compaction](plugins/notes-compaction) | Checkpoint notes and fresh context windows that continue from them |

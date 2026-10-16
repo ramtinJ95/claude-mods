@@ -2,6 +2,8 @@
 
 Spawn, delegate to and monitor Pi and Claude Code agents running in [Herdr](https://herdr.dev) from Claude Code: Pi agents on this machine or on Herdr's saved SSH machines, Claude Code agents on this machine. It is the Claude Code controller for [pi-shepherdr](https://github.com/IgorWarzocha/howaboua-pi-stuff/tree/main/packages/pi-shepherdr): results of background work arrive in the session on their own, so the agent never polls.
 
+Ported from [pi-shepherdr](https://github.com/IgorWarzocha/howaboua-pi-stuff/tree/main/packages/pi-shepherdr) by [howaboua](https://github.com/IgorWarzocha) in [howaboua-pi-stuff](https://github.com/IgorWarzocha/howaboua-pi-stuff); its bridge and profiles started as copies of that package.
+
 ## Install
 
 ```
