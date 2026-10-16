@@ -49,7 +49,8 @@ const RECEIVER_WAIT_MS = 30_000;
 /**
  * Waits for a spawned worker's Shepherdr receiver, which pi-shepherdr
  * publishes only after Pi's startup hooks, later than Herdr reports it ready.
- * A Pi without one is left to `deliver`'s terminal route once the wait ends.
+ * A Pi without one is left to `deliver`'s terminal route once the wait ends,
+ * with a notice saying why.
  */
 export async function awaitStartup(agent) {
 	const inbox = peerInboxPath(sessionPath(agent), agent.terminal_id);
@@ -63,6 +64,9 @@ export async function awaitStartup(agent) {
 		}
 		await sleep(100);
 	}
+	return {
+		notice: `No Shepherdr receiver after ${RECEIVER_WAIT_MS / 1000} s, so the task went through Herdr's terminal prompt. Is @howaboua/pi-shepherdr installed in that Pi?`,
+	};
 }
 
 /** accepted | rejected | unknown once Pi recorded the Ask's outcome, else undefined. */

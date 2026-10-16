@@ -103,11 +103,14 @@ function dispatchWork(
     ...(delivery.record?.machine ? { machine: delivery.record.machine } : {}),
     ...(delivery.agent.name ? { name: delivery.agent.name } : {}),
     delivery: delivery.delivery,
+    ...(delivery.notice ? { notice: delivery.notice } : {}),
   }
   if (delivery.command || !delivery.record) return JSON.stringify({ ...summary, commandSubmitted: true })
   const record = current.track({ agent: delivery.agent, record: delivery.record }, task)
   if (!blocking) return JSON.stringify({ ...summary, status: 'working' })
-  return current.waitFor(bridge, record, signal)
+  const settled = current.waitFor(bridge, record, signal)
+  const { notice } = delivery
+  return notice ? settled.then(report => `${report}\n${notice}`) : settled
 }
 
 async function handle(bridge: Bridge, current: Fleet, cwd: string, request: AgentsRequest, signal: AbortSignal): Promise<string> {

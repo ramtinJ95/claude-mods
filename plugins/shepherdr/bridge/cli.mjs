@@ -105,8 +105,9 @@ const MACHINE_OPS = {
 	},
 	/** Starts the worker and delivers its first task in one call. */
 	async "machine.start"({ message, ...start }) {
-		const agent = await startAgent(start);
-		return deliver(agent.pane_id, message, "task");
+		const { agent, notice } = await startAgent(start);
+		const delivered = await deliver(agent.pane_id, message, "task");
+		return notice ? { ...delivered, notice } : delivered;
 	},
 	"machine.deliver"({ target, message, kind }) {
 		return deliver(target, message, kind);

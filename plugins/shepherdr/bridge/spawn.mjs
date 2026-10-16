@@ -193,6 +193,7 @@ async function startupError(paneId, cwd, program, error) {
 /**
  * Starts the profile's agent on this machine with the controller's profile
  * arguments. `controllerWorkspace` is set only when the controller runs here.
+ * Returns `{ agent, notice? }`, the notice from the adapter's `awaitStartup`.
  */
 export async function startAgent({ params, agent, args: profile, cwd, controllerWorkspace }) {
 	const label = params.label.trim();
@@ -209,8 +210,8 @@ export async function startAgent({ params, agent, args: profile, cwd, controller
 			args,
 			timeout_ms: 30_000,
 		});
-		await worker.awaitStartup?.(started);
-		return started;
+		const startup = await worker.awaitStartup?.(started);
+		return { agent: started, ...(startup?.notice ? { notice: startup.notice } : {}) };
 	} catch (error) {
 		return rollback(
 			location.cleanup,
