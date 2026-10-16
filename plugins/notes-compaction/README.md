@@ -2,6 +2,8 @@
 
 Keep working across fresh context windows. The agent saves checkpoint notes, starts a new window that contains only a pointer to those notes, and can still search what happened in earlier windows.
 
+Ported from [pi-notes-compaction](https://github.com/IgorWarzocha/howaboua-pi-stuff/tree/main/packages/pi-notes-compaction), a Pi extension by [howaboua](https://github.com/IgorWarzocha) in [howaboua-pi-stuff](https://github.com/IgorWarzocha/howaboua-pi-stuff).
+
 ## Install
 
 ```
