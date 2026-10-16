@@ -139,6 +139,9 @@ export class Fleet {
   stop(): void {
     for (const watcher of this.watchers.values()) watcher.stop?.()
     this.watchers.clear()
+    // Retire in-flight checks too, without changing this session's saved state.
+    this.records.clear()
+    this.outbox = []
   }
 
   find(target: string, machine?: string): Watched | undefined {
