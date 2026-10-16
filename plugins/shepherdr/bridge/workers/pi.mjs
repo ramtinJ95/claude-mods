@@ -1,8 +1,11 @@
 // Pi workers: transcripts through the session reader; delivery through the
 // worker's Shepherdr receiver when it publishes one, else Herdr's terminal
 // prompt.
+import { stat } from "node:fs/promises";
+import { setTimeout as sleep } from "node:timers/promises";
 import { request } from "../herdr.mjs";
 import {
+	peerInboxPath,
 	sendPeerExtensionReply,
 	sendPeerMessage,
 } from "../vendor/shepherdr-peer.mjs";
@@ -38,6 +41,28 @@ export function view(agent) {
 
 export function isReady(agent) {
 	return Boolean(sessionPath(agent));
+}
+
+// pi-shepherdr's own client waits this long for a receiver.
+const RECEIVER_WAIT_MS = 30_000;
+
+/**
+ * Waits for a spawned worker's Shepherdr receiver, which pi-shepherdr
+ * publishes only after Pi's startup hooks, later than Herdr reports it ready.
+ * A Pi without one is left to `deliver`'s terminal route once the wait ends.
+ */
+export async function awaitStartup(agent) {
+	const inbox = peerInboxPath(sessionPath(agent), agent.terminal_id);
+	const deadline = Date.now() + RECEIVER_WAIT_MS;
+	while (Date.now() < deadline) {
+		try {
+			await stat(inbox);
+			return;
+		} catch (error) {
+			if (error.code !== "ENOENT") throw error;
+		}
+		await sleep(100);
+	}
 }
 
 /** accepted | rejected | unknown once Pi recorded the Ask's outcome, else undefined. */

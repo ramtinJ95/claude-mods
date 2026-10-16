@@ -202,13 +202,15 @@ export async function startAgent({ params, agent, args: profile, cwd, controller
 	const args = worker.launchArgs(label, profile);
 	const location = await createLocation(params, cwd, label, workspaces, controllerWorkspace);
 	try {
-		return await startWhenShellReady({
+		const started = await startWhenShellReady({
 			name,
 			kind: agent,
 			pane_id: location.paneId,
 			args,
 			timeout_ms: 30_000,
 		});
+		await worker.awaitStartup?.(started);
+		return started;
 	} catch (error) {
 		return rollback(
 			location.cleanup,
