@@ -14,18 +14,28 @@ export interface SessionState {
   projects?: string
   /** The fork record this session was restored from, which prune keeps while the session stays. */
   restoredFrom?: string
+  /**
+   * The marker of a window opened from Claude Code's summary that waits for the user. It leads their next plain
+   * prompt, the one message that can carry it there, and is kept here so a resumed session still delivers it.
+   */
+  unsentMarker?: string
 }
 
 export const GUIDANCE = `<context_window_guidance>
-Keep one checkpoint per task at a stable notes path: request, constraints, decisions, progress and how it was verified, next steps, identifiers needed to act (history IDs too). Replace stale state; mark completion in place. Keep reusable findings and deferred ideas in separate topic notes; link, don't copy. Recording isn't permission to implement.
+Notes persist across windows. Keep one checkpoint per task at a stable notes path, covering the request, constraints, decisions, progress and how it was verified, next steps and identifiers needed to act (history IDs too), so you can resume without rereading the conversation. Replace stale state; mark completion in place. Keep reusable findings and deferred ideas in separate topic notes; link, don't copy. Recording isn't permission to implement.
 
-Save changed state after substantial work, before replying, and before new_context or handoff. Skip routine or unchanged state; raw output stays in history. Include checkpoint paths in handoffs. After rollover, read the checkpoint, then linked notes as needed; history only for missing details.
+Save changed state after substantial work, before replying, and before new_context or handoff. Skip routine or unchanged state; raw output stays in history. Include checkpoint paths in handoffs. After rollover, read the checkpoint, then linked notes as needed. History retrieves earlier conversation; use it only for missing details.
 </context_window_guidance>`
 
 const WINDOW_OPEN = '<context_window>'
+const WINDOW_CLOSE = '</context_window>'
+/** The prompt that continues a window opened on its own. */
+export const CONTINUE = 'Continue.'
 const FIRST = 'First context window id: '
 const CURRENT = 'Current context window id: '
 const PREVIOUS = 'Previous context window id: '
+/** Marks a window's marker repeated after Claude Code's own compaction, as opposed to a window boundary. */
+const RECOVERY = 'If no checkpoint is available, use history to recover missing context.'
 
 export function newState(): SessionState {
   const id = crypto.randomUUID()
@@ -41,18 +51,27 @@ export function nextWindow(current: WindowIdentity): WindowIdentity {
   }
 }
 
-export function windowText(agent: string, ids: WindowIdentity, recentNotes: readonly string[]): string {
+/** `repeated` is the marker put back after Claude Code compacted the window on its own: it adds where to look when no checkpoint covers the work. */
+export function windowText(agent: string, ids: WindowIdentity, recentNotes: readonly string[], repeated = false): string {
   const lines = [`Agent name: ${agent}`, `${FIRST}${ids.firstWindowId}`, `${CURRENT}${ids.currentWindowId}`]
   if (ids.previousWindowId) lines.push(`${PREVIOUS}${ids.previousWindowId}`)
   if (recentNotes.length) lines.push(`Recent notes (read them with the notes tool): ${recentNotes.join(', ')}`)
-  return `${WINDOW_OPEN}\n${lines.join('\n')}\n</context_window>`
+  if (repeated) lines.push(RECOVERY)
+  return `${WINDOW_OPEN}\n${lines.join('\n')}\n${WINDOW_CLOSE}`
+}
+
+/** A marker message's own prompt after the marker, if any besides the plugin's own continue. */
+export function promptAfterMarker(text: string): string | undefined {
+  const end = text.indexOf(WINDOW_CLOSE)
+  const rest = end < 0 ? '' : text.slice(end + WINDOW_CLOSE.length).trim()
+  return rest && rest !== CONTINUE ? rest : undefined
 }
 
 /** The window boundary windowText wrote, read back from a transcript message: on its first or second line. */
 export function windowMarker(message: {
   role: string
   text: string
-}): { first?: string; current: string; previous?: string } | undefined {
+}): { first?: string; current: string; previous?: string; repeated?: true } | undefined {
   if (message.role !== 'user') return
   const { text } = message
   const open = `${WINDOW_OPEN}\n`
@@ -65,7 +84,8 @@ export function windowMarker(message: {
       ?.slice(prefix.length)
       .trim()
   const current = field(CURRENT)
-  return current ? { first: field(FIRST), current, previous: field(PREVIOUS) } : undefined
+  if (!current) return
+  return { first: field(FIRST), current, previous: field(PREVIOUS), ...(lines.includes(RECOVERY) ? { repeated: true as const } : {}) }
 }
 
 /** Both reminders went out in this window: nothing left to measure for. */
@@ -82,5 +102,5 @@ export function reminderFor(state: SessionState, percentUsed: number | undefined
   if (kind === 'urgent') state.reminded.push(`${id}:urgent`)
   // Estimates lean early and can pass the limit.
   const remaining = Math.max(0, Math.round((100 - percentUsed) * 10) / 10)
-  return `<context_window_reminder>\n${kind === 'urgent' ? 'Urgent: ' : ''}${remaining}% remaining. Checkpoint the active request, state and known history IDs in notes, then call new_context ${kind === 'urgent' ? 'now, before other work' : 'before continuing work'}.\n</context_window_reminder>`
+  return `<context_window_reminder>\n${kind === 'urgent' ? 'Urgent: ' : ''}${remaining}% context remaining. Save the task state in notes, then call new_context ${kind === 'urgent' ? 'now, before other work' : 'before continuing work'}.\n</context_window_reminder>`
 }

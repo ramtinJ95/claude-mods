@@ -1,6 +1,6 @@
 import type { SessionMessage } from 'claude-code'
 import { integer } from './notes.ts'
-import { windowMarker } from './windows.ts'
+import { promptAfterMarker, windowMarker } from './windows.ts'
 
 interface HistoryItem {
   window_id: string
@@ -50,11 +50,12 @@ function answer(
     seen.set(`${windowId}:${key}`, n + 1)
     return n ? `${key}~${n}` : key
   }
-  // Rows before the first boundary in view belong to the window it names as previous; with no
-  // boundary in view, every row belongs to the current window.
+  // Rows before the first boundary in view belong to the window it names as previous, or to its own window when it
+  // only repeats that window's marker after Claude Code's compaction; with no boundary in view, every row belongs to
+  // the current window.
   const markers = messages.map(windowMarker)
   const first = markers.find((marker) => marker !== undefined)
-  let windowId = first ? (first.previous ?? currentWindowId) : currentWindowId
+  let windowId = first ? (first.repeated ? first.current : (first.previous ?? currentWindowId)) : currentWindowId
   const windows = new Map<string, HistoryItem[]>([[windowId, []]])
   const toolNames = new Map<string, string>()
   for (const [index, message] of messages.entries()) {
@@ -62,6 +63,10 @@ function answer(
     if (boundary) {
       windowId = boundary.current
       if (!windows.has(windowId)) windows.set(windowId, [])
+      // A window that waited for the user carries its marker on their next prompt.
+      const prompt = promptAfterMarker(message.text)
+      if (prompt)
+        windows.get(windowId)!.push({ window_id: windowId, item_id: stableId(`u-${hash(prompt)}`), role: 'user', content: prompt })
       continue
     }
     const items = windows.get(windowId)!

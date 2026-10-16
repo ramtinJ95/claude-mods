@@ -20,6 +20,7 @@ import {
   WRITE_ACTIONS,
 } from './notes.ts'
 import {
+  CONTINUE,
   GUIDANCE,
   newState,
   nextWindow,
@@ -114,17 +115,22 @@ const TOOLS = [
   {
     name: 'notes',
     // The description carries the checkpoint guidance: prompt events do not reach this mod (see AGENTS.md).
-    description: `Cross-window notes. write_file replaces; append_to_file adds. Virtual paths: relative uses current agent; cross-agent uses <agent>/notes[/path], read-only. Call with no arguments for help.\n\n${GUIDANCE}`,
+    description: `Persistent notes. write_file replaces; append_to_file adds. Virtual paths: relative uses current agent; cross-agent uses <agent>/notes[/path], read-only. Call with no arguments for help.\n\n${GUIDANCE}`,
     inputSchema: NOTES_SCHEMA,
     isDeferred: false,
   },
   {
     name: 'history',
-    description: 'Prior-window detail. Pass IDs unchanged. Search, never browse. Call with no arguments for help.',
+    description: "Search earlier conversation, don't browse it. Pass returned IDs unchanged. Call with no arguments for help.",
     inputSchema: HISTORY_SCHEMA,
     isDeferred: true,
   },
-  { name: 'new_context', description: 'Start a new context window', inputSchema: EMPTY_SCHEMA, isDeferred: false },
+  {
+    name: 'new_context',
+    description: 'Start fresh from saved notes; recover earlier conversation through history',
+    inputSchema: EMPTY_SCHEMA,
+    isDeferred: false,
+  },
   { name: 'get_context_remaining', description: 'Remaining context tokens', inputSchema: EMPTY_SCHEMA, isDeferred: true },
 ]
 
@@ -178,6 +184,7 @@ const BLOCKED_NOTICE =
 const PENDING = 'A notes checkpoint or rollover is already pending.'
 const CHECKPOINT_FIRST = 'Saving a notes checkpoint first. The new window opens after it completes.'
 const ROLLOVER_FAILED = 'Context rollover failed. The existing context remains.'
+const NOTE_FIRST = 'Save your progress with notes, wait for the write to succeed, then call new_context next.'
 
 const CHECKPOINT_PROMPT =
   '<context_window_reminder>\nContext checkpoint requested. Save the current state with notes, then finish your response. The new window opens after this turn. Do not call new_context. If saving fails, report the failure without rolling over.\n</context_window_reminder>'
@@ -197,18 +204,23 @@ const REVISION_LIMIT = 4_000_000
 let storage: Promise<string> | undefined
 let sessionId: string | undefined
 let loaded: { dir: string; promise: Promise<{ dir: string; state: SessionState }> } | undefined
-/** The running main turn. Between turns, Claude Code compacts on its own only while idle. */
-let turn: { id: string; notes: 'none' | 'saved' | 'failed' } | undefined
+/**
+ * The running main turn. Between turns, Claude Code compacts on its own only while idle. `lastCall` is its latest
+ * completed tool call and `savedNote` its latest successful notes write, so new_context can require that it directly
+ * follows a saved note.
+ */
+let turn: { id: string; notes: 'none' | 'saved' | 'failed'; lastCall?: string; savedNote?: string } | undefined
 /** The window whose latest completed turn saved fresh notes. */
 let freshWindowId: string | undefined
 /**
  * At most one rollover at a time: requested by new_context, a checkpoint (/compact or idle compaction), or the
- * /compact opening it. One started by idle compaction (`idle`) opens a window that waits for the user.
+ * /compact opening it. Only new_context's window continues on its own; the others (`waits`) wait for the user,
+ * as Claude Code's /compact does.
  */
 let pending:
   | { kind: 'requested' }
-  | { kind: 'checkpoint'; windowId: string; idle: boolean }
-  | { kind: 'rolling'; idle: boolean; answered: boolean }
+  | { kind: 'checkpoint'; windowId: string }
+  | { kind: 'rolling'; waits: boolean; answered: boolean }
   | undefined
 /** The context whose idle compaction already asked for a checkpoint; a later one there stays Claude Code's own. */
 let idleCheckpointWindowId: string | undefined
@@ -305,7 +317,7 @@ async function loadSession($: EngineInterface, dir: string) {
         firstWindowId: marker.first ?? marker.current,
         currentWindowId: marker.current,
         ...(marker.previous ? { previousWindowId: marker.previous } : {}),
-        windowNumber: markers.filter(Boolean).length,
+        windowNumber: markers.filter((m) => m && !m.repeated).length,
       }
     for (const use of [...messages[i]!.toolUses].reverse()) {
       if (use.tool !== NOTES_TOOL || use.isError || !WRITE_ACTIONS.includes(use.input['action'])) continue
@@ -363,11 +375,11 @@ async function isSessionAgent($: EngineInterface, self: string, agent: string): 
 
 /**
  * The window's opening message, after `kept` (normal compaction's summary, or nothing for a
- * notes-only window); the conversation continues once it stands, unless the user is idle.
+ * notes-only window); the conversation continues once it stands, unless it waits for the user.
  */
-async function openWindow($: EngineInterface, kept: readonly SessionMessage[] = [], idle = false): Promise<SessionCompacted> {
+async function openWindow($: EngineInterface, kept: readonly SessionMessage[], waits: boolean): Promise<SessionCompacted> {
   const marker = await advanceWindow($)
-  if (!idle) $.clock.after(100, () => $.prompt.submit({ text: 'Continue.' }))
+  if (!waits) $.clock.after(100, () => $.prompt.submit({ text: CONTINUE }))
   return {
     messages: [
       ...kept,
@@ -384,6 +396,7 @@ async function advanceWindow($: EngineInterface): Promise<string> {
   const recent = recentPaths(await readNotes($, rootNotesDir(dir)), ROOT)
   state.window = ids
   state.reminded = []
+  delete state.unsentMarker
   await saveState($, dir, state)
   return windowText(ROOT, ids, recent)
 }
@@ -392,14 +405,14 @@ async function advanceWindow($: EngineInterface): Promise<string> {
  * Rollover runs between turns through /compact: the one route on which our session.compact hook answers.
  * Where Claude Code skips that hook, its own summary runs instead, guided to defer to the notes.
  */
-function roll($: EngineInterface, idle = false) {
-  const rolling = { kind: 'rolling' as const, idle, answered: false }
+function roll($: EngineInterface, waits: boolean) {
+  const rolling = { kind: 'rolling' as const, waits, answered: false }
   pending = rolling
   $.clock.after(100, async () => {
     try {
       const guided = !normalCompaction && compaction !== 'hooked'
       await $.command.run({ command: 'compact', ...(guided ? { args: ROLLOVER_SUMMARY } : {}) })
-      if (!rolling.answered) await continueAfterSummary($, idle)
+      if (!rolling.answered) await continueAfterSummary($, waits)
     } catch (error) {
       $.ui.toast(`Context rollover failed: ${message(error)}. The existing context remains.`)
     } finally {
@@ -413,7 +426,7 @@ function roll($: EngineInterface, idle = false) {
  * window boundaries from arrives as the prompt that continues. Usage reads no context until the next request,
  * so a context still measured means no compaction ran.
  */
-async function continueAfterSummary($: EngineInterface, idle: boolean) {
+async function continueAfterSummary($: EngineInterface, waits: boolean) {
   if ((await $.session.usage()).context.tokens !== undefined)
     throw new Error('Claude Code did not compact the conversation')
   if (compaction !== 'blocked') {
@@ -421,7 +434,11 @@ async function continueAfterSummary($: EngineInterface, idle: boolean) {
     await setCompaction($, 'blocked')
   }
   const marker = await advanceWindow($)
-  if (!idle) $.clock.after(100, () => $.prompt.submit({ text: `${marker}\nContinue.` }))
+  if (waits) {
+    const { dir, state } = await session($)
+    state.unsentMarker = marker
+    await saveState($, dir, state)
+  } else $.clock.after(100, () => $.prompt.submit({ text: `${marker}\n${CONTINUE}` }))
 }
 
 async function setCompaction($: EngineInterface, found: 'hooked' | 'blocked') {
@@ -429,9 +446,9 @@ async function setCompaction($: EngineInterface, found: 'hooked' | 'blocked') {
   await $.store.set('compaction', found)
 }
 
-/** In place of a compaction: a turn that saves notes, after which turn.complete rolls into the new window. */
-function checkpoint($: EngineInterface, windowId: string, idle: boolean, guidance: string) {
-  pending = { kind: 'checkpoint', windowId, idle }
+/** In place of a compaction: a turn that saves notes, after which turn.complete rolls into a window that waits. */
+function checkpoint($: EngineInterface, windowId: string, guidance: string) {
+  pending = { kind: 'checkpoint', windowId }
   $.clock.after(100, () => $.prompt.submit({ text: CHECKPOINT_PROMPT + guidance }))
 }
 
@@ -548,7 +565,10 @@ async function runNotes($: EngineInterface, e: ToolCallInput): Promise<ToolCallR
       state.agents = [...(state.agents ?? []), self]
       await saveState($, sessionDir, state)
     }
-    if (main && turn?.notes === 'none') turn.notes = 'saved'
+    if (main && turn) {
+      if (turn.notes === 'none') turn.notes = 'saved'
+      turn.savedNote = e.tool_use_id
+    }
     return result(payload)
   } catch (error) {
     if (isWrite && main && turn) turn.notes = 'failed'
@@ -686,7 +706,11 @@ async function confirmPrune($: EngineInterface) {
 
 export const register: Register = (on) => {
   // First registered is outermost: this wraps every tool's result, the plugin's own included.
-  on('tool.call', async ($, e, next) => remind($, e.agentId, await next(e)))
+  on('tool.call', async ($, e, next) => {
+    const called = await next(e)
+    if (e.agentId === undefined && turn && e.tool_use_id) turn.lastCall = e.tool_use_id
+    return remind($, e.agentId, called)
+  })
 
   on('session.start', async ($, e, next) => {
     const started = await next(e)
@@ -702,11 +726,21 @@ export const register: Register = (on) => {
   // "Continue." arrives while usage still measures the old window, and the checkpoint prompt already asks for notes.
   on('prompt.submit', async ($, e, next) => {
     if (e.origin.kind === 'plugin' && e.origin.name === 'notes-compaction') return next(e)
+    // A slash command's text cannot be rewritten, so the marker waits for a plain prompt.
+    let prompt = e
+    if (!e.command) {
+      const { dir, state } = await session($)
+      if (state.unsentMarker) {
+        prompt = { ...e, text: `${state.unsentMarker}\n${e.text}` }
+        delete state.unsentMarker
+        await saveState($, dir, state)
+      }
+    }
     // This runs before turn.start refreshes the threshold, which a resumed session has yet to read.
     const reminder = await refreshThreshold($)
       .then(() => dueReminder($, e.text.length))
       .catch(() => undefined)
-    return next(reminder ? { ...e, context: [...(e.context ?? []), reminder] } : e)
+    return next(reminder ? { ...prompt, context: [...(prompt.context ?? []), reminder] } : prompt)
   })
 
   // After new_context, the turn ends at its next model request, once the whole tool batch ran,
@@ -746,7 +780,7 @@ export const register: Register = (on) => {
     if (was?.kind === 'checkpoint') {
       pending = undefined
       if (e.isAborted || was.windowId !== windowId) $.ui.toast('Checkpoint cancelled. The old context remains.')
-      else if (fresh) roll($, was.idle)
+      else if (fresh) roll($, true)
       else
         $.ui.toast(
           'Rollover did not start. No fresh note was saved in the completed checkpoint. The old context remains.',
@@ -756,7 +790,7 @@ export const register: Register = (on) => {
       if (e.isAborted) $.ui.toast('Rollover cancelled by the interruption. The old context remains.')
       else if (ended?.notes === 'failed')
         $.ui.toast('Rollover did not start: a note failed to save this turn. The old context remains.')
-      else roll($)
+      else roll($, false)
     }
     return completed
   })
@@ -766,11 +800,11 @@ export const register: Register = (on) => {
     if (compaction !== 'hooked') await setCompaction($, 'hooked')
     if (e.trigger === 'precompute') return next(e)
     if (pending?.kind === 'rolling') {
-      const { idle } = pending
+      const { waits } = pending
       pending.answered = true
-      if (!normalCompaction) return openWindow($, [], idle)
+      if (!normalCompaction) return openWindow($, [], waits)
       const compacted = await next(e)
-      return compacted.skip ? compacted : openWindow($, compacted.messages, idle)
+      return compacted.messages ? openWindow($, compacted.messages, waits) : compacted
     }
     // With normal compaction on, idle compaction is Claude Code's own, as in Pi. Otherwise it is handled as /compact
     // (the command.run hook): the prompt cache is still warm, so a checkpoint turn costs about what its summary would.
@@ -780,19 +814,20 @@ export const register: Register = (on) => {
       if (freshWindowId === windowId) return openWindow($, [], true)
       if (idleCheckpointWindowId !== windowId) {
         idleCheckpointWindowId = windowId
-        checkpoint($, windowId, true, '')
+        checkpoint($, windowId, '')
         return { skip: CHECKPOINT_FIRST }
       }
     }
     // Other compaction stays Claude Code's own; reminders and the idle checkpoint restart in the compacted context.
+    // The window's marker leads it again, so the window keeps its identity and history files the summary under it.
     const compacted = await next(e)
-    if (!compacted.skip) {
-      idleCheckpointWindowId = undefined
-      const { dir, state } = await session($)
-      state.reminded = []
-      await saveState($, dir, state)
-    }
-    return compacted
+    if (!compacted.messages) return compacted
+    idleCheckpointWindowId = undefined
+    const { dir, state } = await session($)
+    state.reminded = []
+    await saveState($, dir, state)
+    const marker = windowText(ROOT, state.window, recentPaths(await readNotes($, rootNotesDir(dir)), ROOT), true)
+    return { ...compacted, messages: [{ role: 'user', text: marker, toolUses: [] }, ...compacted.messages] }
   }).catch(async ($, e, next) => {
     // A called next replays what it settled to: a rejection there is Claude Code's own compaction failing.
     if (next.called)
@@ -815,6 +850,9 @@ export const register: Register = (on) => {
         started: false,
         message: 'A checkpoint or rollover is already pending. Save notes and finish your response',
       })
+    // A write earlier in the batch may still be saving.
+    await notesQueue
+    if (!turn?.savedNote || turn.lastCall !== turn.savedNote) return { deny: NOTE_FIRST }
     pending = { kind: 'requested' }
     return result({
       started: true,
@@ -832,10 +870,10 @@ export const register: Register = (on) => {
     const windowId = (await session($)).state.window.currentWindowId
     const instructions = e.args.trim()
     if (!instructions && freshWindowId === windowId) {
-      roll($)
+      roll($, true)
       return { text: 'Opening a new window from your notes.' }
     }
-    checkpoint($, windowId, false, instructions ? `\n\nCheckpoint guidance:\n${instructions}` : '')
+    checkpoint($, windowId, instructions ? `\n\nCheckpoint guidance:\n${instructions}` : '')
     return { text: CHECKPOINT_FIRST }
   }).catch(() => ({ text: ROLLOVER_FAILED }))
 
