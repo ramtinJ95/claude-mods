@@ -14,6 +14,11 @@ export interface SessionState {
   projects?: string
   /** The fork record this session was restored from, which prune keeps while the session stays. */
   restoredFrom?: string
+  /**
+   * The marker of a window opened from Claude Code's summary that waits for the user. It leads their next plain
+   * prompt, the one message that can carry it there, and is kept here so a resumed session still delivers it.
+   */
+  unsentMarker?: string
 }
 
 export const GUIDANCE = `<context_window_guidance>
@@ -23,6 +28,9 @@ Save changed state after substantial work, before replying, and before new_conte
 </context_window_guidance>`
 
 const WINDOW_OPEN = '<context_window>'
+const WINDOW_CLOSE = '</context_window>'
+/** The prompt that continues a window opened on its own. */
+export const CONTINUE = 'Continue.'
 const FIRST = 'First context window id: '
 const CURRENT = 'Current context window id: '
 const PREVIOUS = 'Previous context window id: '
@@ -49,7 +57,14 @@ export function windowText(agent: string, ids: WindowIdentity, recentNotes: read
   if (ids.previousWindowId) lines.push(`${PREVIOUS}${ids.previousWindowId}`)
   if (recentNotes.length) lines.push(`Recent notes (read them with the notes tool): ${recentNotes.join(', ')}`)
   if (repeated) lines.push(RECOVERY)
-  return `${WINDOW_OPEN}\n${lines.join('\n')}\n</context_window>`
+  return `${WINDOW_OPEN}\n${lines.join('\n')}\n${WINDOW_CLOSE}`
+}
+
+/** A marker message's own prompt after the marker, if any besides the plugin's own continue. */
+export function promptAfterMarker(text: string): string | undefined {
+  const end = text.indexOf(WINDOW_CLOSE)
+  const rest = end < 0 ? '' : text.slice(end + WINDOW_CLOSE.length).trim()
+  return rest && rest !== CONTINUE ? rest : undefined
 }
 
 /** The window boundary windowText wrote, read back from a transcript message: on its first or second line. */

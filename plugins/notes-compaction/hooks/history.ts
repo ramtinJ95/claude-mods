@@ -1,6 +1,6 @@
 import type { SessionMessage } from 'claude-code'
 import { integer } from './notes.ts'
-import { windowMarker } from './windows.ts'
+import { promptAfterMarker, windowMarker } from './windows.ts'
 
 interface HistoryItem {
   window_id: string
@@ -63,6 +63,10 @@ function answer(
     if (boundary) {
       windowId = boundary.current
       if (!windows.has(windowId)) windows.set(windowId, [])
+      // A window that waited for the user carries its marker on their next prompt.
+      const prompt = promptAfterMarker(message.text)
+      if (prompt)
+        windows.get(windowId)!.push({ window_id: windowId, item_id: stableId(`u-${hash(prompt)}`), role: 'user', content: prompt })
       continue
     }
     const items = windows.get(windowId)!

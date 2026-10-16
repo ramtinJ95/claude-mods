@@ -20,6 +20,7 @@ import {
   WRITE_ACTIONS,
 } from './notes.ts'
 import {
+  CONTINUE,
   GUIDANCE,
   newState,
   nextWindow,
@@ -221,11 +222,6 @@ let pending:
   | { kind: 'checkpoint'; windowId: string }
   | { kind: 'rolling'; waits: boolean; answered: boolean }
   | undefined
-/**
- * The marker of a window opened from Claude Code's summary that waits for the user: it leads their next prompt,
- * the one message that can carry it there.
- */
-let unsentMarker: string | undefined
 /** The context whose idle compaction already asked for a checkpoint; a later one there stays Claude Code's own. */
 let idleCheckpointWindowId: string | undefined
 /**
@@ -383,7 +379,7 @@ async function isSessionAgent($: EngineInterface, self: string, agent: string): 
  */
 async function openWindow($: EngineInterface, kept: readonly SessionMessage[], waits: boolean): Promise<SessionCompacted> {
   const marker = await advanceWindow($)
-  if (!waits) $.clock.after(100, () => $.prompt.submit({ text: 'Continue.' }))
+  if (!waits) $.clock.after(100, () => $.prompt.submit({ text: CONTINUE }))
   return {
     messages: [
       ...kept,
@@ -400,6 +396,7 @@ async function advanceWindow($: EngineInterface): Promise<string> {
   const recent = recentPaths(await readNotes($, rootNotesDir(dir)), ROOT)
   state.window = ids
   state.reminded = []
+  delete state.unsentMarker
   await saveState($, dir, state)
   return windowText(ROOT, ids, recent)
 }
@@ -437,8 +434,11 @@ async function continueAfterSummary($: EngineInterface, waits: boolean) {
     await setCompaction($, 'blocked')
   }
   const marker = await advanceWindow($)
-  if (waits) unsentMarker = marker
-  else $.clock.after(100, () => $.prompt.submit({ text: `${marker}\nContinue.` }))
+  if (waits) {
+    const { dir, state } = await session($)
+    state.unsentMarker = marker
+    await saveState($, dir, state)
+  } else $.clock.after(100, () => $.prompt.submit({ text: `${marker}\n${CONTINUE}` }))
 }
 
 async function setCompaction($: EngineInterface, found: 'hooked' | 'blocked') {
@@ -727,9 +727,15 @@ export const register: Register = (on) => {
   on('prompt.submit', async ($, e, next) => {
     if (e.origin.kind === 'plugin' && e.origin.name === 'notes-compaction') return next(e)
     // A slash command's text cannot be rewritten, so the marker waits for a plain prompt.
-    const marker = e.command ? undefined : unsentMarker
-    if (marker) unsentMarker = undefined
-    const prompt = marker ? { ...e, text: `${marker}\n${e.text}` } : e
+    let prompt = e
+    if (!e.command) {
+      const { dir, state } = await session($)
+      if (state.unsentMarker) {
+        prompt = { ...e, text: `${state.unsentMarker}\n${e.text}` }
+        delete state.unsentMarker
+        await saveState($, dir, state)
+      }
+    }
     // This runs before turn.start refreshes the threshold, which a resumed session has yet to read.
     const reminder = await refreshThreshold($)
       .then(() => dueReminder($, e.text.length))
@@ -751,7 +757,7 @@ export const register: Register = (on) => {
 
   // /clear ends this session in the same process, under a new ID.
   on('session.end', async ($, e, next) => {
-    sessionId = loaded = turn = freshWindowId = pending = idleCheckpointWindowId = measured = unsentMarker = undefined
+    sessionId = loaded = turn = freshWindowId = pending = idleCheckpointWindowId = measured = undefined
     return next(e)
   })
 
