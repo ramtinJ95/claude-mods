@@ -221,6 +221,11 @@ let pending:
   | { kind: 'checkpoint'; windowId: string }
   | { kind: 'rolling'; waits: boolean; answered: boolean }
   | undefined
+/**
+ * The marker of a window opened from Claude Code's summary that waits for the user: it leads their next prompt,
+ * the one message that can carry it there.
+ */
+let unsentMarker: string | undefined
 /** The context whose idle compaction already asked for a checkpoint; a later one there stays Claude Code's own. */
 let idleCheckpointWindowId: string | undefined
 /**
@@ -316,8 +321,7 @@ async function loadSession($: EngineInterface, dir: string) {
         firstWindowId: marker.first ?? marker.current,
         currentWindowId: marker.current,
         ...(marker.previous ? { previousWindowId: marker.previous } : {}),
-        // Each later window's ID is new; a Claude Code compaction repeats its window's marker.
-        windowNumber: new Set(markers.flatMap((m) => (m && m.current !== m.first ? [m.current] : []))).size,
+        windowNumber: markers.filter((m) => m && !m.repeated).length,
       }
     for (const use of [...messages[i]!.toolUses].reverse()) {
       if (use.tool !== NOTES_TOOL || use.isError || !WRITE_ACTIONS.includes(use.input['action'])) continue
@@ -433,7 +437,8 @@ async function continueAfterSummary($: EngineInterface, waits: boolean) {
     await setCompaction($, 'blocked')
   }
   const marker = await advanceWindow($)
-  if (!waits) $.clock.after(100, () => $.prompt.submit({ text: `${marker}\nContinue.` }))
+  if (waits) unsentMarker = marker
+  else $.clock.after(100, () => $.prompt.submit({ text: `${marker}\nContinue.` }))
 }
 
 async function setCompaction($: EngineInterface, found: 'hooked' | 'blocked') {
@@ -721,11 +726,15 @@ export const register: Register = (on) => {
   // "Continue." arrives while usage still measures the old window, and the checkpoint prompt already asks for notes.
   on('prompt.submit', async ($, e, next) => {
     if (e.origin.kind === 'plugin' && e.origin.name === 'notes-compaction') return next(e)
+    // A slash command's text cannot be rewritten, so the marker waits for a plain prompt.
+    const marker = e.command ? undefined : unsentMarker
+    if (marker) unsentMarker = undefined
+    const prompt = marker ? { ...e, text: `${marker}\n${e.text}` } : e
     // This runs before turn.start refreshes the threshold, which a resumed session has yet to read.
     const reminder = await refreshThreshold($)
       .then(() => dueReminder($, e.text.length))
       .catch(() => undefined)
-    return next(reminder ? { ...e, context: [...(e.context ?? []), reminder] } : e)
+    return next(reminder ? { ...prompt, context: [...(prompt.context ?? []), reminder] } : prompt)
   })
 
   // After new_context, the turn ends at its next model request, once the whole tool batch ran,
@@ -742,7 +751,7 @@ export const register: Register = (on) => {
 
   // /clear ends this session in the same process, under a new ID.
   on('session.end', async ($, e, next) => {
-    sessionId = loaded = turn = freshWindowId = pending = idleCheckpointWindowId = measured = undefined
+    sessionId = loaded = turn = freshWindowId = pending = idleCheckpointWindowId = measured = unsentMarker = undefined
     return next(e)
   })
 

@@ -26,6 +26,8 @@ const WINDOW_OPEN = '<context_window>'
 const FIRST = 'First context window id: '
 const CURRENT = 'Current context window id: '
 const PREVIOUS = 'Previous context window id: '
+/** Marks a window's marker repeated after Claude Code's own compaction, as opposed to a window boundary. */
+const RECOVERY = 'If no checkpoint is available, use history to recover missing context.'
 
 export function newState(): SessionState {
   const id = crypto.randomUUID()
@@ -41,12 +43,12 @@ export function nextWindow(current: WindowIdentity): WindowIdentity {
   }
 }
 
-/** `recovery` adds where to look when no checkpoint covers the work, for a window Claude Code compacted on its own. */
-export function windowText(agent: string, ids: WindowIdentity, recentNotes: readonly string[], recovery = false): string {
+/** `repeated` is the marker put back after Claude Code compacted the window on its own: it adds where to look when no checkpoint covers the work. */
+export function windowText(agent: string, ids: WindowIdentity, recentNotes: readonly string[], repeated = false): string {
   const lines = [`Agent name: ${agent}`, `${FIRST}${ids.firstWindowId}`, `${CURRENT}${ids.currentWindowId}`]
   if (ids.previousWindowId) lines.push(`${PREVIOUS}${ids.previousWindowId}`)
   if (recentNotes.length) lines.push(`Recent notes (read them with the notes tool): ${recentNotes.join(', ')}`)
-  if (recovery) lines.push('If no checkpoint is available, use history to recover missing context.')
+  if (repeated) lines.push(RECOVERY)
   return `${WINDOW_OPEN}\n${lines.join('\n')}\n</context_window>`
 }
 
@@ -54,7 +56,7 @@ export function windowText(agent: string, ids: WindowIdentity, recentNotes: read
 export function windowMarker(message: {
   role: string
   text: string
-}): { first?: string; current: string; previous?: string } | undefined {
+}): { first?: string; current: string; previous?: string; repeated?: true } | undefined {
   if (message.role !== 'user') return
   const { text } = message
   const open = `${WINDOW_OPEN}\n`
@@ -67,7 +69,8 @@ export function windowMarker(message: {
       ?.slice(prefix.length)
       .trim()
   const current = field(CURRENT)
-  return current ? { first: field(FIRST), current, previous: field(PREVIOUS) } : undefined
+  if (!current) return
+  return { first: field(FIRST), current, previous: field(PREVIOUS), ...(lines.includes(RECOVERY) ? { repeated: true as const } : {}) }
 }
 
 /** Both reminders went out in this window: nothing left to measure for. */

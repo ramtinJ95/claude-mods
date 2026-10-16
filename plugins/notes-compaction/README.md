@@ -36,7 +36,7 @@ A new window replaces the conversation with one marker message; no summary is ge
 
 From 2.1.299, on a machine with managed settings and for Team and Enterprise organizations, Claude Code's built-in security plugin skips installed plugins' compaction hooks. The mod then runs in a reduced mode and says so once with a notice and in `/notes`:
 
-- A new window starts from Claude Code's own summary, told to keep only what the notes lack, followed by the window marker and "Continue." in place of a notes-only window. The rollover costs one summarization request.
+- A new window starts from Claude Code's own summary, told to keep only what the notes lack, followed by the window marker and "Continue." in place of a notes-only window. After `/compact` or idle compaction the window waits instead, and the marker leads your next prompt. The rollover costs one summarization request.
 - `/compact` still asks for a checkpoint first, and instructions after it still become checkpoint guidance.
 - Idle compaction and compaction at the auto-compact threshold are Claude Code's own, with no checkpoint before them. Reminders start over after them.
 
