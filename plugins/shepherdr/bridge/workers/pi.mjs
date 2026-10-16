@@ -65,7 +65,7 @@ export async function awaitStartup(agent) {
 		await sleep(100);
 	}
 	return {
-		notice: `No Shepherdr receiver after ${RECEIVER_WAIT_MS / 1000} s, so the task went through Herdr's terminal prompt. Is @howaboua/pi-shepherdr installed in that Pi?`,
+		notice: `No Shepherdr receiver within ${RECEIVER_WAIT_MS / 1000} s of Pi starting; delivery shows the route the task took. Is @howaboua/pi-shepherdr installed in that Pi?`,
 	};
 }
 
