@@ -16,7 +16,7 @@ Requires Claude Code running inside Herdr, Node.js 22.18 or newer on `PATH`, and
 pi install npm:@howaboua/pi-shepherdr
 ```
 
-Without it, messages still reach a worker, but through Herdr's terminal prompt, which can mix with text typed into that worker's editor, and the worker cannot list its commands. Results report which path was used as `delivery: "peer"` or `"terminal"`.
+Without it, messages still reach a worker, but through Herdr's terminal prompt, which can mix with text typed into that worker's editor, and the worker cannot list its commands. Results report which path was used as `delivery: "peer"` or `"terminal"`. A spawned Pi worker gets its first task once pi-shepherdr's receiver is up, waiting up to 30 seconds after Pi starts; past that the task goes through the terminal prompt and the result carries a `notice` saying so. pi-shepherdr 0.2.20 needs Pi 1.2 or newer.
 
 ## What the agent gets
 
@@ -80,4 +80,4 @@ Claude Code profiles are separate, since pi-shepherdr does not read their fields
 
 ## Sessions and storage
 
-Watches and the orchestration mode belong to one Claude Code session and survive resuming it. A fork starts with none. After compaction, including a notes-compaction window, the agent is reminded of agents with assigned work before its next model request. State is stored as plaintext JSON under `$XDG_DATA_HOME/claude-shepherdr/sessions/<session id>.json`, defaulting to `~/.local/share`.
+Watches and the orchestration mode belong to one Claude Code session and survive resuming it. A fork starts with none. After compaction, including a notes-compaction window, the agent is reminded of the agents it watches, idle ones included, and their tasks before its next model request. State is stored as plaintext JSON under `$XDG_DATA_HOME/claude-shepherdr/sessions/<session id>.json`, defaulting to `~/.local/share`.

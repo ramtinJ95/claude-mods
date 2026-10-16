@@ -75,6 +75,8 @@ export type Delivery = {
   command?: true
   profileBlocking?: boolean
   session?: SessionRoute
+  /** Why a spawned worker's first task may have taken a fallback route. */
+  notice?: string
 }
 
 export type Tracked = { agent: AgentSummary; record: WorkerRecord }

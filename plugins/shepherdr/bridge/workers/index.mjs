@@ -2,7 +2,9 @@
 // name), localOnly?, launchArgs(label, profileArgs), sessionPath(agent),
 // isReady(agent), view(agent) -> SessionView, deliver(agent, message),
 // commands(agent), answer(agent, askId, answers) -> { status?, background?,
-// session? } and answerStatus(agent, askId, answers).
+// session? }, answerStatus(agent, askId, answers) and optional
+// awaitStartup(agent) -> { notice? }, which spawn awaits before delivering the
+// first task; a notice says why that task may take a fallback route.
 // view().ask is { toolCallId, delivery?: "steer", prompts: [{ title, body?,
 // multiple, choices }] }, where "steer" marks a question asked while the worker
 // continues; answers are [{ selections?, other?, comment? }] in prompt order,
