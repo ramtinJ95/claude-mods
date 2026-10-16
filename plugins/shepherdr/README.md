@@ -78,4 +78,4 @@ Claude Code profiles are separate, since pi-shepherdr does not read their fields
 
 ## Sessions and storage
 
-Watches and the orchestration mode belong to one Claude Code session and survive resuming it. A fork starts with none. After compaction, including a notes-compaction window, the agent is reminded of agents with assigned work before its next model request. State is stored as plaintext JSON under `$XDG_DATA_HOME/claude-shepherdr/sessions/<session id>.json`, defaulting to `~/.local/share`.
+Watches and the orchestration mode belong to one Claude Code session and survive resuming it. A fork starts with none. After compaction, including a notes-compaction window, the agent is reminded of the agents it watches, idle ones included, and their tasks before its next model request. State is stored as plaintext JSON under `$XDG_DATA_HOME/claude-shepherdr/sessions/<session id>.json`, defaulting to `~/.local/share`.

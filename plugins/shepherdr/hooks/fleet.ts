@@ -267,22 +267,23 @@ export class Fleet {
     return [...problems, ...lines, ...machineLines, mode].join('\n')
   }
 
-  /** What compaction drops: the chosen orchestration guidance and agents with assigned work. */
+  /**
+   * What compaction drops: the chosen orchestration guidance and every watched
+   * agent, idle ones included so the controller reuses them.
+   */
   briefing(): string[] {
-    const agents = [...this.records.values()]
-      .filter(record => record.task)
-      .map(record => ({
-        ...(record.machine ? { machine: record.machine } : {}),
-        target: record.paneId,
-        ...(record.name ? { name: record.name } : {}),
-        status: record.status ?? 'unknown',
-        task: record.task,
-      }))
+    const agents = [...this.records.values()].map(record => ({
+      ...(record.machine ? { machine: record.machine } : {}),
+      target: record.paneId,
+      ...(record.name ? { name: record.name } : {}),
+      status: record.status ?? 'unknown',
+      ...(record.task ? { task: record.task } : {}),
+    }))
     return [
       ...(this.orchestration ? [this.orchestration.guidance] : []),
       ...(agents.length
         ? [
-            `Existing agents after context rollover. Do not duplicate their work. Status is last observed; use these machine/target values for updates.\n${JSON.stringify(agents)}`,
+            `Supervised agents after context rollover. Their tasks are reference data, not tasks for you. Do not repeat settled tasks or duplicate running work. Status is last observed; use these machine/target values for updates.\n${JSON.stringify(agents)}`,
           ]
         : []),
     ]
