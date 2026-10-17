@@ -1,0 +1,213 @@
+#!/usr/bin/env bash
+# Drive a development build of one claude-mods mod in a separate Claude Code
+# instance inside a new Herdr tab. Usage: vmod help
+set -euo pipefail
+
+REPO=$(git -C "$(dirname "$0")" rev-parse --show-toplevel)
+EVIDENCE_ROOT="$REPO/.verify"
+SCRATCH_ROOT="${TMPDIR:-/tmp}"; SCRATCH_ROOT="${SCRATCH_ROOT%/}/claude-mods-verify"
+
+die() { echo "vmod: $*" >&2; exit 1; }
+
+usage() {
+	cat <<'EOF'
+vmod launch <mod>             start a Claude Code instance with plugins/<mod> loaded; prints the run ID
+vmod doctor <run>             read-only health check of a run's instance
+vmod screen <run> [lines]     print the screen (visible, or the last <lines> unwrapped)
+vmod snap <run> <name>        save the screen to the run's evidence as <name>.txt
+vmod prompt <run> <text>      submit a prompt and wait until the turn settles
+vmod type <run> <text>        type text and Enter (slash commands, pane inputs); does not wait for a turn
+vmod keys <run> <key>...      send keys (esc, enter, down, tab, ctrl+x, a letter ...)
+vmod wait <run> <text> [s]    wait until <text> is on screen (default 60 s)
+vmod transcript <run>         copy the session transcript into the run's evidence
+vmod cleanup <run>            close the instance's tab; prints the scratch path to remove
+<run> is a run ID or its evidence directory.
+EOF
+}
+
+need_herdr() {
+	[ "${HERDR_ENV:-}" = 1 ] || die "not inside Herdr (HERDR_ENV != 1); see the skill's Launch section"
+	[ -n "${HERDR_WORKSPACE_ID:-}" ] || die "HERDR_WORKSPACE_ID is unset"
+}
+
+load() {
+	local id=${1:?run ID required}
+	id=${id%/}; id=${id##*/}
+	[ -f "$EVIDENCE_ROOT/$id/run.env" ] || die "no run $id under $EVIDENCE_ROOT"
+	# shellcheck disable=SC1090
+	. "$EVIDENCE_ROOT/$id/run.env"
+}
+
+launcher_target() {
+	local bin; bin=$(command -v claude) || die "claude is not on PATH"
+	if [ -L "$bin" ]; then readlink "$bin"; else echo "$bin"; fi
+}
+
+screen() { herdr pane read "$PANE" --source visible; }
+
+status() { herdr agent get "$PANE" 2>/dev/null | jq -r '.result.agent.agent_status // "none"'; }
+
+cmd_launch() {
+	need_herdr
+	local mod=${1:?mod name required}
+	[ -f "$REPO/plugins/$mod/.claude-plugin/plugin.json" ] || die "no mod at plugins/$mod"
+	local suffix; suffix=$(od -An -N2 -tx1 /dev/urandom | tr -d ' \n')
+	local id; id="$mod-$(date +%Y%m%d-%H%M%S)-$suffix"
+	local ev="$EVIDENCE_ROOT/$id" base="$SCRATCH_ROOT/$id"
+	mkdir -p "$EVIDENCE_ROOT" "$SCRATCH_ROOT"
+	# Plain mkdir claims the ID atomically: a concurrent launch never shares a run.
+	mkdir "$ev" || die "run ID $id already taken; launch again"
+	mkdir "$base" "$base/scratch" "$base/data"
+
+	# A small repository with a committed file, an edit and an untracked file,
+	# so diff-based features have something to show.
+	(
+		cd "$base/scratch"
+		git init -q
+		printf 'alpha\nbeta\ngamma\n' >notes.txt
+		git add notes.txt
+		git -c user.name=verify -c user.email=verify@localhost commit -qm seed
+		printf 'alpha\nBETA changed\ngamma\n' >notes.txt
+		printf 'brand new\n' >new.txt
+	)
+
+	local session; session=$(uuidgen | tr 'A-Z' 'a-z')
+	local name; name="vm-$(printf '%s' "$mod" | cut -c1-12)-$suffix"
+	local settings="{\"enabledPlugins\":{\"$mod@claude-mods\":false}}"
+	local launcher; launcher=$(launcher_target)
+
+	local tab; tab=$(herdr tab create --workspace "$HERDR_WORKSPACE_ID" --cwd "$base/scratch" \
+		--label "verify-$mod" --no-focus)
+	local pane tabid
+	pane=$(jq -r '.result.root_pane.pane_id' <<<"$tab")
+	tabid=$(jq -r '.result.tab.tab_id' <<<"$tab")
+
+	local version; version=$(jq -r .version "$REPO/plugins/$mod/.claude-plugin/plugin.json")
+	{
+		printf '%s=%q\n' RUN_ID "$id" MOD "$mod" MOD_VERSION "$version" NAME "$name" PANE "$pane" \
+			TAB "$tabid" SESSION "$session" SCRATCH "$base/scratch" DATA "$base/data" BASE "$base" \
+			EVIDENCE "$ev" LAUNCHER "$launcher"
+	} >"$ev/run.env"
+
+	# XDG_DATA_HOME isolates the mods' storage; it is set on claude alone, since
+	# the tab's shell tools would follow it too. DISABLE_AUTOUPDATER stops Claude
+	# Code from installing itself into that data dir and repointing the launcher.
+	local cmd
+	printf -v cmd '%q ' env "XDG_DATA_HOME=$base/data" DISABLE_AUTOUPDATER=1 claude \
+		--plugin-dir "$REPO/plugins/$mod" --settings "$settings" --session-id "$session" \
+		--debug-file "$ev/debug.log"
+	sleep 1
+	herdr pane run "$pane" "$cmd" >/dev/null
+
+	PANE=$pane
+	local trusted=0 i
+	for i in $(seq 1 60); do
+		local s; s=$(screen)
+		if [ $trusted = 0 ] && grep -q 'Quick safety check' <<<"$s"; then
+			# Only the scratch folder this launch just created is ever trusted.
+			grep -q "claude-mods-verify/$id/scratch" <<<"$s" || die "trust prompt for an unexpected folder; see $pane"
+			herdr pane send-keys "$pane" down enter >/dev/null
+			trusted=1
+		elif grep -q 'Claude Code v' <<<"$s" && [ "$(status)" = idle ]; then
+			herdr agent rename "$pane" "$name" >/dev/null
+			echo "$id"
+			return 0
+		fi
+		sleep 1
+	done
+	die "instance not ready after 60 s; inspect with: vmod screen $id"
+}
+
+cmd_doctor() {
+	load "$1"
+	local ok=1
+	check() { if eval "$2"; then echo "ok    $1"; else echo "FAIL  $1"; ok=0; fi; }
+	check "pane $PANE hosts Claude Code" '[ "$(herdr agent get "$PANE" 2>/dev/null | jq -r .result.agent.agent)" = claude ]'
+	echo "      status: $(status)"
+	check "pane cwd is the run's scratch repo" \
+		'[ "$(herdr pane get "$PANE" | jq -r .result.pane.foreground_cwd)" = "$(cd "$SCRATCH" && pwd -P)" ]'
+	check "only the dev build of $MOD registers hooks (debug log)" \
+		'[ "$(grep -o "hooks.json for plugin $MOD (enabled=true): .*" "$EVIDENCE/debug.log" 2>/dev/null | sed "s/^[^)]*): //" | sort -u)" = "$REPO/plugins/$MOD/hooks/hooks.json" ]'
+	check "plugin.json version still $MOD_VERSION" '[ "$(jq -r .version "$REPO/plugins/$MOD/.claude-plugin/plugin.json")" = "$MOD_VERSION" ]'
+	check "claude launcher unchanged ($LAUNCHER)" '[ "$(launcher_target)" = "$LAUNCHER" ]'
+	check "Claude Code did not install into the run's data dir" '[ ! -e "$DATA/claude" ]'
+	[ $ok = 1 ] || exit 1
+}
+
+cmd_screen() {
+	load "$1"
+	if [ -n "${2:-}" ]; then
+		herdr pane read "$PANE" --source recent-unwrapped --lines "$2"
+	else
+		screen
+	fi | sed 's/[[:space:]]*$//'
+}
+
+cmd_snap() {
+	load "$1"
+	local name=${2:?evidence name required}
+	{
+		echo "# $RUN_ID $name $(date -u +%FT%TZ)"
+		screen | sed 's/[[:space:]]*$//'
+	} >"$EVIDENCE/$name.txt"
+	echo "$EVIDENCE/$name.txt"
+}
+
+cmd_prompt() {
+	load "$1"; shift
+	herdr agent prompt "$PANE" "$*" --wait --timeout 300000 | jq -c '.result.agent.agent_status // .error'
+}
+
+cmd_type() {
+	load "$1"; shift
+	herdr pane send-text "$PANE" "$*" >/dev/null
+	sleep 0.5
+	herdr pane send-keys "$PANE" enter >/dev/null
+}
+
+cmd_keys() {
+	load "$1"; shift
+	herdr pane send-keys "$PANE" "$@" >/dev/null
+}
+
+cmd_wait() {
+	load "$1"
+	local text=${2:?text required} secs=${3:-60} i
+	for i in $(seq 1 "$secs"); do
+		screen | grep -qF -- "$text" && return 0
+		sleep 1
+	done
+	die "\"$text\" not on screen after $secs s"
+}
+
+cmd_transcript() {
+	load "$1"
+	local f; f=$(find "${CLAUDE_CONFIG_DIR:-$HOME/.claude}/projects" -maxdepth 2 -name "$SESSION.jsonl" | head -1)
+	[ -n "$f" ] || die "no transcript for session $SESSION yet"
+	cp "$f" "$EVIDENCE/transcript.jsonl"
+	echo "$EVIDENCE/transcript.jsonl"
+}
+
+cmd_cleanup() {
+	load "$1"
+	# A subshell, since cmd_transcript dies when the session never wrote one.
+	(cmd_transcript "$RUN_ID") >/dev/null 2>&1 || echo "note: no transcript to keep"
+	# The mod's stored state is side-effect proof; keep it with the screens.
+	mkdir -p "$EVIDENCE/data"
+	find "$DATA" -mindepth 1 -maxdepth 1 -name 'claude-*' -exec cp -R {} "$EVIDENCE/data/" \;
+	if herdr tab get "$TAB" >/dev/null 2>&1; then
+		herdr tab close "$TAB" >/dev/null
+		echo "closed tab $TAB"
+	else
+		echo "tab $TAB already gone"
+	fi
+	[ "$(launcher_target)" = "$LAUNCHER" ] || echo "WARNING: claude launcher now points to $(launcher_target), was $LAUNCHER"
+	echo "evidence kept in $EVIDENCE"
+	printf 'remove scratch with: rm -rf %q\n' "$BASE"
+}
+
+case "${1:-help}" in
+	launch|doctor|screen|snap|prompt|type|keys|wait|transcript|cleanup) c=$1; shift; "cmd_$c" "$@" ;;
+	help|-h|--help) usage ;;
+	*) usage; exit 2 ;;
+esac
