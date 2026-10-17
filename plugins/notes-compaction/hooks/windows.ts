@@ -15,8 +15,8 @@ export interface SessionState {
   /** The fork record this session was restored from, which prune keeps while the session stays. */
   restoredFrom?: string
   /**
-   * The marker of a window opened from Claude Code's summary that waits for the user. It leads their next plain
-   * prompt, the one message that can carry it there, and is kept here so a resumed session still delivers it.
+   * The marker of a window opened from Claude Code's summary that waits for the user (/compact). It leads their next
+   * plain prompt, the one message that can carry it there, and is kept here so a resumed session still delivers it.
    */
   unsentMarker?: string
 }
@@ -29,8 +29,17 @@ Save changed state after substantial work, before replying, and before new_conte
 
 const WINDOW_OPEN = '<context_window>'
 const WINDOW_CLOSE = '</context_window>'
-/** The prompt that continues a window opened on its own. */
-export const CONTINUE = 'Continue.'
+/**
+ * How a new window starts. `continue` follows new_context, called mid-task. `resume` follows idle compaction: the
+ * agent ended its last turn, perhaps short of the user's request. `wait` follows /compact typed by the user.
+ */
+export type Opening = 'continue' | 'resume' | 'wait'
+/** The prompt that starts each window that does not wait. */
+export const OPENING_PROMPTS: Readonly<Record<Exclude<Opening, 'wait'>, string>> = {
+  continue: 'Continue.',
+  resume:
+    "Read your checkpoint. If the user's latest request is unfinished and needs nothing more from them, continue it. Otherwise reply in one line with what you are waiting for.",
+}
 const FIRST = 'First context window id: '
 const CURRENT = 'Current context window id: '
 const PREVIOUS = 'Previous context window id: '
@@ -60,11 +69,11 @@ export function windowText(agent: string, ids: WindowIdentity, recentNotes: read
   return `${WINDOW_OPEN}\n${lines.join('\n')}\n${WINDOW_CLOSE}`
 }
 
-/** A marker message's own prompt after the marker, if any besides the plugin's own continue. */
+/** A marker message's own prompt after the marker, if any besides the plugin's own opening prompt. */
 export function promptAfterMarker(text: string): string | undefined {
   const end = text.indexOf(WINDOW_CLOSE)
   const rest = end < 0 ? '' : text.slice(end + WINDOW_CLOSE.length).trim()
-  return rest && rest !== CONTINUE ? rest : undefined
+  return rest && !Object.values(OPENING_PROMPTS).includes(rest) ? rest : undefined
 }
 
 /** The window boundary windowText wrote, read back from a transcript message: on its first or second line. */
