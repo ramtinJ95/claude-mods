@@ -20,10 +20,11 @@ import {
   WRITE_ACTIONS,
 } from './notes.ts'
 import {
-  CONTINUE,
   GUIDANCE,
   newState,
   nextWindow,
+  OPENING_PROMPTS,
+  type Opening,
   reminderFor,
   remindersDone,
   type SessionState,
@@ -214,13 +215,12 @@ let turn: { id: string; notes: 'none' | 'saved' | 'failed'; lastCall?: string; s
 let freshWindowId: string | undefined
 /**
  * At most one rollover at a time: requested by new_context, a checkpoint (/compact or idle compaction), or the
- * /compact opening it. Only new_context's window continues on its own; the others (`waits`) wait for the user,
- * as Claude Code's /compact does.
+ * /compact opening it. Each carries how its window opens: only /compact's waits for the user, as Claude Code's does.
  */
 let pending:
   | { kind: 'requested' }
-  | { kind: 'checkpoint'; windowId: string }
-  | { kind: 'rolling'; waits: boolean; answered: boolean }
+  | { kind: 'checkpoint'; windowId: string; opening: Opening }
+  | { kind: 'rolling'; opening: Opening; answered: boolean }
   | undefined
 /** The context whose idle compaction already asked for a checkpoint; a later one there stays Claude Code's own. */
 let idleCheckpointWindowId: string | undefined
@@ -377,9 +377,9 @@ async function isSessionAgent($: EngineInterface, self: string, agent: string): 
  * The window's opening message, after `kept` (normal compaction's summary, or nothing for a
  * notes-only window); the conversation continues once it stands, unless it waits for the user.
  */
-async function openWindow($: EngineInterface, kept: readonly SessionMessage[], waits: boolean): Promise<SessionCompacted> {
+async function openWindow($: EngineInterface, kept: readonly SessionMessage[], opening: Opening): Promise<SessionCompacted> {
   const marker = await advanceWindow($)
-  if (!waits) $.clock.after(100, () => $.prompt.submit({ text: CONTINUE }))
+  if (opening !== 'wait') $.clock.after(100, () => $.prompt.submit({ text: OPENING_PROMPTS[opening] }))
   return {
     messages: [
       ...kept,
@@ -405,14 +405,14 @@ async function advanceWindow($: EngineInterface): Promise<string> {
  * Rollover runs between turns through /compact: the one route on which our session.compact hook answers.
  * Where Claude Code skips that hook, its own summary runs instead, guided to defer to the notes.
  */
-function roll($: EngineInterface, waits: boolean) {
-  const rolling = { kind: 'rolling' as const, waits, answered: false }
+function roll($: EngineInterface, opening: Opening) {
+  const rolling = { kind: 'rolling' as const, opening, answered: false }
   pending = rolling
   $.clock.after(100, async () => {
     try {
       const guided = !normalCompaction && compaction !== 'hooked'
       await $.command.run({ command: 'compact', ...(guided ? { args: ROLLOVER_SUMMARY } : {}) })
-      if (!rolling.answered) await continueAfterSummary($, waits)
+      if (!rolling.answered) await continueAfterSummary($, opening)
     } catch (error) {
       $.ui.toast(`Context rollover failed: ${message(error)}. The existing context remains.`)
     } finally {
@@ -426,7 +426,7 @@ function roll($: EngineInterface, waits: boolean) {
  * window boundaries from arrives as the prompt that continues. Usage reads no context until the next request,
  * so a context still measured means no compaction ran.
  */
-async function continueAfterSummary($: EngineInterface, waits: boolean) {
+async function continueAfterSummary($: EngineInterface, opening: Opening) {
   if ((await $.session.usage()).context.tokens !== undefined)
     throw new Error('Claude Code did not compact the conversation')
   if (compaction !== 'blocked') {
@@ -434,11 +434,11 @@ async function continueAfterSummary($: EngineInterface, waits: boolean) {
     await setCompaction($, 'blocked')
   }
   const marker = await advanceWindow($)
-  if (waits) {
+  if (opening === 'wait') {
     const { dir, state } = await session($)
     state.unsentMarker = marker
     await saveState($, dir, state)
-  } else $.clock.after(100, () => $.prompt.submit({ text: `${marker}\n${CONTINUE}` }))
+  } else $.clock.after(100, () => $.prompt.submit({ text: `${marker}\n${OPENING_PROMPTS[opening]}` }))
 }
 
 async function setCompaction($: EngineInterface, found: 'hooked' | 'blocked') {
@@ -446,9 +446,9 @@ async function setCompaction($: EngineInterface, found: 'hooked' | 'blocked') {
   await $.store.set('compaction', found)
 }
 
-/** In place of a compaction: a turn that saves notes, after which turn.complete rolls into a window that waits. */
-function checkpoint($: EngineInterface, windowId: string, guidance: string) {
-  pending = { kind: 'checkpoint', windowId }
+/** In place of a compaction: a turn that saves notes, after which turn.complete rolls into a window opened as `opening`. */
+function checkpoint($: EngineInterface, windowId: string, guidance: string, opening: Opening) {
+  pending = { kind: 'checkpoint', windowId, opening }
   $.clock.after(100, () => $.prompt.submit({ text: CHECKPOINT_PROMPT + guidance }))
 }
 
@@ -780,7 +780,7 @@ export const register: Register = (on) => {
     if (was?.kind === 'checkpoint') {
       pending = undefined
       if (e.isAborted || was.windowId !== windowId) $.ui.toast('Checkpoint cancelled. The old context remains.')
-      else if (fresh) roll($, true)
+      else if (fresh) roll($, was.opening)
       else
         $.ui.toast(
           'Rollover did not start. No fresh note was saved in the completed checkpoint. The old context remains.',
@@ -790,7 +790,7 @@ export const register: Register = (on) => {
       if (e.isAborted) $.ui.toast('Rollover cancelled by the interruption. The old context remains.')
       else if (ended?.notes === 'failed')
         $.ui.toast('Rollover did not start: a note failed to save this turn. The old context remains.')
-      else roll($, false)
+      else roll($, 'continue')
     }
     return completed
   })
@@ -800,21 +800,21 @@ export const register: Register = (on) => {
     if (compaction !== 'hooked') await setCompaction($, 'hooked')
     if (e.trigger === 'precompute') return next(e)
     if (pending?.kind === 'rolling') {
-      const { waits } = pending
+      const { opening } = pending
       pending.answered = true
-      if (!normalCompaction) return openWindow($, [], waits)
+      if (!normalCompaction) return openWindow($, [], opening)
       const compacted = await next(e)
-      return compacted.messages ? openWindow($, compacted.messages, waits) : compacted
+      return compacted.messages ? openWindow($, compacted.messages, opening) : compacted
     }
     // With normal compaction on, idle compaction is Claude Code's own, as in Pi. Otherwise it is handled as /compact
     // (the command.run hook): the prompt cache is still warm, so a checkpoint turn costs about what its summary would.
     if (e.trigger === 'auto' && turn === undefined && !normalCompaction) {
       if (pending) return { skip: PENDING }
       const windowId = (await session($)).state.window.currentWindowId
-      if (freshWindowId === windowId) return openWindow($, [], true)
+      if (freshWindowId === windowId) return openWindow($, [], 'resume')
       if (idleCheckpointWindowId !== windowId) {
         idleCheckpointWindowId = windowId
-        checkpoint($, windowId, '')
+        checkpoint($, windowId, '', 'resume')
         return { skip: CHECKPOINT_FIRST }
       }
     }
@@ -870,10 +870,10 @@ export const register: Register = (on) => {
     const windowId = (await session($)).state.window.currentWindowId
     const instructions = e.args.trim()
     if (!instructions && freshWindowId === windowId) {
-      roll($, true)
+      roll($, 'wait')
       return { text: 'Opening a new window from your notes.' }
     }
-    checkpoint($, windowId, instructions ? `\n\nCheckpoint guidance:\n${instructions}` : '')
+    checkpoint($, windowId, instructions ? `\n\nCheckpoint guidance:\n${instructions}` : '', 'wait')
     return { text: CHECKPOINT_FIRST }
   }).catch(() => ({ text: ROLLOVER_FAILED }))
 
