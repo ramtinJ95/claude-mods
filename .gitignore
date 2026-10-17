@@ -2,3 +2,6 @@
 .claude-plugin/types/
 plugins/*/.claude-plugin/types/
 plugins/*/tsconfig.json
+
+# Proof artifacts from the verify-claude-mods skill.
+.verify/
