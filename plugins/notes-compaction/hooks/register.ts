@@ -4,6 +4,7 @@ import type {
   RenderElement,
   SessionCompacted,
   SessionMessage,
+  Timer,
   ToolCallInput,
   ToolCallResult,
 } from 'claude-code'
@@ -180,7 +181,7 @@ const failure = (error: unknown) => ({ deny: message(error) })
 const ROLLOVER_SUMMARY =
   'The agent saved its working state in notes and continues from them in a new context window. Write at most a few lines: the user\'s latest request in their words, and only what happened after the last notes save that the notes lack. Do not restate saved notes.'
 const BLOCKED_NOTICE =
-  "Claude Code keeps plugins out of compaction here, so each new window starts from a short Claude Code summary and your notes. Idle and automatic compaction stay Claude Code's own."
+  "Claude Code keeps plugins out of compaction here, so each new window starts from a short Claude Code summary and your notes. Compaction at the threshold stays Claude Code's own."
 
 const PENDING = 'A notes checkpoint or rollover is already pending.'
 const CHECKPOINT_FIRST = 'Saving a notes checkpoint first. The new window opens after it completes.'
@@ -224,6 +225,18 @@ let pending:
   | undefined
 /** The context whose idle compaction already asked for a checkpoint; a later one there stays Claude Code's own. */
 let idleCheckpointWindowId: string | undefined
+/**
+ * Where our session.compact hook may be skipped, Claude Code's idle compaction goes unseen, so the idle rollover
+ * runs from this timer instead, armed when a main turn completes. Claude Code compacts a conversation of at least
+ * its minimum size at 90% of a one-hour prompt cache (54 minutes); the rollover's first request comes before that
+ * and restarts its clock.
+ */
+let idleTimer: Timer | undefined
+/** Our session.compact hook answered in this process; the stored `compaction` may predate an upgrade into the block. */
+let compactHookRan = false
+const IDLE_ROLLOVER_MS = 50 * 60 * 1000
+const IDLE_MIN_TOKENS = 200_000
+const IDLE_MIN_TOKENS_FLOOR = 100_000
 /**
  * Where Claude Code compacts on its own (an auto-compact window such as 400k), refreshed each turn.
  * Reminders and remaining context measure against it, so checkpoints come before that compaction.
@@ -450,6 +463,33 @@ async function setCompaction($: EngineInterface, found: 'hooked' | 'blocked') {
 function checkpoint($: EngineInterface, windowId: string, guidance: string, opening: Opening) {
   pending = { kind: 'checkpoint', windowId, opening }
   $.clock.after(100, () => $.prompt.submit({ text: CHECKPOINT_PROMPT + guidance }))
+}
+
+function armIdleRollover($: EngineInterface) {
+  idleTimer?.cancel()
+  idleTimer = undefined
+  if (compactHookRan || normalCompaction) return
+  idleTimer = $.clock.after(IDLE_ROLLOVER_MS, () => {
+    idleTimer = undefined
+    idleRollover($).catch((error) => $.ui.toast(`Idle rollover failed: ${message(error)}. The existing context remains.`))
+  })
+}
+
+/** What the session.compact hook does with Claude Code's idle compaction, for a context it would compact. */
+async function idleRollover($: EngineInterface) {
+  const idle = () => !turn && !pending && !compactHookRan && !normalCompaction && compactThreshold !== undefined
+  if (!idle() || (await $.settings.read({})).idleCompaction === false) return
+  const { tokens } = await contextUsed($)
+  const configured = Number((await $.env.get('CLAUDE_CODE_IDLE_COMPACT_MIN_TOKENS')) || NaN)
+  const minTokens = Number.isFinite(configured) ? Math.max(IDLE_MIN_TOKENS_FLOOR, configured) : IDLE_MIN_TOKENS
+  if (tokens === undefined || tokens < minTokens) return
+  const windowId = (await session($)).state.window.currentWindowId
+  // A turn or /compact may have started while this read.
+  if (!idle()) return
+  if (freshWindowId === windowId) return roll($, 'resume')
+  if (idleCheckpointWindowId === windowId) return
+  idleCheckpointWindowId = windowId
+  checkpoint($, windowId, '', 'resume')
 }
 
 async function refreshThreshold($: EngineInterface) {
@@ -757,12 +797,17 @@ export const register: Register = (on) => {
 
   // /clear ends this session in the same process, under a new ID.
   on('session.end', async ($, e, next) => {
-    sessionId = loaded = turn = freshWindowId = pending = idleCheckpointWindowId = measured = undefined
+    idleTimer?.cancel()
+    sessionId = loaded = turn = freshWindowId = pending = idleCheckpointWindowId = measured = idleTimer = undefined
     return next(e)
   })
 
   on('turn.start', async ($, e, next) => {
-    turn = { id: e.turnId, notes: 'none' }
+    // A subagent's turn completes without clearing turn, so only the main turn is tracked.
+    if (e.agentId === undefined) {
+      turn = { id: e.turnId, notes: 'none' }
+      idleTimer?.cancel()
+    }
     // /config and /model can move the threshold between turns; the previous figure stands meanwhile.
     refreshThreshold($).catch(() => undefined)
     return next(e)
@@ -792,11 +837,14 @@ export const register: Register = (on) => {
         $.ui.toast('Rollover did not start: a note failed to save this turn. The old context remains.')
       else roll($, 'continue')
     }
+    armIdleRollover($)
     return completed
   })
 
   on('session.compact', async ($, e, next) => {
     if (e.agentId !== undefined) return next(e)
+    compactHookRan = true
+    idleTimer?.cancel()
     if (compaction !== 'hooked') await setCompaction($, 'hooked')
     if (e.trigger === 'precompute') return next(e)
     if (pending?.kind === 'rolling') {
