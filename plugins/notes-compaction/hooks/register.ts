@@ -163,7 +163,13 @@ function relevant(namespace: Namespace, params: Record<string, unknown>) {
   const spec = ACTIONS[namespace][String(params['action'])]
   if (!spec) throw new Error('Unknown action')
   const missing = (spec.required ?? []).filter((field) => typeof params[field] !== 'string' || !params[field])
-  if (missing.length) throw new Error(`Supply ${missing.join(' and ')}`)
+  if (missing.length)
+    throw new Error(
+      `${namespace} ${String(params['action'])} requires ${missing.join(' and ')}` +
+        (namespace === 'history' && params['action'] === 'read_item'
+          ? '. Copy window_id and item_id from the same search_contents or list_items result'
+          : ''),
+    )
   const scoped = Object.fromEntries(
     Object.entries(params).filter(([key]) => key === 'action' || spec.fields.includes(key)),
   )
