@@ -40,7 +40,8 @@ From 2.1.299, on a machine with managed settings and for Team and Enterprise org
 
 - A new window starts from Claude Code's own summary, told to keep only what the notes lack, followed by the window marker and "Continue." in place of a notes-only window. After `/compact` the window waits instead, and the marker leads your next prompt. The rollover costs one summarization request.
 - `/compact` still asks for a checkpoint first, and instructions after it still become checkpoint guidance.
-- Idle compaction and compaction at the auto-compact threshold are Claude Code's own, with no checkpoint before them. Reminders start over after them.
+- Idle compaction goes unseen, so the mod runs its own idle rollover first: 50 minutes after a turn, on a context Claude Code would compact while idle (200k tokens, or `CLAUDE_CODE_IDLE_COMPACT_MIN_TOKENS`), it checkpoints and opens a new window as above. `"idleCompaction": false` turns it off too.
+- Compaction at the auto-compact threshold is Claude Code's own, as in full mode, but without the window marker ahead of it. Reminders start over after it.
 
 According to Claude Code's setting descriptions, an administrator can restore the full behavior by enabling the mod in managed settings and seating it with `"appendPlugins": ["notes-compaction@claude-mods"]`; this is untested. Claude Code reads only the highest-priority managed source, so on a machine with an MDM profile these keys belong in that profile.
 
