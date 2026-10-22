@@ -92,7 +92,7 @@ export function useNotes(
     if (new TextEncoder().encode(next).length > 1_000_000)
       throw new Error('Note exceeds 1 MB. Split it into separate paths.')
     return {
-      payload: { path: root + path, chars: next.length },
+      payload: { path: root + path },
       write: { path, text: next, createdAt: previous?.createdAt ?? now, updatedAt: now },
     }
   }
