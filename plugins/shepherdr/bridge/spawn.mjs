@@ -24,7 +24,9 @@ function allocateName(agents, label, requested) {
 	const names = new Set(agents.map((agent) => agent.name).filter(Boolean));
 	if (requested) {
 		if (!AGENT_NAME.test(requested))
-			throw new Error("name must match [a-z][a-z0-9_-]{0,31}");
+			throw new Error(
+				"name must be 1–32 characters, start with a lowercase letter, and contain only lowercase letters, digits, underscores or hyphens. Omit name to generate it from label; label can be longer.",
+			);
 		if (names.has(requested))
 			throw new Error(`agent name ${requested} is already live`);
 		return requested;
@@ -169,8 +171,11 @@ export async function spawnDirectory(params, fallbackCwd = homedir()) {
 	return pane.foreground_cwd || pane.cwd || fallbackCwd;
 }
 
-/** A start that stalls at the folder trust prompt says so: trusting a folder is the user's decision. */
-async function startupError(paneId, cwd, program, error) {
+/**
+ * A start that stalls at the folder trust prompt says so: trusting a folder is
+ * the user's decision. The adapter's `startupFailure` explains other screens.
+ */
+async function startupError(paneId, cwd, worker, error) {
 	let screen;
 	try {
 		screen = (
@@ -184,9 +189,11 @@ async function startupError(paneId, cwd, program, error) {
 	} catch {
 		return error;
 	}
+	const failure = worker.startupFailure?.(screen ?? "");
+	if (failure) return new Error(failure);
 	if (!/\btrust\b/i.test(screen ?? "")) return error;
 	return new Error(
-		`${program} stopped at its folder trust prompt for ${cwd}; ask the user to trust that folder in ${program}, or choose a trusted cwd`,
+		`${worker.program} stopped at its folder trust prompt for ${cwd}; ask the user to trust that folder in ${worker.program}, or choose a trusted cwd`,
 	);
 }
 
@@ -215,7 +222,7 @@ export async function startAgent({ params, agent, args: profile, cwd, controller
 	} catch (error) {
 		return rollback(
 			location.cleanup,
-			await startupError(location.paneId, cwd, worker.program, error),
+			await startupError(location.paneId, cwd, worker, error),
 		);
 	}
 }

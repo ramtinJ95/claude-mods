@@ -305,7 +305,7 @@ const CONTROLLER_OPS = {
 				base: params.base,
 				local: !machine,
 			}),
-			profileArgs(profile, !machine),
+			profileArgs(profile),
 		]);
 		const delivery = await onMachine(
 			machine,

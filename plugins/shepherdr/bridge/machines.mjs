@@ -143,6 +143,9 @@ function ssh(machine, command, input, deadline) {
 			clearTimeout(timer);
 			reject(error);
 		});
+		// ssh that exits before reading its input (host down, key refused)
+		// breaks the pipe; its exit code and stderr, reported on close, say why.
+		child.stdin.on("error", () => {});
 		child.on("close", (code) => {
 			clearTimeout(timer);
 			resolve({ code, stdout, stderr });
@@ -210,6 +213,9 @@ export async function remoteCall(machine, op, params, deadline, marginMs) {
 export async function spawnRemoteWatcher(machine, targets) {
 	const { version } = await ensureInstalled(machine, Date.now() + 60_000);
 	const child = sshChild(machine, bridgeCommand(machine, version, "watch.mjs"));
+	// A connection that closes early breaks this pipe; the caller's close
+	// handler reports why, from ssh's exit code and stderr.
+	child.stdin.on("error", () => {});
 	// Kept open: the remote watcher exits when it closes with this connection.
 	child.stdin.write(`${JSON.stringify({ targets })}\n`);
 	return child;

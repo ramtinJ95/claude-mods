@@ -187,10 +187,11 @@ async function workerSettings(name, claudeArgs) {
 }
 
 /**
- * The worker's launch arguments. A remote worker cannot read this machine's
- * prompt file, so a Pi worker there gets the prompt as one line of text.
+ * The worker's launch arguments. A Pi worker's prompt travels as JSON text
+ * for pi-shepherdr's profile flag, which keeps its whitespace through Herdr on
+ * any machine and places it after the shared project context.
  */
-export async function profileArgs(profile, local) {
+export async function profileArgs(profile) {
 	if (profile.agent === "claude")
 		return [
 			"--session-id",
@@ -206,20 +207,15 @@ export async function profileArgs(profile, local) {
 				: []),
 			...(await workerSettings(profile.name, profile.claudeArgs)),
 		];
-	const prompt = !profile.promptPath
-		? undefined
-		: local
-			? profile.promptPath
-			: (await readFile(profile.promptPath, "utf8"))
-					.replace(/\p{Cc}+/gu, " ")
-					.replace(/\s+/gu, " ")
-					.trim();
+	const prompt = profile.promptPath
+		? await readFile(profile.promptPath, "utf8")
+		: undefined;
 	return [
 		"--model",
 		profile.model,
 		"--thinking",
 		profile.thinking,
-		...(prompt ? ["--append-system-prompt", prompt] : []),
+		...(prompt ? ["--shepherdr-profile-prompt", JSON.stringify(prompt)] : []),
 		...profile.piArgs,
 	];
 }

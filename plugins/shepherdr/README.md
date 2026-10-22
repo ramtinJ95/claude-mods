@@ -10,13 +10,13 @@ Ported from [pi-shepherdr](https://github.com/IgorWarzocha/howaboua-pi-stuff/tre
 /plugin install shepherdr --marketplace ramtinJ95/claude-mods
 ```
 
-Requires Claude Code running inside Herdr, Node.js 22.18 or newer on `PATH`, and the Herdr Pi integration (`herdr integration install pi`). Install pi-shepherdr in the Pi workers too:
+Requires Claude Code running inside Herdr, Node.js 22.18 or newer on `PATH`, and the Herdr Pi integration (`herdr integration install pi`). Install pi-shepherdr 0.2.23 or newer wherever Pi workers run:
 
 ```
 pi install npm:@howaboua/pi-shepherdr
 ```
 
-Without it, messages still reach a worker, but through Herdr's terminal prompt, which can mix with text typed into that worker's editor, and the worker cannot list its commands. Results report which path was used as `delivery: "peer"` or `"terminal"`. A spawned Pi worker gets its first task once pi-shepherdr's receiver is up, waiting up to 30 seconds after Pi starts; past that the task goes through the terminal prompt and the result carries a `notice` saying so. pi-shepherdr 0.2.20 needs Pi 1.2 or newer.
+Spawned Pi workers need it: they start with its `--shepherdr-worker` flag, which tells their extensions to keep human-only features off, and take their profile prompt through its `--shepherdr-profile-prompt` flag. Pi refuses flags it does not know, so without it a spawn fails and says why. A Pi agent you started yourself works without it, but messages reach it through Herdr's terminal prompt, which can mix with text typed into its editor, and it cannot list its commands. Results report which path was used as `delivery: "peer"` or `"terminal"`. A spawned Pi worker gets its first task once pi-shepherdr's receiver is up, waiting up to 30 seconds after Pi starts; past that the task goes through the terminal prompt and the result carries a `notice` saying so. pi-shepherdr 0.2.23 needs Pi 1.2 or newer.
 
 ## What the agent gets
 
@@ -49,7 +49,7 @@ Spawned Claude Code workers accept their controller's messages whatever either s
 
 Remote agents are those on the SSH machines saved in Herdr on the host running Claude Code (`herdr machine add`, `herdr machine list`). Pass the machine's ID from `list` as `machine` with every request about its agents; labels and hostnames are not accepted. Omitting `machine` means this machine.
 
-Each machine needs `node` on its noninteractive SSH `PATH`, Herdr with the Pi integration and a running Herdr session. Shepherdr copies its bridge once per version to `~/.local/share/claude-shepherdr/bridge/` there and runs each operation over `ssh -o BatchMode=yes`; OpenSSH owns authentication and nothing keeps running except the monitor while agents there are watched. Profiles and their preparation run on this machine; a remote worker gets its profile prompt as text. A spawn on another machine without `workspace` opens a new workspace there.
+Each machine needs `node` on its noninteractive SSH `PATH`, Herdr with the Pi integration and a running Herdr session. Shepherdr copies its bridge once per version to `~/.local/share/claude-shepherdr/bridge/` there and runs each operation over `ssh -o BatchMode=yes`; OpenSSH owns authentication and nothing keeps running except the monitor while agents there are watched. Profiles and their preparation run on this machine; a remote worker gets its profile prompt as text, formatting intact. A spawn on another machine without `workspace` opens a new workspace there.
 
 ## Orchestration mode
 

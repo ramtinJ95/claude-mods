@@ -20,13 +20,23 @@ import { answerAsk, answersMatch, unblockedAfterAnswer } from "./pi-ask.mjs";
 export const kind = "pi";
 export const program = "Pi";
 
-/** Spawn's launch arguments: Shepherdr follows the worker through its saved session. */
+/**
+ * Spawn's launch arguments: Shepherdr follows the worker through its saved
+ * session, and `--shepherdr-worker` tells the worker's extensions to keep
+ * human-only features off.
+ */
 export function launchArgs(label, args) {
 	if (args.includes("--no-session"))
 		throw new Error(
 			"spawn requires a persistent Pi session; remove --no-session from the profile",
 		);
-	return ["--name", label, ...args];
+	return ["--shepherdr-worker", "--name", label, ...args];
+}
+
+/** Pi refuses flags no extension registered: the worker's pi-shepherdr is missing or too old. */
+export function startupFailure(screen) {
+	if (/Unknown options?:.*--shepherdr-/.test(screen))
+		return "Pi on that machine lacks pi-shepherdr 0.2.23 or newer, which spawned workers need; ask the user to run `pi install npm:@howaboua/pi-shepherdr` there";
 }
 
 export function sessionPath(agent) {

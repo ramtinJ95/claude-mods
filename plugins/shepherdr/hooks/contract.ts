@@ -138,8 +138,8 @@ export function orchestrationGuidance(enabled: boolean, general: boolean): strin
   const ownership = "Own a scope or delegate it; don't do both."
   if (!enabled) return `Work normally. Delegate only when useful or requested. ${ownership}`
   const guidance = general
-    ? 'Your main goal from now on is to orchestrate agents. Fan out suitable work to general agents, synthesize their results, and report the outcome. Work directly only when asked or for routine local tasks.'
-    : 'Your main goal from now on is to orchestrate agents. Fan out suitable work, synthesize agent results, and report the outcome. Work directly only when asked or for routine local tasks.'
+    ? 'Your main goal from now on is to orchestrate general agents with separate scopes. Integrate their results, validate the combined outcome and report it. Work directly only when asked or for routine local tasks.'
+    : 'Your main goal from now on is to orchestrate agents with separate scopes. Integrate their results, validate the combined outcome and report it. Work directly only when asked or for routine local tasks.'
   return `${guidance} ${ownership}`
 }
 
@@ -162,7 +162,7 @@ export function helpText(profiles: { sources: Record<string, string>; profiles: 
     requests: {
       list: '{action:"list", machine?, query?, status?} — this machine and every connected machine unless machine is given',
       commands: '{commands:true, target, machine?} — the slash commands that agent accepts',
-      spawn: '{action:"spawn", agent_type, label (2-3 words), message, cwd?, placement?: new_tab|new_workspace|pane, workspace?, pane?, name?, base?, blocking?}',
+      spawn: '{action:"spawn", agent_type, label (short, 2 words when useful), message, cwd?, placement?: new_tab|new_workspace|pane, workspace?, pane?, name?, base?, blocking?}',
       send: '{action:"send", target, message}',
       assign: '{action:"assign", target, message, blocking?}',
       answer: '{action:"answer", target, ask_id, answers: [{selections?: [choice label], other?, comment?}] one per prompt in order, blocking?}',
@@ -174,6 +174,8 @@ export function helpText(profiles: { sources: Record<string, string>; profiles: 
       'spawn, assign and answer block until the worker settles unless blocking:false; a profile blocking setting overrides spawn',
       'Non-blocking work and watched agents report completion, questions and blockage as agent_report messages; never poll',
       'send delivers input without waiting or watching; use assign only for work whose result you need',
+      'Give each worker a distinct scope, desired outcome, relevant project context and issue references. Describe success rather than lists of forbidden investigations',
+      'Reuse an agent only for the same investigation; keep reviews independent; a new scope gets a new agent',
       'Delegation and watch keep reporting later work until unwatch or the pane closes',
       'A question report carries its ask_id and prompts; answer it with answer, asking the user first when the choice is theirs. A background question does not stop the worker, and answering it does not wait for its task',
       'Messages starting with / run as the worker\'s slash commands without a watch; list them first with commands:true',
