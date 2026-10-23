@@ -9,6 +9,7 @@ notes-compaction and shepherdr are Claude Code ports of Pi extensions by [howabo
 | [notes-compaction](plugins/notes-compaction) | Checkpoint notes and fresh context windows that continue from them |
 | [shepherdr](plugins/shepherdr) | Spawn, delegate to and monitor Pi agents in Herdr, with results pushed back into the session |
 | [review-pane](plugins/review-pane) | Review the working diff in Neovim beside Claude Code, or the last response in a pane: annotate lines, ask questions inline and prepare a follow-up prompt |
+| [nexus](plugins/nexus) | Drive Nexus coding-agent threads from Claude Code: a live pane of threads and conversations, /nexus commands, and tools for the model |
 
 ## Install
 
