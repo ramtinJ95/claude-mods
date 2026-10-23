@@ -1,0 +1,15 @@
+{
+	"name": "nexus",
+	"version": "0.1.0",
+	"description": "Drive Nexus coding-agent threads from Claude Code: a live pane of threads and conversations, /nexus commands, and tools for the model",
+	"author": { "name": "ramtinJ95" },
+	"types": "./types/index.d.ts",
+	"userConfig": {
+		"cli": {
+			"type": "string",
+			"title": "Nexus CLI",
+			"description": "The nexus command to run: a name on PATH or an absolute path.",
+			"default": "nexus"
+		}
+	}
+}
