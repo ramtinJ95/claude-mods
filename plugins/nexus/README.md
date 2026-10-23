@@ -12,15 +12,20 @@ Requires the Mac `nexus` CLI from the Nexus repository (`docs/cli.md` there is t
 
 ## The pane
 
-`/nexus` opens it and asks for the keyboard. If the prompt keeps it, the pane says so: ctrl+x then tab, or a click, hands it the keys. It lists the threads by project, the most recently active first, each with whether its agent is working and how long ago anything happened. Archived threads are counted per project; `v` shows them. Press a thread's number (or Tab to it and Enter) to open it.
+`/nexus` opens it and asks for the keyboard. If the prompt keeps it, the pane says so: ctrl+x then tab, or a click, hands it the keys. Docked beside a fullscreen transcript it takes as much width as Claude Code gives a pane, 45% of the terminal; above the prompt it takes the full width. It draws with your theme's colours, and the engine scrolls it with the arrows while it has focus.
 
-An open thread shows its status, its run (`working`, `idle` or `parked`), its pylon's state, queued messages and any pylon failure, then the tail of its conversation: your messages, the agent's replies and its tool calls, one line each with a mark for running, done or failed. Long runs of tool calls collapse to their last three under a count.
+It does what the Nexus dashboard does, in four views:
 
-Keys in a thread: `m` writes a message (queued behind a running turn), `x` aborts the run after a `y`, `a` archives or unarchives, `r` restarts the watch, `b` goes back to the list, `q` closes the pane. Esc hands the keyboard back to the prompt and leaves the pane open.
+- **Threads**, by project, newest first, with the archived and deleted ones folded under each project (Enter on the fold opens it). Each row says what the thread is doing (`agent working`, the pylon's state), its node, `wants paused` when the pylon is not yet where the control plane wants it, and how long ago you and the agent were last active. A line under the projects shows the nodes. `1` to `9` open a thread, `n` starts one, `f` filters by title (a filter opens the folds it matches), `r` refreshes, `q` closes.
+- **A thread**, drawn as a Claude Code transcript draws its own: your messages after `❯`, the agent's answers after `⏺` in Markdown, each tool call as `⏺ Bash(npm test)` with its result after `⎿`, an edit as a coloured diff, and a failed command with its exit code. Four or more calls in a row fold into one line, such as `Read 4 files, ran 1 command`, which opens itself while a step runs or failed. Enter on a call shows all of it: the whole command, its other arguments and its output. While the run works, `✻ Working… (1m 12s · 6 tools this turn)` ticks above the prompt box, the answer streams in, queued messages show under it and a running command shows its latest output.
+- **Details**, on `i`: the pylon's wanted and observed state, its node, when it was last seen, the previews (each a link while it can be opened; opening a paused one wakes it), the thread's outputs, its sessions, and the command to attach to them, which `c` copies.
+- **Start a thread**, on `n`: a title, the project, the node and branch it boots (the project's own by default) and a first message. `s` on a thread whose pylon failed opens it with that thread's project and title.
 
-When the control plane cannot be reached, the pane says so in red with the CLI's own message (a proxy that is down points to `ts-home status`) and keeps showing the last list it had.
+Keys in a thread: `m` writes a message (Enter sends it, or queues it behind a run that is working; an empty Enter hands the keys back), `x` aborts the run, `t` retries parked tasks, `p` retries a failed pylon, `s` starts again, `a` archives, `u` unarchives, `d` deletes after asking (Keep is the default), `i` shows the details, `r` restarts the watch, `b` goes back, `q` closes. Esc hands the keyboard back to the prompt and leaves the pane open. Opening an open thread counts as a visit, which wakes its paused pylon, as the dashboard's page does.
 
-While the pane is open it runs at most two CLI processes: one `nexus threads` poll every five seconds, skipped while the pane is behind another, and one `nexus watch` for the thread it shows. Both stop when the pane closes. The pane keeps updating while a turn runs, and `/nexus` runs at once rather than waiting for the turn to end.
+When the control plane cannot be reached, the pane says so in red with the CLI's own message (a proxy that is down points to `ts-home status`) and keeps showing what it had.
+
+While the pane is open it runs at most two CLI processes: one poll every five seconds, `nexus threads` for the list or `nexus show` for the thread shown, skipped while the pane is behind another, and one `nexus watch` for that thread. Both stop when the pane closes. It also runs `nexus nodes` when it opens, on a refresh and with the details or the start form, and `nexus projects` with the start form. The pane keeps updating while a turn runs, and `/nexus` runs at once rather than waiting for the turn to end.
 
 ## /nexus
 
@@ -55,7 +60,7 @@ The pane's red line carries the CLI's own error. A proxy that is down points to 
 To see the pane's processes, look for the CLI's script rather than `nexus`. The Nexus repository's `nexus` shim runs `node …/src/cli/nexus.ts`, so a process list shows that:
 
 ```
-pgrep -fl 'nexus.ts (watch|threads)'
+pgrep -fl 'nexus.ts (watch|threads|show)'
 ```
 
-While a thread is open there is one `watch`, and at most one `threads` poll, which comes and goes every five seconds. After the pane closes there are none.
+While a thread is open there is one `watch`, and at most one `show` poll, which comes and goes every five seconds; on the list, a `threads` poll instead. After the pane closes there are none.

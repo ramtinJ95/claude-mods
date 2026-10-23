@@ -1,7 +1,21 @@
 // Everything the mod knows about Nexus that needs no `$`: parsing what the CLI
-// prints, folding a watch stream into rows, the /nexus grammar and the tail's
-// layout. docs/cli.md in the Nexus repository is the contract parsed here.
-import type { NexusFailure, NexusRow, NexusRunState, NexusThread, NexusWatch } from '../types'
+// prints, folding a watch stream into rows, the /nexus grammar and what the
+// pane derives from them. docs/cli.md in the Nexus repository is the contract.
+import type {
+  NexusActual,
+  NexusDesired,
+  NexusDetail,
+  NexusFailure,
+  NexusLive,
+  NexusNode,
+  NexusProject,
+  NexusRow,
+  NexusRunState,
+  NexusSession,
+  NexusThread,
+  NexusThreadRow,
+  NexusWatch,
+} from '../types'
 
 export const FULL_ID = /^th-[0-9a-f]{12}$/
 
@@ -25,6 +39,16 @@ export function parseFailure(exitCode: number, stderr: string): NexusFailure {
 type Raw = Record<string, unknown>
 const isRecord = (value: unknown): value is Raw => typeof value === 'object' && value !== null && !Array.isArray(value)
 const num = (value: unknown) => (typeof value === 'number' ? value : 0)
+const str = (value: unknown) => (typeof value === 'string' ? value : '')
+const strOrNull = (value: unknown) => (typeof value === 'string' ? value : null)
+const list = (value: unknown) => (Array.isArray(value) ? value : [])
+
+const ACTUAL = new Set<string>(['spawning', 'running', 'pausing', 'paused', 'deleting', 'absent', 'failed', 'unknown'])
+const actual = (value: unknown): NexusActual => (typeof value === 'string' && ACTUAL.has(value) ? (value as NexusActual) : 'unknown')
+const desired = (value: unknown): NexusDesired | undefined => (value === 'running' || value === 'paused' || value === 'deleted' ? value : undefined)
+
+/** A field docs/cli.md requires is missing: the CLI and this mod disagree on the contract. */
+const contractError = (command: string, what: string) => new Error(`nexus ${command} printed ${what}, which docs/cli.md requires: the CLI and this mod disagree on the contract`)
 
 function parseThread(raw: unknown): NexusThread | undefined {
   if (!isRecord(raw) || typeof raw.id !== 'string' || typeof raw.title !== 'string' || typeof raw.project !== 'string') return undefined
@@ -34,14 +58,25 @@ function parseThread(raw: unknown): NexusThread | undefined {
     project: raw.project,
     status: raw.status as NexusThread['status'],
     agentTurnRunning: raw.agentTurnRunning === true,
+    createdAt: num(raw.createdAt),
+    lastHumanActivityAt: num(raw.lastHumanActivityAt),
+    lastAgentActivityAt: num(raw.lastAgentActivityAt),
     lastActivityAt: Math.max(num(raw.lastAgentActivityAt), num(raw.lastHumanActivityAt), num(raw.createdAt)),
   }
 }
 
-/** `threads --json` or `start --json`, kept to the fields the mod reads. */
-export function parseThreads(json: unknown): NexusThread[] {
+/** `threads --json`, kept to the fields the mod reads. A row without its pylon or `desired` fails the whole list. */
+export function parseThreads(json: unknown): NexusThreadRow[] {
   if (!Array.isArray(json)) throw new Error('nexus threads did not print a list')
-  return json.flatMap(raw => parseThread(raw) ?? [])
+  return json.flatMap(raw => {
+    const thread = parseThread(raw)
+    if (!thread || !isRecord(raw)) return []
+    const { pylon } = raw
+    if (!isRecord(pylon) || typeof pylon.node !== 'string') throw contractError('threads', `a row (${thread.id}) without its pylon`)
+    const wants = desired(raw.desired)
+    if (!wants) throw contractError('threads', `a row (${thread.id}) without desired`)
+    return [{ ...thread, pylon: { node: pylon.node, actualState: actual(pylon.actualState), failed: strOrNull(pylon.failed) }, desired: wants }]
+  })
 }
 
 export function parseStarted(json: unknown): NexusThread {
@@ -50,15 +85,84 @@ export function parseStarted(json: unknown): NexusThread {
   return thread
 }
 
+const HARNESS = new Set(['claude-code', 'pi', 'shell'])
+const SESSION = new Set(['working', 'idle', 'blocked', 'done', 'unknown'])
+const OUTPUT = new Set(['branch', 'diff', 'preview', 'file'])
+
+/** `show --json`: the ThreadDetail, kept to what the pane draws. */
+export function parseDetail(json: unknown): NexusDetail {
+  const thread = isRecord(json) ? parseThread(json.thread) : undefined
+  if (!isRecord(json) || !thread || !isRecord(json.pylon)) throw new Error('nexus show did not print a thread')
+  const { pylon } = json
+  const wants = desired(json.desired)
+  if (!wants) throw contractError('show', 'no desired')
+  if (typeof json.attach !== 'string') throw contractError('show', 'no attach')
+  return {
+    thread,
+    pylon: {
+      id: str(pylon.id),
+      node: str(pylon.node),
+      actualState: actual(pylon.actualState),
+      failed: strOrNull(pylon.failed),
+      observedAt: strOrNull(pylon.observedAt),
+      retryRefused: strOrNull(pylon.retryRefused),
+    },
+    sessions: list(json.sessions).flatMap((raw): NexusSession[] =>
+      isRecord(raw) && typeof raw.herdrPane === 'string'
+        ? [
+            {
+              herdrPane: raw.herdrPane,
+              harness: HARNESS.has(str(raw.harness)) ? (raw.harness as NexusSession['harness']) : 'shell',
+              harnessSessionId: strOrNull(raw.harnessSessionId),
+              status: SESSION.has(str(raw.status)) ? (raw.status as NexusSession['status']) : 'unknown',
+            },
+          ]
+        : [],
+    ),
+    previews: list(json.previews).flatMap(raw =>
+      isRecord(raw) && typeof raw.service === 'string' ? [{ service: raw.service, httpsPort: num(raw.httpsPort), ready: raw.ready === true }] : [],
+    ),
+    outputs: list(json.outputs).flatMap(raw =>
+      isRecord(raw) && OUTPUT.has(str(raw.kind)) ? [{ kind: raw.kind as NexusDetail['outputs'][number]['kind'], ref: str(raw.ref) }] : [],
+    ),
+    agent: isRecord(json.agent) ? { parkedTasks: num(json.agent.parkedTasks) } : null,
+    hasConversation: isRecord(json.thread) && typeof json.thread.conversationId === 'string',
+    desired: wants,
+    attach: json.attach,
+  }
+}
+
+export function parseProjects(json: unknown): NexusProject[] {
+  if (!Array.isArray(json)) throw new Error('nexus projects did not print a list')
+  return json.flatMap(raw =>
+    isRecord(raw) && typeof raw.id === 'string'
+      ? [{ id: raw.id, repoUrl: str(raw.repoUrl), defaultBranch: str(raw.defaultBranch), defaultNode: str(raw.defaultNode) }]
+      : [],
+  )
+}
+
+export function parseNodes(json: unknown): NexusNode[] {
+  if (!Array.isArray(json)) throw new Error('nexus nodes did not print a list')
+  return json.flatMap(raw =>
+    isRecord(raw) && typeof raw.name === 'string'
+      ? [{ name: raw.name, tailnetHost: str(raw.tailnetHost), state: raw.state === 'offline' ? ('offline' as const) : ('online' as const) }]
+      : [],
+  )
+}
+
 // The pi-ai message shapes an entry's `model` holds, as far as rows read them.
 type Part = { type?: string; text?: string; id?: string; name?: string; arguments?: unknown }
 type Message = {
   role?: string
   content?: string | Part[]
   toolCallId?: string
+  toolName?: string
   isError?: boolean
   stopReason?: string
   errorMessage?: string
+  timestamp?: number
+  model?: string
+  details?: unknown
 }
 
 /** An entry as the watch prints it: its model messages, and the CLI's plain rendering of them. */
@@ -68,12 +172,16 @@ export type WatchEvent =
   | { type: 'reset'; entries: WatchEntry[] }
   | { type: 'entry'; entry: WatchEntry }
   | { type: 'state'; state: NexusRunState }
+  | { type: 'live'; live: NexusLive }
   | { type: 'error'; kind: 'unreachable' | 'failed'; message: string }
 
 function parseEntry(entry: unknown, text: unknown): WatchEntry {
   const model = isRecord(entry) && Array.isArray(entry.model) ? (entry.model as Message[]) : null
   return { model, text: typeof text === 'string' ? text : '' }
 }
+
+/** Live output kept per running call: its tail, enough for the few lines a row shows. */
+const LIVE_CHARS = 2_000
 
 /** One line of `watch --json`; undefined for a line or an event type this version does not know. */
 export function parseWatchEvent(line: string): WatchEvent | undefined {
@@ -104,6 +212,18 @@ export function parseWatchEvent(line: string): WatchEvent | undefined {
           failed: typeof raw.failed === 'string' ? raw.failed : null,
         },
       }
+    case 'live':
+      return {
+        type: 'live',
+        live: {
+          queued: list(raw.queued).filter((text): text is string => typeof text === 'string'),
+          tools: list(raw.tools).flatMap(tool =>
+            isRecord(tool) && typeof tool.callId === 'string' ? [{ callId: tool.callId, output: keepTail(str(tool.output), LIVE_CHARS) }] : [],
+          ),
+          partial: strOrNull(raw.partial),
+          retry: strOrNull(raw.retry),
+        },
+      }
     case 'error':
       return {
         type: 'error',
@@ -122,10 +242,31 @@ const SUMMARY_KEYS = ['command', 'path', 'file_path', 'pattern', 'query', 'url',
 
 /** A tool call in one line: the argument that says what it does, else the arguments as JSON. */
 export function toolSummary(args: unknown): string {
-  if (!isRecord(args)) return ''
+  if (!isRecord(args) || Object.keys(args).length === 0) return ''
   const key = SUMMARY_KEYS.find(name => typeof args[name] === 'string')
   const text = key ? (args[key] as string) : (Object.values(args).find(value => typeof value === 'string') as string | undefined) ?? JSON.stringify(args)
   return text.replace(/\s+/g, ' ').trim()
+}
+
+/** What a row keeps of a call's arguments and result: `$.state` holds every row as JSON for each redraw. */
+const ARG_CHARS = 4_000
+const OUTPUT_CHARS = 3_000
+const PATCH_CHARS = 20_000
+
+/** `value` with every string longer than the bound cut, for a row's arguments. */
+function bounded(value: unknown, depth = 0): unknown {
+  if (typeof value === 'string') return value.length > ARG_CHARS ? `${value.slice(0, ARG_CHARS)}…` : value
+  if (depth > 4) return null
+  if (Array.isArray(value)) return value.slice(0, 50).map(item => bounded(item, depth + 1))
+  if (isRecord(value)) return Object.fromEntries(Object.entries(value).map(([key, item]) => [key, bounded(item, depth + 1)]))
+  return value
+}
+
+const lineCount = (text: string) => (text.trim() === '' ? 0 : text.trimEnd().split('\n').length)
+
+function patchOf(details: unknown): string | null {
+  const patch = isRecord(details) ? details.patch : undefined
+  return typeof patch === 'string' && patch.length <= PATCH_CHARS ? patch : null
 }
 
 /** The rows after one more entry: its messages in order, a tool result settling its call's row. */
@@ -139,27 +280,41 @@ export function appendEntry(rows: readonly NexusRow[], entry: WatchEntry): Nexus
     switch (message.role) {
       case 'user': {
         const text = contentText(message.content).trim()
-        if (text) next.push({ kind: 'user', text })
+        if (text) next.push({ kind: 'user', text, at: typeof message.timestamp === 'number' ? message.timestamp : null })
         break
       }
       case 'assistant': {
         for (const part of Array.isArray(message.content) ? message.content : []) {
           if (part.type === 'text' && part.text?.trim()) next.push({ kind: 'assistant', text: part.text.trim() })
-          if (part.type === 'toolCall') next.push({ kind: 'tool', id: part.id ?? '', name: part.name ?? 'tool', summary: toolSummary(part.arguments), outcome: 'running' })
+          if (part.type === 'toolCall') next.push(toolRow(part.id ?? '', part.name ?? 'tool', part.arguments))
         }
         if (message.stopReason === 'error') next.push({ kind: 'notice', tone: 'error', text: `The model failed: ${message.errorMessage ?? 'no reason given'}` })
         if (message.stopReason === 'aborted') next.push({ kind: 'notice', tone: 'dim', text: 'Aborted.' })
         break
       }
       case 'toolResult': {
+        const output = contentText(message.content)
+        const settled = { outcome: message.isError ? ('error' as const) : ('ok' as const), output: keepTail(output, OUTPUT_CHARS), lines: lineCount(output), patch: patchOf(message.details) }
         const at = next.findLastIndex(row => row.kind === 'tool' && row.id === message.toolCallId)
         const row = next[at]
-        if (row?.kind === 'tool') next[at] = { ...row, outcome: message.isError ? 'error' : 'ok' }
+        // A result whose call is not in the context still shows, as the dashboard shows it.
+        if (row?.kind === 'tool') next[at] = { ...row, ...settled }
+        else next.push({ ...toolRow(message.toolCallId ?? '', message.toolName ?? 'tool', {}), ...settled })
         break
       }
     }
   }
   return next
+}
+
+function toolRow(id: string, name: string, args: unknown): Extract<NexusRow, { kind: 'tool' }> {
+  return { kind: 'tool', id, name, summary: toolSummary(args), outcome: 'running', args: isRecord(args) ? (bounded(args) as Raw) : {}, output: '', lines: 0, patch: null }
+}
+
+/** The model of the newest answer in `entry`, else `model`. */
+function modelIn(model: string | null, entry: WatchEntry): string | null {
+  const answers = (entry.model ?? []).filter(message => message.role === 'assistant' && typeof message.model === 'string')
+  return answers.at(-1)?.model ?? model
 }
 
 /** Rows kept per thread: the pane shows a tail, and `$.state` holds JSON for every redraw. */
@@ -168,11 +323,13 @@ const KEPT_ROWS = 400
 export function applyEvent(watch: NexusWatch, event: WatchEvent): NexusWatch {
   switch (event.type) {
     case 'reset':
-      return { ...watch, rows: event.entries.reduce(appendEntry, [] as NexusRow[]).slice(-KEPT_ROWS) }
+      return { ...watch, rows: event.entries.reduce(appendEntry, [] as NexusRow[]).slice(-KEPT_ROWS), model: event.entries.reduce(modelIn, null) }
     case 'entry':
-      return { ...watch, rows: appendEntry(watch.rows, event.entry).slice(-KEPT_ROWS) }
+      return { ...watch, rows: appendEntry(watch.rows, event.entry).slice(-KEPT_ROWS), model: modelIn(watch.model, event.entry) }
     case 'state':
       return { ...watch, state: event.state, outage: null }
+    case 'live':
+      return { ...watch, live: event.live }
     case 'error':
       return { ...watch, outage: `${event.kind === 'failed' ? 'The control plane is failing' : 'Nexus is unreachable'}: ${sentence(event.message)}` }
   }
@@ -242,21 +399,239 @@ export function matchThread(arg: string, threads: readonly NexusThread[]): Match
   return { unknown: true }
 }
 
-export type ProjectGroup = { project: string; threads: NexusThread[]; archived: number }
-
-/** Threads by project, A to Z, each group's most recent first; archived ones counted unless shown. */
-export function groupThreads(threads: readonly NexusThread[], showArchived: boolean): ProjectGroup[] {
-  const groups = new Map<string, ProjectGroup>()
-  for (const thread of threads) {
-    if (thread.status === 'deleted') continue
-    const group = groups.get(thread.project) ?? { project: thread.project, threads: [], archived: 0 }
-    groups.set(thread.project, group)
-    if (thread.status === 'archived' && !showArchived) group.archived += 1
-    else group.threads.push(thread)
-  }
-  for (const group of groups.values()) group.threads.sort((a, b) => b.lastActivityAt - a.lastActivityAt)
-  return [...groups.values()].sort((a, b) => a.project.localeCompare(b.project))
+export type ProjectGroup = {
+  project: string
+  /** Active and idle threads, newest first. */
+  open: NexusThreadRow[]
+  /** Archived and deleted ones, folded under the open ones. */
+  closed: NexusThreadRow[]
+  /** Whether the fold shows its threads: as the person left it, else when a filter matches one of them. */
+  isUnfolded: boolean
 }
+
+const isClosed = (thread: NexusThread) => thread.status === 'archived' || thread.status === 'deleted'
+
+/**
+ * Threads by project, A to Z, each group newest first with its closed threads folded below, as the dashboard
+ * lists them. A filter keeps the threads whose title holds it, opens a fold it matches and drops empty groups.
+ */
+export function groupThreads(threads: readonly NexusThreadRow[], filter: string, toggled: Readonly<Record<string, boolean>>): ProjectGroup[] {
+  const query = filter.trim().toLowerCase()
+  const groups = new Map<string, NexusThreadRow[]>()
+  for (const thread of threads) {
+    if (query && !thread.title.toLowerCase().includes(query)) continue
+    groups.set(thread.project, [...(groups.get(thread.project) ?? []), thread])
+  }
+  return [...groups.entries()]
+    .sort(([a], [b]) => a.localeCompare(b))
+    .map(([project, members]) => {
+      const sorted = members.toSorted((a, b) => b.createdAt - a.createdAt)
+      const closed = sorted.filter(isClosed)
+      return { project, open: sorted.filter(thread => !isClosed(thread)), closed, isUnfolded: toggled[closedKey(project)] ?? (query !== '' && closed.length > 0) }
+    })
+}
+
+export const closedKey = (project: string) => `closed-${project}`
+
+/** "3 archived, 1 deleted". */
+export function closedLabel(threads: readonly NexusThread[]): string {
+  const deleted = threads.filter(thread => thread.status === 'deleted').length
+  const archived = threads.length - deleted
+  return [archived > 0 && `${archived} archived`, deleted > 0 && `${deleted} deleted`].filter(Boolean).join(', ')
+}
+
+/** The colour of a state: `work` is an agent mid-turn, `busy` a pylon changing phase. The dashboard's tones. */
+export type Tone = 'ok' | 'work' | 'busy' | 'idle' | 'bad' | 'muted'
+export const TONE_COLOR: Record<Tone, string> = { ok: 'success', work: 'claude', busy: 'warning', idle: 'inactive', bad: 'error', muted: 'subtle' }
+
+export const ACTUAL_BADGE: Record<NexusActual, [label: string, tone: Tone]> = {
+  running: ['running', 'ok'],
+  spawning: ['spawning', 'busy'],
+  pausing: ['pausing', 'busy'],
+  deleting: ['deleting', 'busy'],
+  paused: ['paused', 'idle'],
+  absent: ['not on its node', 'muted'],
+  failed: ['failed', 'bad'],
+  unknown: ['unknown', 'muted'],
+}
+export const DESIRED_TONE: Record<NexusDesired, Tone> = { running: 'ok', paused: 'idle', deleted: 'muted' }
+
+/** What a thread is doing, most urgent first: the agent mid-turn hides a running pylon, never a failed one. */
+export function threadState(thread: Pick<NexusThread, 'status' | 'agentTurnRunning'>, pylon: NexusActual): [label: string, tone: Tone] {
+  if (thread.status === 'archived' || thread.status === 'deleted') return [thread.status, 'muted']
+  if (thread.agentTurnRunning && pylon !== 'failed') return ['agent working', 'work']
+  return ACTUAL_BADGE[pylon]
+}
+
+/** "5 min", or null under 45 seconds: the dashboard's spans. */
+export function span(ms: number): string | null {
+  const seconds = Math.max(0, Math.round(ms / 1000))
+  return seconds < 45
+    ? null
+    : seconds < 45 * 60
+      ? `${Math.round(seconds / 60)} min`
+      : seconds < 36 * 3600
+        ? `${Math.round(seconds / 3600)} h`
+        : `${Math.round(seconds / 86_400)} d`
+}
+
+/** "5 min ago", "just now", or "never" for a time of 0. */
+export function since(at: number, now: number): string {
+  if (at === 0) return 'never'
+  const label = span(now - at)
+  return label === null ? 'just now' : `${label} ago`
+}
+
+/** A run's length as a clock reads it, such as 1m 12s. */
+export function clock(ms: number): string {
+  const s = Math.max(0, Math.floor(ms / 1000))
+  return s < 60 ? `${s}s` : s < 3600 ? `${Math.floor(s / 60)}m ${s % 60}s` : `${Math.floor(s / 3600)}h ${Math.floor((s % 3600) / 60)}m`
+}
+
+export const previewUrl = (node: Pick<NexusNode, 'tailnetHost'>, httpsPort: number) => `https://${node.tailnetHost}:${httpsPort}/`
+
+/**
+ * A paused pylon's preview keeps its link, because a visit wakes the pylon. An archived thread's stays paused
+ * whatever the visit, so its link would only show the waking page.
+ */
+export function previewLook(detail: Pick<NexusDetail, 'thread' | 'pylon'>, preview: NexusDetail['previews'][number]) {
+  if (detail.thread.status === 'archived') return { linked: false, label: 'paused', tone: 'idle' as Tone, hint: 'Unarchive the thread to open it.' }
+  if (detail.pylon.actualState === 'paused') return { linked: true, label: 'paused', tone: 'idle' as Tone, hint: 'Opening it wakes the pylon.' }
+  return preview.ready ? { linked: true, label: 'ready', tone: 'ok' as Tone, hint: null } : { linked: false, label: 'starting', tone: 'busy' as Tone, hint: null }
+}
+
+/** Who opened the thread's pane, what it runs and where: the dashboard's session labels. */
+export const HARNESS_LABEL: Record<NexusSession['harness'], string> = { 'claude-code': 'Claude Code', pi: 'pi', shell: 'Shell' }
+export const SESSION_TONE: Record<NexusSession['status'], Tone> = { working: 'work', idle: 'idle', blocked: 'bad', done: 'ok', unknown: 'muted' }
+
+export type ToolRow = Extract<NexusRow, { kind: 'tool' }>
+
+/** A tool call as drawn: still running in a busy run, without a result once the run stopped, or settled. */
+export type ToolStatus = 'running' | 'none' | 'ok' | 'error'
+
+export const toolStatus = (tool: ToolRow, isWorking: boolean): ToolStatus =>
+  tool.outcome !== 'running' ? tool.outcome : isWorking ? 'running' : 'none'
+
+/** One block of the conversation as drawn. A run of tool calls this long folds into one line. */
+export const FOLD_AT = 4
+
+export type Block =
+  | { kind: 'user'; text: string; queued: boolean }
+  | { kind: 'assistant'; text: string; streaming: boolean }
+  | { kind: 'notice'; tone: 'error' | 'dim' | 'warning'; text: string }
+  | { kind: 'tools'; tools: ToolRow[] }
+
+/** The rows, then what the run shows of itself: the answer streaming, a retry waiting, and the queued messages. */
+export function blocks(rows: readonly NexusRow[], live: NexusLive | null): Block[] {
+  const out: Block[] = []
+  for (const row of rows) {
+    const last = out.at(-1)
+    if (row.kind === 'tool') {
+      if (last?.kind === 'tools') last.tools.push(row)
+      else out.push({ kind: 'tools', tools: [row] })
+    } else if (row.kind === 'user') out.push({ kind: 'user', text: row.text, queued: false })
+    else if (row.kind === 'assistant') out.push({ kind: 'assistant', text: row.text, streaming: false })
+    else out.push({ kind: 'notice', tone: row.tone, text: row.text })
+  }
+  if (live?.partial?.trim()) out.push({ kind: 'assistant', text: live.partial.trim(), streaming: true })
+  if (live?.retry) out.push({ kind: 'notice', tone: 'warning', text: `The model request failed and will be retried: ${live.retry}` })
+  for (const text of live?.queued ?? []) out.push({ kind: 'user', text, queued: true })
+  return out
+}
+
+/** The name a call is drawn under, as Claude Code names its own: Bash, Read, Update. */
+const TOOL_NAMES: Record<string, string> = { bash: 'Bash', read: 'Read', edit: 'Update', write: 'Write', grep: 'Search', find: 'Find', ls: 'List' }
+export const toolName = (name: string) => TOOL_NAMES[name] ?? (name ? `${name[0]!.toUpperCase()}${name.slice(1)}` : 'Tool')
+
+/** The argument that says what a call did, shown in its row: the dashboard's subject keys. */
+const SUBJECT_KEYS = ['command', 'pattern', 'path', 'url']
+export function subjectOf(tool: ToolRow): { key: string; value: string } | undefined {
+  const key = SUBJECT_KEYS.find(name => typeof tool.args[name] === 'string')
+  return key === undefined ? undefined : { key, value: String(tool.args[key]) }
+}
+
+const plural = (count: number, one: string, many: string) => `${count} ${count === 1 ? one : many}`
+
+/** A fold's line, in Claude Code's words: "Read 3 files, ran 2 commands". */
+export function foldSummary(tools: readonly ToolRow[]): string {
+  const counts = new Map<string, number>()
+  for (const tool of tools) counts.set(tool.name, (counts.get(tool.name) ?? 0) + 1)
+  const phrase = ([name, count]: [string, number]) =>
+    name === 'read'
+      ? `read ${plural(count, 'file', 'files')}`
+      : name === 'bash'
+        ? `ran ${plural(count, 'command', 'commands')}`
+        : name === 'edit'
+          ? `edited ${plural(count, 'file', 'files')}`
+          : name === 'write'
+            ? `wrote ${plural(count, 'file', 'files')}`
+            : name === 'grep' || name === 'find'
+              ? `searched ${plural(count, 'pattern', 'patterns')}`
+              : name === 'ls'
+                ? `listed ${plural(count, 'directory', 'directories')}`
+                : `called ${name} ${plural(count, 'time', 'times')}`
+  const text = [...counts.entries()].map(phrase).join(', ')
+  return `${text[0]!.toUpperCase()}${text.slice(1)}`
+}
+
+/** pi's bash tool ends a failed command's output with its exit code. */
+export const exitCode = (output: string) => /exited with code (\d+)/.exec(output)?.[1]
+
+/** `omitted` counts the replacements of an edit's call left out of `source`, which holds what fits in `PATCH_CHARS`. */
+export type Diff = { source: string; added: number; removed: number; isNumbered: boolean; omitted: number }
+
+const diffLines = (sign: '+' | '-', text: string) => text.split('\n').map(line => `${sign}${line}`)
+
+/**
+ * What an edit or a write changed, as unified hunks Code draws: the patch the edit's result carries, numbered as the
+ * file is, else hunks from the call's arguments, which say nothing of where in the file they are.
+ */
+export function diffOf(tool: ToolRow): Diff | null {
+  // From the first hunk on, a line starting + or - is a change: a removed "-- x" reads "--- x" and still counts.
+  const count = (source: string) => {
+    const lines = source.split('\n')
+    return { added: lines.filter(line => line.startsWith('+')).length, removed: lines.filter(line => line.startsWith('-')).length }
+  }
+  const at = tool.patch?.indexOf('@@') ?? -1
+  if (tool.patch && at >= 0) {
+    // Only the newline that ends the patch goes: a blank context line is a single space the hunk's counts include.
+    const source = tool.patch.slice(at).replace(/\n$/, '')
+    return { source, ...count(source), isNumbered: true, omitted: 0 }
+  }
+  const { edits, content } = tool.args
+  const isEdit = (edit: unknown): edit is { oldText: string; newText: string } =>
+    isRecord(edit) && typeof edit.oldText === 'string' && typeof edit.newText === 'string'
+  if (tool.name === 'edit' && Array.isArray(edits) && edits.length > 0 && edits.every(isEdit)) {
+    // A row bounds each replacement, not their number: the hunks are kept whole while they fit, the first always.
+    const hunks: string[] = []
+    let size = 0
+    for (const edit of edits) {
+      const hunk = [`@@ -1,${edit.oldText.split('\n').length} +1,${edit.newText.split('\n').length} @@`, ...diffLines('-', edit.oldText), ...diffLines('+', edit.newText)].join('\n')
+      if (hunks.length > 0 && size + hunk.length > PATCH_CHARS) break
+      hunks.push(hunk)
+      size += hunk.length + 1
+    }
+    const source = hunks.join('\n')
+    return { source, ...count(source), isNumbered: false, omitted: edits.length - hunks.length }
+  }
+  if (tool.name === 'write' && typeof content === 'string') {
+    const text = content.replace(/\n$/, '')
+    const source = [`@@ -0,0 +1,${text.split('\n').length} @@`, ...diffLines('+', text)].join('\n')
+    return { source, ...count(source), isNumbered: true, omitted: 0 }
+  }
+  return null
+}
+
+/** What the agent's run is doing: since when it works and how many tools this turn ran. */
+export function runOf(rows: readonly NexusRow[]): { since: number | null; tools: number } {
+  const asked = rows.findLastIndex(row => row.kind === 'user')
+  const prompt = rows[asked]
+  return { since: prompt?.kind === 'user' ? prompt.at : null, tools: rows.slice(asked + 1).filter(row => row.kind === 'tool').length }
+}
+
+/** Claude Code's spinner glyphs, one per tick. */
+const SPINNER = ['·', '✢', '✳', '✶', '✻', '✽', '✻', '✶', '✳', '✢']
+export const spinner = (now: number) => SPINNER[Math.floor(now / 1000) % SPINNER.length]!
 
 export function ago(ms: number): string {
   const s = Math.max(0, Math.floor(ms / 1000))
@@ -339,9 +714,6 @@ export function parseCommand(args: string): NexusCommand {
   }
 }
 
-export type Span = { text: string; color?: string; dim?: boolean; bold?: boolean }
-export type Line = Span[]
-
 /** East Asian wide characters and emoji, which take two terminal cells. */
 const WIDE = [
   [0x1100, 0x115f],
@@ -379,100 +751,7 @@ function head(text: string, width: number): string {
   return text.slice(0, end)
 }
 
-/** `text` broken into lines of at most `width` cells at spaces, a longer word broken where it must. */
-export function wrap(text: string, width: number): string[] {
-  const lines: string[] = []
-  for (const paragraph of text.split('\n')) {
-    let line = ''
-    for (const word of paragraph.split(/\s+/).filter(Boolean)) {
-      let rest = word
-      while (cells(rest) > width) {
-        if (line) lines.push(line)
-        line = ''
-        const piece = head(rest, width) || [...rest][0]!
-        lines.push(piece)
-        rest = rest.slice(piece.length)
-      }
-      if (!rest) continue
-      if (line && cells(line) + 1 + cells(rest) > width) {
-        lines.push(line)
-        line = rest
-      } else line = line ? `${line} ${rest}` : rest
-    }
-    lines.push(line)
-  }
-  return lines
-}
-
 /** `text` ending in a full stop; the CLI's messages end without one. */
 export const sentence = (text: string) => (/[.!?]$/.test(text.trim()) ? text.trim() : `${text.trim()}.`)
 
 export const clip = (text: string, width: number) => (cells(text) <= width ? text : `${head(text, Math.max(0, width - 1))}…`)
-
-const OUTCOME = {
-  running: { glyph: '◌', color: 'claude' },
-  ok: { glyph: '✓', color: 'success' },
-  error: { glyph: '✗', color: 'error' },
-} as const
-
-/** A run of tool rows longer than this shows its last ones under a count of the rest. */
-const TOOLS_SHOWN = 3
-
-type Block = { kind: NexusRow['kind'] | 'tools'; lines: Line[] }
-
-function rowLines(row: Exclude<NexusRow, { kind: 'tool' }>, width: number): Line[] {
-  switch (row.kind) {
-    case 'user':
-      return wrap(row.text, width - 2).map((text, index) => [{ text: index === 0 ? '› ' : '  ', color: 'claude', bold: true }, { text, bold: true }])
-    case 'assistant':
-      return wrap(row.text, width).map(text => [{ text }])
-    case 'notice':
-      return wrap(row.text, width).map(text => [row.tone === 'error' ? { text, color: 'error' } : { text, dim: true }])
-  }
-}
-
-function toolLine(row: Extract<NexusRow, { kind: 'tool' }>, width: number): Line {
-  const { glyph, color } = OUTCOME[row.outcome]
-  const name = clip(row.name, Math.max(4, width - 4))
-  return [{ text: `${glyph} `, color }, { text: name, bold: true }, { text: clip(` ${row.summary}`, Math.max(0, width - 2 - cells(name))), dim: true }]
-}
-
-function toolBlock(run: Extract<NexusRow, { kind: 'tool' }>[], width: number): Line[] {
-  const hidden = run.slice(0, Math.max(0, run.length - TOOLS_SHOWN))
-  const failed = hidden.filter(row => row.outcome === 'error').length
-  const head: Line[] = hidden.length
-    ? [[{ text: clip(`  ${hidden.length} earlier tool call${hidden.length === 1 ? '' : 's'}${failed ? `, ${failed} failed` : ''}`, width), dim: true }]]
-    : []
-  return [...head, ...run.slice(hidden.length).map(row => toolLine(row, width))]
-}
-
-/**
- * The last `room` display lines of a conversation `width` cells wide: each message wrapped, each run of tool calls
- * collapsed to its last few, a blank line between messages. Built from the end, so a long thread costs its tail.
- */
-export function tailLines(rows: readonly NexusRow[], width: number, room: number): Line[] {
-  const blocks: Block[] = []
-  let used = 0
-  let at = rows.length - 1
-  while (at >= 0 && used < room) {
-    const row = rows[at]!
-    if (row.kind === 'tool') {
-      let start = at
-      while (start > 0 && rows[start - 1]!.kind === 'tool') start -= 1
-      const block = { kind: 'tools' as const, lines: toolBlock(rows.slice(start, at + 1) as Extract<NexusRow, { kind: 'tool' }>[], width) }
-      blocks.unshift(block)
-      used += block.lines.length + 1
-      at = start - 1
-    } else {
-      const block = { kind: row.kind, lines: rowLines(row, width) }
-      blocks.unshift(block)
-      used += block.lines.length + 1
-      at -= 1
-    }
-  }
-  const isWork = (block: Block | undefined) => block?.kind === 'tools' || block?.kind === 'notice'
-  const lines = blocks.flatMap((block, index) =>
-    index === 0 || (isWork(block) && isWork(blocks[index - 1])) ? block.lines : [[], ...block.lines],
-  )
-  return lines.slice(-room)
-}
