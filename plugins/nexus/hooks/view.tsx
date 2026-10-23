@@ -947,6 +947,7 @@ export function StartView(draw: Draw, scene: Scene, actions: PaneActions) {
           />
           <Text color="subtle">{`Boots a pylon on ${node} and checks out ${branch}.`}</Text>
           {draft.error && <Text color="error">{draft.error}</Text>}
+          {Notice(draw, scene.pane)}
           <Box flexDirection="row" columnGap={2} marginTop={1}>
             <Button key="start-submit" variant="primary" label={draft.isStarting ? 'Starting…' : 'Start thread'} onPress={() => actions.startSubmit()} />
             <Button key="start-cancel" label="Cancel" onPress={actions.back} />

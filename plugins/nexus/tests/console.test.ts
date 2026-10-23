@@ -1,5 +1,6 @@
 import { expect, test } from 'claude-code/testing'
 
+import { cutTree } from '../hooks/view'
 import { DETAIL, ENTRIES, ID, PATCH, THEME_KEYS, THREAD, THREADS, boot, fake, live, state } from './fake-cli'
 
 type Ui = Awaited<ReturnType<Awaited<ReturnType<typeof boot>>['mount']>>
@@ -17,9 +18,19 @@ function carried(node: unknown): number {
   return ['source', 'text', 'label'].reduce((sum, prop) => sum + (typeof props?.[prop] === 'string' ? (props[prop] as string).length : 0), 0) + carried(children)
 }
 
+/** Where a tree holds a null or undefined child, each a path of indexes from its root. */
+function holes(node: unknown, at = ''): string[] {
+  if (node === null || node === undefined) return [at || 'root']
+  if (Array.isArray(node)) return node.flatMap((child, index) => holes(child, `${at}/${index}`))
+  if (typeof node !== 'object' || !('children' in node)) return []
+  return holes((node as { children: unknown }).children, at)
+}
+
 /** The drawing stays under the engine's limit and still ends with the view's keys, which a cut would take first. */
 async function expectWhole(ui: Ui, keys: string[]) {
-  const size = carried(await ui.drawn())
+  const tree = await ui.drawn()
+  expect(holes(tree)).toEqual([])
+  const size = carried(tree)
   expect(size).toBeGreaterThan(50_000)
   expect(size).toBeLessThan(100_000)
   expect(await hotkeys(ui)).toEqual(expect.arrayContaining(keys))
@@ -318,6 +329,27 @@ test('a fold of many distinct long tools keeps its line to one row and draws its
   expect(await hotkeys(ui)).toEqual(expect.arrayContaining(['b', 'x', 'q']))
 })
 
+test('a cut tree leaves out what does not fit without leaving a null in its place', () => {
+  const button = (label: string) => ({ type: 'Button', props: { label }, children: undefined })
+  const diff = { type: 'Code', props: { format: 'diff', source: `@@ -1 +1 @@\n-${'a'.repeat(40)}\n+${'b'.repeat(40)}` }, children: undefined }
+  const tree = {
+    type: 'Box',
+    props: {},
+    children: [
+      { type: 'Text', props: {}, children: ['kept'] },
+      button('a label drawn whole or not at all'),
+      { type: 'Box', props: {}, children: [button('another label too long to fit'), diff] },
+      { type: 'Text', props: {}, children: ['past the room'] },
+    ],
+  }
+  const cut = cutTree(tree, 12)
+  expect(holes(cut.node)).toEqual([])
+  expect(cut.used).toBeLessThanOrEqual(12)
+  expect(carried(cut.node)).toBe(cut.used)
+  expect(JSON.stringify(cut.node)).toContain('kept')
+  expect(JSON.stringify(cut.node)).not.toContain('Button')
+})
+
 test('a newest answer bigger than a drawing is cut with a note, the keys kept', async ($, on) => {
   const cli = fake()
   cli.watch = [{ type: 'reset', thread: ID, entries: [ENTRIES[0], { entry: { id: 2, model: [{ role: 'assistant', content: [{ type: 'text', text: 'word '.repeat(30_000) }] }] }, text: '' }] }, state('idle'), live()]
@@ -563,6 +595,7 @@ test('a start the person left for another form does not take that form over', as
   await clock.advance(3_000)
   // The first start ended: the second form stays, still starting.
   expect((await ui.find({ type: 'Button', key: 'start-submit' }))?.props.label).toBe('Starting…')
+  expect(await shows(ui, 'Started New one.')).toBe(true)
   expect(cli.spawns.some(argv => argv[0] === 'watch')).toBe(false)
   await clock.advance(2_000)
   expect(cli.runs.filter(argv => argv[0] === 'start')).toHaveLength(2)
@@ -587,9 +620,8 @@ test('a start whose switch to the thread loses a race to a new form follows noth
   await clock.advance(5_000)
   expect(isRaced).toBe(true)
   expect((await ui.find({ type: 'Input', key: 'start-title' }))?.props.value).toBe('Other')
-  expect(cli.spawns.some(argv => argv[1] === 'th-123456789abc')).toBe(false)
-  await ui.press({ key: 'start-cancel' })
   expect(await shows(ui, 'Started New one.')).toBe(true)
+  expect(cli.spawns.some(argv => argv[1] === 'th-123456789abc')).toBe(false)
 })
 
 test('a start that ends after the pane closed watches nothing until the pane opens again', async ($, on) => {
