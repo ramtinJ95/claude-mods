@@ -1,7 +1,20 @@
 import { atom, read, update } from 'claude-code'
 import type { EngineInterface, Register, Timer } from 'claude-code'
 
-import type { NexusCatalog, NexusFailure, NexusList, NexusPane, NexusRunState, NexusShown, NexusStartDraft, NexusThread, NexusThreadRow, NexusWatch } from '../types'
+import type {
+  NexusCatalog,
+  NexusFailure,
+  NexusList,
+  NexusOpening,
+  NexusPane,
+  NexusPreview,
+  NexusRunState,
+  NexusShown,
+  NexusStartDraft,
+  NexusThread,
+  NexusThreadRow,
+  NexusWatch,
+} from '../types'
 import {
   ACTIONS,
   type Action,
@@ -21,6 +34,7 @@ import {
   parseDetail,
   parseFailure,
   parseNodes,
+  parsePreview,
   parseProjects,
   parseStarted,
   parseThreads,
@@ -28,7 +42,7 @@ import {
   sentence,
   transcript,
 } from './model'
-import { needsHuman, TOOLS } from './tools'
+import { needsHuman, portFacts, TOOLS } from './tools'
 import { COMPOSE, type Draw, FILTER, ListView, type PaneActions, type Scene, StartView, ThreadView } from './view'
 
 const PANE = 'nexus'
@@ -39,10 +53,17 @@ const TICK_MS = 1_000
 const RUN_MS = 70_000
 const READ_CHARS = 6_000
 const REPLY_CHARS = 4_000
+/**
+ * The most often the pane's watch writes what it read: a streaming answer prints a `live` event ten times a second,
+ * and each write redraws the pane. The first event after a quiet spell is written at once.
+ */
+const FLUSH_MS = 100
 
 const listAtom = atom({ plugin: 'nexus', key: 'list' } as const, { threads: null, failure: null, polledAt: null })
 const WATCH = { plugin: 'nexus', key: 'watch' } as const
 const watchAtom = atom(WATCH, null)
+const LIVE = { plugin: 'nexus', key: 'live' } as const
+const liveAtom = atom(LIVE, null)
 const SHOWN = { plugin: 'nexus', key: 'shown' } as const
 const shownAtom = atom(SHOWN, null)
 const catalogAtom = atom({ plugin: 'nexus', key: 'catalog' } as const, { projects: null, nodes: null, nodesFailure: null, projectsFailure: null })
@@ -57,6 +78,7 @@ const paneAtom = atom({ plugin: 'nexus', key: 'pane' } as const, {
   draft: '',
   start: null,
   notice: null,
+  openings: {},
 })
 
 /** The CLI to run, from the `cli` option. */
@@ -155,7 +177,8 @@ async function runChild(
 
 /**
  * Runs `nexus watch <thread> --json` and hands each event to `take` until it answers true, `stop` settles or the
- * child exits. The exit is clean (no failure) after the thread's deletion.
+ * child exits. The exit is clean (no failure) after the thread's deletion; a line that breaks the contract ends the
+ * watch with a failure that says so.
  */
 async function followWatch(
   $: EngineInterface,
@@ -164,7 +187,8 @@ async function followWatch(
   stop: Promise<void>,
 ): Promise<ChildEnd> {
   let pending = ''
-  return runChild(
+  let broken: NexusFailure | undefined
+  const end = await runChild(
     $,
     ['watch', thread, '--json'],
     async text => {
@@ -172,17 +196,24 @@ async function followWatch(
       const lines = pending.split('\n')
       pending = lines.pop()!
       for (const line of lines) {
-        const event = parseWatchEvent(line)
+        let event: WatchEvent | undefined
+        try {
+          event = parseWatchEvent(line)
+        } catch (error) {
+          broken = { kind: 'failed', message: messageOf(error) }
+          return true
+        }
         if (event && (await take(event))) return true
       }
       return false
     },
     stop,
   )
+  return broken ? { by: 'exit', failure: broken } : end
 }
 
-/** One poll of the pane, `threads` or `show`, as a child `stop` kills: a closed pane leaves no poll running. Undefined once stopped. */
-async function pollJson($: EngineInterface, argv: readonly string[], stop: Promise<void>): Promise<Outcome<unknown> | undefined> {
+/** One CLI command as a child `stop` kills, such as a poll of the pane: a closed pane leaves none running. Undefined once stopped. */
+async function childJson($: EngineInterface, argv: readonly string[], stop: Promise<void>): Promise<Outcome<unknown> | undefined> {
   let stdout = ''
   const end = await runChild(
     $,
@@ -211,38 +242,72 @@ function stopper() {
   return { promise, stop }
 }
 
-/** The thread open in the pane, watched until the pane leaves it. Events for a thread no longer shown are dropped. */
+/**
+ * The thread open in the pane, watched until the pane leaves it. Events for a thread no longer shown are dropped.
+ * What it reads is gathered and written at most every `FLUSH_MS`, in order.
+ */
 function watchInPane($: EngineInterface, thread: string) {
   watcher?.stop()
   const { promise, stop } = stopper()
+  /** What this watch has written: only it writes the watch while it is the current one, so it needs no read back. */
+  let watched: NexusWatch = { thread, rows: [], dropped: 0, state: null, model: null, outage: null, ended: null }
+  let gathered: WatchEvent[] = []
+  /** The write about to run, and the wait after a write during which events only gather. */
+  let soon: Timer | undefined
+  let cooling: Timer | undefined
   // A stopped watch may still hold lines it read: only the current one writes, so a rewatch of the same thread
   // never takes an older reader's entries or its exit.
   const mine = {
     thread,
     stop: () => {
       if (watcher === mine) watcher = undefined
+      soon?.cancel()
+      cooling?.cancel()
       stop()
     },
   }
   watcher = mine
+  // The rows and state, then the newest live event, which stands for the others, are sent with no wait between
+  // them, so no drawing reads one without the other: the CLI prints an answer's entry before the live event that
+  // drops it from `partial`, and a drawing between the two writes would show the answer twice.
+  const write = () => {
+    soon?.cancel()
+    soon = undefined
+    const events = gathered
+    gathered = []
+    cooling = $.clock.after(FLUSH_MS, () => {
+      cooling = undefined
+      if (gathered.length > 0) void write()
+    })
+    if (watcher !== mine) return Promise.resolve()
+    const rows = events.filter(event => event.type !== 'live')
+    const live = events.findLast((event): event is Extract<WatchEvent, { type: 'live' }> => event.type === 'live')
+    watched = rows.reduce(applyEvent, watched)
+    return Promise.all([rows.length > 0 && $.state.set(WATCH, watched), live && $.state.set(LIVE, { thread, live: live.live })])
+  }
   void (async () => {
-    await $.state.set(WATCH, { thread, rows: [], state: null, live: null, model: null, outage: null, ended: null })
+    await Promise.all([$.state.set(WATCH, watched), $.state.set(LIVE, null)])
     const end = await followWatch(
       $,
       thread,
-      async event => {
+      event => {
         if (watcher !== mine) return true
-        await update($, watchAtom, current => (current ? applyEvent(current, event) : current))
-        // A changed state may come with changed details: the pylon, its previews, the parked tasks.
+        gathered.push(event)
+        // A changed state may come with changed details: the pylon, its previews and ports, the parked tasks.
         if (event.type === 'state') void poll($)
+        // A zero wait lets the rest of the lines read with this one join its write.
+        if (!soon && !cooling) soon = $.clock.after(0, () => void write())
         return false
       },
       promise,
     )
+    const last = write()
+    cooling?.cancel()
+    await last
     if (watcher !== mine || end.by !== 'exit') return
     watcher = undefined
-    const ended = end.failure ? `The watch stopped: ${sentence(end.failure.message)} r watches again.` : 'The thread was deleted.'
-    await update($, watchAtom, current => (current ? { ...current, ended } : current))
+    watched = { ...watched, ended: end.failure ? `The watch stopped: ${sentence(end.failure.message)} r watches again.` : 'The thread was deleted.' }
+    await $.state.set(WATCH, watched)
   })()
 }
 
@@ -272,7 +337,7 @@ async function poll($: EngineInterface) {
     const { view, selected } = await read($, paneAtom)
     if (view === 'start') return
     const thread = view === 'list' ? null : selected
-    const got = await pollJson($, thread ? ['show', thread] : ['threads', '--all'], current.stopped)
+    const got = await childJson($, thread ? ['show', thread] : ['threads', '--all'], current.stopped)
     const now = await $.clock.now()
     if (!got || poller !== current) return
     await $.state.set(NOW, now)
@@ -323,6 +388,8 @@ async function startPane($: EngineInterface) {
       stopped: promise,
     }
     void loadCatalog($, { projects: false })
+    // A port's wait ran under the poller before this one, or the module before a reload: none is under way now.
+    await update($, paneAtom, pane => ({ ...pane, openings: {} }))
   }
   void poll($)
   const { selected, view } = await read($, paneAtom)
@@ -361,7 +428,7 @@ async function setPane($: EngineInterface, change: (pane: NexusPane) => Partial<
   await update($, paneAtom, pane => ({ ...pane, notice: null, ...change(pane) }))
 }
 
-/** The pane showing `thread`, keeping what the person opened and closed in it when it was shown already. */
+/** The pane showing `thread`, keeping what the person opened and closed in it, and the ports opened, when it was shown already. */
 const threadView = (pane: NexusPane, thread: string): Partial<NexusPane> => ({
   view: 'thread',
   selected: thread,
@@ -370,6 +437,7 @@ const threadView = (pane: NexusPane, thread: string): Partial<NexusPane> => ({
   start: null,
   notice: null,
   toggled: pane.selected === thread ? pane.toggled : {},
+  openings: pane.selected === thread ? pane.openings : {},
 })
 
 /** Shows a thread: its watch, and its details polled, the first of which records the visit as the dashboard's page does. */
@@ -430,6 +498,35 @@ async function targetOf($: EngineInterface, arg: string | undefined): Promise<Ou
   if (arg) return resolveThread($, arg)
   const { selected } = await read($, paneAtom)
   return selected ? { ok: true, value: selected } : failed('name a thread, or open one in the pane first')
+}
+
+/** `nexus preview <thread> <port> --wait`: the port published, and its preview once the node serves it. Undefined once stopped. */
+async function previewPort($: EngineInterface, thread: string, port: number, stop: Promise<void>): Promise<Outcome<NexusPreview> | undefined> {
+  const got = await childJson($, ['preview', thread, String(port), '--wait'], stop)
+  return got && parsed(got, json => parsePreview(json, 'preview'))
+}
+
+/**
+ * Opens a port of the thread shown as a preview, saying so while the CLI waits for the node to serve it, then its
+ * link or why it failed. Closing the pane kills the wait; the port is published or refused all the same.
+ */
+async function openPort($: EngineInterface, port: number) {
+  const current = poller
+  const { selected, openings } = await read($, paneAtom)
+  const key = String(port)
+  if (!current || !selected || openings[key]?.phase === 'opening') return
+  const mark = (opening: NexusOpening | null) =>
+    update($, paneAtom, (pane): NexusPane => {
+      if (pane.selected !== selected) return pane
+      const { [key]: _, ...rest } = pane.openings
+      return { ...pane, openings: opening ? { ...rest, [key]: opening } : rest }
+    })
+  await mark({ phase: 'opening' })
+  const got = await previewPort($, selected, port, current.stopped)
+  if (!got) return mark(null)
+  await mark(got.ok ? { phase: 'open', preview: got.value } : { phase: 'failed', message: sentence(got.failure.message) })
+  // The port now has its preview, which the details list under Previews.
+  if (got.ok) void poll($)
 }
 
 async function act($: EngineInterface, action: Action, id: string): Promise<Outcome<string>> {
@@ -544,7 +641,7 @@ const QUIET_MS = 1_000
  * only once the watch has been quiet for a moment, and a state settles it at once.
  */
 async function waitFor($: EngineInterface, thread: string, ms: number, signal: AbortSignal) {
-  let watch: NexusWatch = { thread, rows: [], state: null, live: null, model: null, outage: null, ended: null }
+  let watch: NexusWatch = { thread, rows: [], dropped: 0, state: null, model: null, outage: null, ended: null }
   let reply: Reply | undefined
   const { promise, stop } = stopper()
   let timedOut = false
@@ -591,7 +688,14 @@ const str = (input: Record<string, unknown>, key: string) => {
 }
 
 const stateFields = (state: NexusRunState | null) =>
-  state && { status: state.status, run: state.run, pylon: state.pylon, queued: state.queued, ...(state.failed ? { failed: state.failed } : {}) }
+  state && {
+    status: state.status,
+    run: state.run,
+    pylon: state.pylon,
+    queued: state.queued,
+    ...(state.failed ? { failed: state.failed } : {}),
+    ports: state.ports && state.ports.map(portFacts),
+  }
 
 type ToolAnswer = { result: string } | { deny: string }
 
@@ -673,6 +777,16 @@ async function runTool($: EngineInterface, tool: keyof typeof TOOLS, input: Reco
         },
       })
     }
+    case 'preview': {
+      const id = await toolThread($, input)
+      if (!id.ok) return answer(id)
+      if (typeof input.port !== 'number') return { deny: 'port is required' }
+      // An abort during the lookup above fired no event the wait below could hear: it would publish the port anyway.
+      if (signal.aborted) return { deny: 'nexus: cancelled before the port was published' }
+      const got = await previewPort($, id.value, input.port, new Promise(resolve => signal.addEventListener('abort', () => resolve())))
+      if (!got) return { deny: 'nexus: cancelled while waiting for the preview; the port may be published already' }
+      return answer(got.ok ? { ok: true, value: { thread: id.value, port: input.port, url: got.value.url, ready: got.value.ready } } : got)
+    }
     case 'archive': {
       const id = await toolThread($, input)
       if (!id.ok) return answer(id)
@@ -750,8 +864,8 @@ function paneActions($: EngineInterface): PaneActions {
         const { view, selected } = await read($, paneAtom)
         if (view === 'details' || (view === 'start' && selected)) return setPane($, () => ({ view: 'thread', field: 'none', start: null }))
         watcher?.stop()
-        await setPane($, () => ({ view: 'list', selected: null, field: 'none', draft: '', start: null, toggled: {} }))
-        await Promise.all([$.state.set(WATCH, null), $.state.set(SHOWN, null)])
+        await setPane($, () => ({ view: 'list', selected: null, field: 'none', draft: '', start: null, toggled: {}, openings: {} }))
+        await Promise.all([$.state.set(WATCH, null), $.state.set(LIVE, null), $.state.set(SHOWN, null)])
         void poll($)
       }),
     refresh: () =>
@@ -804,6 +918,7 @@ function paneActions($: EngineInterface): PaneActions {
         await setPane($, pane => ({ view: pane.view === 'details' ? 'thread' : 'details' }))
         await Promise.all([poll($), loadCatalog($, { projects: false })])
       }),
+    openPort: port => run(() => openPort($, port)),
     newThread: () => run(() => openStart($)),
     startAgain: () =>
       run(async () => {
@@ -853,6 +968,7 @@ export const register: Register = (on, options) => {
   on('tool.call', { tool: 'mcp__nexus__send' }, ($, e, next) => callTool($, 'send', input(e), next.signal)).catch(failedTool)
   on('tool.call', { tool: 'mcp__nexus__read' }, ($, e, next) => callTool($, 'read', input(e), next.signal)).catch(failedTool)
   on('tool.call', { tool: 'mcp__nexus__wait' }, ($, e, next) => callTool($, 'wait', input(e), next.signal)).catch(failedTool)
+  on('tool.call', { tool: 'mcp__nexus__preview' }, ($, e, next) => callTool($, 'preview', input(e), next.signal)).catch(failedTool)
   on('tool.call', { tool: 'mcp__nexus__archive' }, ($, e, next) => callTool($, 'archive', input(e), next.signal)).catch(failedTool)
 
   on('ui.render', { component: 'Pane', requestId: PANE }, async ($, e) => {
@@ -861,9 +977,10 @@ export const register: Register = (on, options) => {
       return <Text dimColor>The Nexus pane needs a surface with text fields.</Text>
     }
     const draw: Draw = $.ui.resolve(e)
-    const [list, watch, shown, catalog, pane, now] = await Promise.all([
+    const [list, watch, live, shown, catalog, pane, now] = await Promise.all([
       read($, listAtom),
       read($, watchAtom),
+      read($, liveAtom),
       read($, shownAtom),
       read($, catalogAtom),
       read($, paneAtom),
@@ -872,6 +989,7 @@ export const register: Register = (on, options) => {
     const scene: Scene = {
       list,
       watch,
+      live: live && live.thread === pane.selected ? live.live : null,
       shown,
       catalog,
       pane,

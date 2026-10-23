@@ -1,7 +1,7 @@
-import { expect, test } from 'claude-code/testing'
+import { expect, test, type TestBody } from 'claude-code/testing'
 
 import { cutTree } from '../hooks/view'
-import { DETAIL, ENTRIES, ID, PATCH, THEME_KEYS, THREAD, THREADS, boot, fake, live, state } from './fake-cli'
+import { DETAIL, ENTRIES, ID, OPENED, PATCH, THEME_KEYS, THREAD, THREADS, WEB_PREVIEW, boot, fake, live, state } from './fake-cli'
 
 type Ui = Awaited<ReturnType<Awaited<ReturnType<typeof boot>>['mount']>>
 
@@ -149,6 +149,90 @@ test("the live run draws the answer streaming, a retry waiting, the queued messa
   expect(output).not.toContain('running 40 tests')
   // The live event's queue is the queued messages themselves, so no count stands in for them.
   expect(await shows(ui, /behind the run/)).toBe(false)
+})
+
+/** A turn whose answer streams at `hz` live events a second for `seconds`, each the whole partial so far, then commits. */
+function streaming(hz: number, seconds: number) {
+  const words = Array.from({ length: hz * seconds }, (_, n) => `word${n}`)
+  const partial = (n: number) => `Running the suite: ${words.slice(0, n + 1).join(' ')}`
+  const answer = partial(words.length - 1)
+  const lives = words.flatMap((_, n) => [{ delay: 1_000 / hz }, live({ partial: partial(n) })])
+  const commit = { type: 'entry', thread: ID, entry: { id: 12, model: [{ role: 'assistant', content: [{ type: 'text', text: answer }] }] }, text: answer }
+  return { answer, partial, events: [{ type: 'reset', thread: ID, entries: ENTRIES.slice(0, -1) }, state('working'), live(), ...lives, commit, live(), state('idle')] }
+}
+
+/** Every write of the mod's `watch` and `live` values. */
+function countWrites(on: Parameters<TestBody>[1]) {
+  const writes = { watch: 0, live: 0 }
+  on('state.set', async (_, e, next) => {
+    if (e.plugin === 'nexus' && (e.key === 'watch' || e.key === 'live')) writes[e.key] += 1
+    return next(e)
+  })
+  return writes
+}
+
+test('a 10 Hz stream writes the live event alone, at most every 100 ms, and draws its newest partial', async ($, on) => {
+  const writes = countWrites(on)
+  const cli = fake()
+  const { answer, partial, events } = streaming(50, 2)
+  cli.watch = events
+  const { clock, nexus, mount } = await boot($, on, cli)
+  await nexus(`open ${ID}`)
+  const ui = await mount()
+  const before = { ...writes }
+  await clock.advance(1_000)
+  // 50 events in that second, written as at most one in each 100 ms, and none of them copies the rows.
+  expect(writes.live - before.live).toBeGreaterThanOrEqual(9)
+  expect(writes.live - before.live).toBeLessThanOrEqual(11)
+  expect(writes.watch).toBe(before.watch)
+  // Read 1.1 s in, 20 ms apart: the drawing is at most one write behind the newest.
+  expect((await ui.findAll({ type: 'Markdown' })).at(-1)?.text).toMatch(new RegExp(`^${partial(49)}`))
+  await clock.advance(1_100)
+  expect((await ui.findAll({ type: 'Markdown' })).filter(one => one.text === answer)).toHaveLength(1)
+  expect(await shows(ui, /Working…/)).toBe(false)
+})
+
+test('the streaming answer keeps its key as it commits, and no drawing shows it twice', async ($, on) => {
+  const cli = fake()
+  const { answer, events } = streaming(10, 3)
+  cli.watch = events
+  const { clock, nexus, mount } = await boot($, on, cli)
+  await nexus(`open ${ID}`)
+  const ui = await mount()
+  const keyOf = async () => (await ui.findAll({ type: 'Box' })).find(one => one.key !== undefined && one.text.includes('Running the suite'))?.key
+  const streamed = new Set<string | undefined>()
+  for (let tick = 0; tick < 32; tick += 1) {
+    await clock.advance(100)
+    const answers = (await ui.findAll({ type: 'Markdown' })).filter(one => one.text.startsWith('Running the suite'))
+    expect(answers.length).toBeLessThanOrEqual(1)
+    streamed.add(await keyOf())
+  }
+  expect((await ui.findAll({ type: 'Markdown' })).at(-1)?.text).toBe(answer)
+  const committed = await keyOf()
+  expect(committed).toMatch(/^row-\d+$/)
+  expect([...streamed]).toEqual([committed])
+})
+
+test('older blocks stay drawn as an answer streams and the clock ticks, so the drawing above holds still', async ($, on) => {
+  const cli = fake()
+  const said = (id: number) => ({ entry: { id, model: [{ role: 'assistant', content: [{ type: 'text', text: `${id} ${'z'.repeat(296)}` }] }] }, text: '' })
+  const grown = (chars: number) => live({ partial: 'p'.repeat(chars) })
+  cli.watch = [
+    { type: 'reset', thread: ID, entries: [ENTRIES[0], ...Array.from({ length: 399 }, (_, n) => said(n + 2))] },
+    state('working'),
+    ...[100, 900, 1_700, 2_500, 3_300, 4_100].flatMap(chars => [{ delay: 1_000 }, grown(chars)]),
+  ]
+  const { clock, nexus, mount } = await boot($, on, cli)
+  await nexus(`open ${ID}`)
+  const ui = await mount()
+  const omitted = new Set<string | undefined>()
+  for (let second = 0; second < 6; second += 1) {
+    await clock.advance(1_000)
+    omitted.add((await ui.find({ type: 'Text', text: /earlier blocks? left out of the pane$/ }))?.text)
+  }
+  expect([...omitted]).toHaveLength(1)
+  expect([...omitted][0]).toMatch(/^… \d+ earlier blocks left out of the pane$/)
+  await expectWhole(ui, ['b', 'x', 'q'])
 })
 
 test('the run clock and spinner tick each second while the run works', async ($, on) => {
@@ -506,7 +590,7 @@ test("opening a thread records one visit, and its show poll stands in for the li
   expect(cli.runs.filter(argv => argv[0] === 'wake')).toHaveLength(1)
 })
 
-test('details: the pylon, previews linked where they open, outputs, sessions and the attach command to copy', async ($, on) => {
+test('details: the pylon, previews linked by their own URL, ports, outputs, sessions and the attach command to copy', async ($, on) => {
   const cli = fake()
   const { nexus, mount } = await boot($, on, cli)
   await nexus(`open ${ID}`)
@@ -516,11 +600,17 @@ test('details: the pylon, previews linked where they open, outputs, sessions and
   expect(rows).toEqual(expect.arrayContaining(['Desired    ● running', 'Observed   ● running', 'Node       firebat', 'Last seen  just now', 'Human      2 min ago', 'Agent      turn running']))
   // Text queries join a row's parts without the gaps the layout puts between them.
   const links = await ui.findAll({ type: 'Link' })
-  expect(links.map(link => [link.props.href, link.text])).toEqual([
-    ['https://rj-firebat.example.ts.net:10201/', 'https://rj-firebat.example.ts.net:10201/'],
-    ['https://rj-firebat.example.ts.net:10201/', 'web'],
-  ])
-  expect(await shows(ui, /^●apistartingport 10202$/, 'Box')).toBe(true)
+  expect(links.map(link => [link.props.href, link.text])).toEqual([[WEB_PREVIEW.url, WEB_PREVIEW.url]])
+  expect(await shows(ui, /^●webport 3000ready/, 'Box')).toBe(true)
+  expect(await shows(ui, /^●apistartinghttps:\/\/rj-firebat\.example\.ts\.net:10202\/$/, 'Box')).toBe(true)
+  // Each port once: 3000 has its preview above, so Ports lists the other two.
+  expect(await shows(ui, /^Ports 2$/)).toBe(true)
+  expect((await ui.find({ type: 'Button', key: 'port-5173' }))?.text).toBe('● 5173 no preview yet; press to open one')
+  expect(await shows(ui, /^●9229worker, a service with no preview$/, 'Box')).toBe(true)
+  expect(await ui.find({ type: 'Button', key: 'port-9229' })).toBeUndefined()
+  expect(await ui.find({ key: 'port-3000' })).toBeUndefined()
+  // The preview output is the preview listed above, so the outputs leave it out.
+  expect(await shows(ui, /^Outputs 1$/)).toBe(true)
   expect(await shows(ui, /^branch\s+fix\/login-plus$/, 'Box')).toBe(true)
   expect(await shows(ui, /^Claude Code● workingnexus:1\.2session 9c1e$/, 'Box')).toBe(true)
   await ui.press({ key: 'key-c' })
@@ -531,14 +621,72 @@ test('details: the pylon, previews linked where they open, outputs, sessions and
   expect(await ui.find({ type: 'Markdown' })).toBeDefined()
 })
 
-test('without the nodes, previews show their port and no link', async ($, on) => {
+test("a preview's link is the CLI's URL, with or without the nodes", async ($, on) => {
   const cli = fake({ fail: { nodes: { exitCode: 1, error: 'the API answered 404' } } })
   const { nexus, mount } = await boot($, on, cli)
   await nexus(`open ${ID}`)
   const ui = await mount()
   await ui.press({ key: 'key-i' })
-  expect(await ui.findAll({ type: 'Link' })).toEqual([])
-  expect(await shows(ui, /^●webreadyport 10201$/, 'Box')).toBe(true)
+  expect((await ui.findAll({ type: 'Link' })).map(link => link.props.href)).toEqual([WEB_PREVIEW.url])
+})
+
+test('a port opens on its digit: progress while the CLI waits, then its link, and Previews takes it at the next details', async ($, on) => {
+  const cli = fake({ slow: { preview: 3_000 } })
+  const { clock, nexus, mount } = await boot($, on, cli)
+  await nexus(`open ${ID}`)
+  const ui = await mount()
+  await ui.press({ key: 'key-i' })
+  expect((await ui.find({ type: 'Button', key: 'port-5173' }))?.props.hotkey).toBe('1')
+  await ui.press({ key: 'port-5173' })
+  expect(cli.spawns).toContainEqual(['preview', '--json', ID, '5173', '--wait'])
+  expect((await ui.find({ type: 'Button', key: 'port-5173' }))?.text).toBe('● 5173 opening: publishing it and waiting for the node to serve its URL…')
+  await ui.press({ key: 'port-5173' })
+  expect(cli.spawns.filter(argv => argv[0] === 'preview')).toHaveLength(1)
+  const polled = cli.spawns.filter(argv => argv[0] === 'show').length
+  await clock.advance(3_000)
+  expect((await ui.find({ type: 'Link', text: OPENED.url }))?.props.href).toBe(OPENED.url)
+  expect(cli.spawns.filter(argv => argv[0] === 'show').length).toBeGreaterThan(polled)
+  // The next details list it as a preview of its own, so Ports no longer does.
+  const opened = { ...OPENED, pylon: 'pylon-7f3a' }
+  cli.detail = { ...DETAIL, previews: [...DETAIL.previews, opened], ports: DETAIL.ports.map(one => (one.port === 5173 ? { ...one, preview: opened } : one)) }
+  await clock.advance(5_000)
+  expect(await ui.find({ key: 'port-5173' })).toBeUndefined()
+  expect(await shows(ui, /^Ports 1$/)).toBe(true)
+  expect(await shows(ui, new RegExp(`^●port-5173ready${OPENED.url}$`), 'Box')).toBe(true)
+})
+
+test('a port that does not open says why, and opens again when pressed', async ($, on) => {
+  const cli = fake({ fail: { preview: { exitCode: 5, error: 'the pylon is not running' } } })
+  const { nexus, mount } = await boot($, on, cli)
+  await nexus(`open ${ID}`)
+  const ui = await mount()
+  await ui.press({ key: 'key-i' })
+  await ui.press({ key: 'port-5173' })
+  expect((await ui.find({ type: 'Button', key: 'port-5173' }))?.text).toBe('● 5173 did not open; press again to retry')
+  expect((await ui.find({ type: 'Text', text: /the pylon is not running/ }))?.props).toMatchObject({ color: 'error' })
+  delete cli.fail.preview
+  await ui.press({ key: 'port-5173' })
+  expect(cli.spawns.filter(argv => argv[0] === 'preview')).toHaveLength(2)
+  expect(await ui.find({ type: 'Link', text: OPENED.url })).toBeDefined()
+})
+
+test('with no port to open, Ports says why: nothing listens and the ::1 hint, a pylon not running, or ports unknown', async ($, on) => {
+  const hint = "A server bound only to ::1 can't be previewed, so bind it to 0.0.0.0 or 127.0.0.1."
+  const cli = fake({ detail: { ...DETAIL, ports: [] } })
+  const { clock, nexus, mount } = await boot($, on, cli)
+  await nexus(`open ${ID}`)
+  const ui = await mount()
+  await ui.press({ key: 'key-i' })
+  expect(await shows(ui, `Nothing listens yet. ${hint}`)).toBe(true)
+  cli.detail = { ...DETAIL, ports: [DETAIL.ports[0]] }
+  await clock.advance(5_000)
+  expect(await shows(ui, `Every port that listens is under Previews. ${hint}`)).toBe(true)
+  cli.detail = { ...DETAIL, pylon: { ...DETAIL.pylon, actualState: 'paused' }, ports: [] }
+  await clock.advance(5_000)
+  expect(await shows(ui, 'Ports show while the pylon runs.')).toBe(true)
+  cli.detail = { ...DETAIL, ports: null }
+  await clock.advance(5_000)
+  expect(await shows(ui, "The pylon's ports could not be read.")).toBe(true)
 })
 
 test('the start form offers the projects and nodes, starts with every field it was given, and shows the new thread', async ($, on) => {

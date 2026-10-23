@@ -29,14 +29,23 @@ export const THREADS = [
   { id: 'th-7c0000000003', title: 'API docs', project: 'api', status: 'idle', agentTurnRunning: false, createdAt: T0 - 3 * 60 * MIN, lastHumanActivityAt: T0 - 3 * 60 * MIN, lastAgentActivityAt: T0 - 3 * 60 * MIN, pylonId: 'p3', conversationId: '9', pylon: { node: 'testbench', actualState: 'paused', failed: null }, desired: 'paused' },
 ]
 
+export const WEB_PREVIEW = { pylon: 'pylon-7f3a', service: 'web', httpsPort: 10201, ready: true, url: 'https://rj-firebat.example.ts.net:10201/' }
+const API_PREVIEW = { pylon: 'pylon-7f3a', service: 'api', httpsPort: 10202, ready: false, url: 'https://rj-firebat.example.ts.net:10202/' }
+/** A declared service with its preview, an ad hoc server with none yet, and a service declared without one. */
+export const PORTS = [
+  { port: 3000, service: 'web', preview: WEB_PREVIEW },
+  { port: 5173, service: null, preview: null },
+  { port: 9229, service: 'worker', preview: null },
+]
+/** What `nexus preview <thread> 5173 --wait` prints once the node serves it. */
+export const OPENED = { pylon: 'pylon-7f3a', service: 'port-5173', httpsPort: 10203, ready: true, url: 'https://rj-firebat.example.ts.net:10203/' }
+
 export const DETAIL = {
   thread: THREAD,
   pylon: { id: 'pylon-7f3a', node: 'firebat', actualState: 'running', failed: null, observedAt: new Date(T0 - 12_000).toISOString(), retryRefused: null },
   sessions: [{ herdrPane: 'nexus:1.2', harness: 'claude-code', harnessSessionId: '9c1e', status: 'working', pylon: 'pylon-7f3a' }],
-  previews: [
-    { pylon: 'pylon-7f3a', service: 'web', httpsPort: 10201, ready: true },
-    { pylon: 'pylon-7f3a', service: 'api', httpsPort: 10202, ready: false },
-  ],
+  previews: [WEB_PREVIEW, API_PREVIEW],
+  ports: PORTS,
   outputs: [
     { thread: ID, kind: 'branch', ref: 'fix/login-plus' },
     { thread: ID, kind: 'preview', ref: 'web' },
@@ -91,7 +100,7 @@ export const ENTRIES = [
   assistant(11, [call('call_b2|fc_9', 'bash', { command: 'npm test' })]),
 ]
 
-export const state = (run: string, extra: Record<string, unknown> = {}) => ({ type: 'state', thread: ID, status: 'active', run, parkedTasks: 0, queued: 0, pylon: 'running', failed: null, ...extra })
+export const state = (run: string, extra: Record<string, unknown> = {}) => ({ type: 'state', thread: ID, status: 'active', run, parkedTasks: 0, queued: 0, pylon: 'running', failed: null, ports: PORTS, ...extra })
 export const live = (extra: Record<string, unknown> = {}) => ({ type: 'live', thread: ID, queued: [], tools: [], partial: null, retry: null, ...extra })
 
 export type Fake = {
@@ -138,6 +147,7 @@ export async function boot(...[$, on, cli]: [...Body, Fake]) {
     unarchive: () => THREAD,
     delete: () => ({ ...THREAD, status: 'deleted' }),
     start: () => ({ ...THREAD, id: 'th-123456789abc', title: 'New one', agentTurnRunning: false }),
+    preview: () => OPENED,
   }
   on('process.run', async (_, e) => {
     const argv = e.argv.slice(1)
@@ -158,7 +168,16 @@ export async function boot(...[$, on, cli]: [...Body, Fake]) {
       }
       // A live watch holds until it is stopped.
       await clock.sleep(10 * 60 * MIN)
-    } else yield { stream: 'stdout' as const, text: JSON.stringify(answers[argv[0]!]?.() ?? null) }
+    } else {
+      const late = cli.slow[argv[0]!]
+      if (late) await clock.sleep(late)
+      const failure = cli.fail[argv[0]!]
+      if (failure) {
+        yield { stream: 'stderr' as const, text: `${JSON.stringify({ error: failure.error, kind: 'failed', status: 500 })}\n` }
+        return { value: { code: failure.exitCode, signal: null } }
+      }
+      yield { stream: 'stdout' as const, text: JSON.stringify(answers[argv[0]!]?.() ?? null) }
+    }
     return { value: { code: 0, signal: null } }
   })
   on('command.register', () => ({ value: { command: 'nexus' } }))
@@ -186,7 +205,8 @@ export async function boot(...[$, on, cli]: [...Body, Fake]) {
   await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
   const nexus = async (args: string) => {
     const done = await $.command.run({ command: 'nexus', args, origin: { kind: 'composer' }, presentation: { isFullscreen: true, columns: 200 } } as never)
-    await clock.settle()
+    // The pane's watch writes what it read within 100 ms.
+    await clock.advance(100)
     return done
   }
   const mount = (columns = 100) =>
