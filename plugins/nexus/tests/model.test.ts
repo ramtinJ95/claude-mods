@@ -1,7 +1,46 @@
 import { describe, expect, test } from 'claude-code/testing'
 
-import type { NexusRunState, NexusWatch } from '../types'
-import { applyEvent, foldReply, isSettled, keepTail, leftOut, matchThread, type WatchEntry, type WatchEvent, parseCommand, parseFailure, parseWatchEvent, tailLines, wrap } from '../hooks/model'
+import type { NexusRow, NexusRunState, NexusThread, NexusWatch } from '../types'
+import {
+  type WatchEntry,
+  type WatchEvent,
+  appendEntry,
+  applyEvent,
+  blocks,
+  clip,
+  clock,
+  diffOf,
+  exitCode,
+  foldReply,
+  foldSummary,
+  groupThreads,
+  isSettled,
+  keepTail,
+  leftOut,
+  matchThread,
+  parseCommand,
+  parseDetail,
+  parseFailure,
+  parseThreads,
+  parseWatchEvent,
+  previewLook,
+  since,
+  threadState,
+} from '../hooks/model'
+import { DETAIL, ENTRIES, PATCH, T0, THREADS } from './fake-cli'
+
+const thread = (over: Partial<NexusThread>): NexusThread => ({
+  id: 'th-4f2a00000001',
+  title: 'A thread',
+  project: 'web',
+  status: 'active',
+  agentTurnRunning: false,
+  createdAt: 0,
+  lastHumanActivityAt: 0,
+  lastAgentActivityAt: 0,
+  lastActivityAt: 0,
+  ...over,
+})
 
 describe('/nexus arguments', () => {
   test('a quoted title after the project, the rest the message', () => {
@@ -25,14 +64,7 @@ describe('/nexus arguments', () => {
   })
 
   test('a prefix names the one thread it starts', () => {
-    const threads = ['th-4f2a00000001', 'th-4f2b00000002'].map(id => ({
-      id,
-      title: id,
-      project: 'web',
-      status: 'active' as const,
-      agentTurnRunning: false,
-      lastActivityAt: 0,
-    }))
+    const threads = ['th-4f2a00000001', 'th-4f2b00000002'].map(id => thread({ id, title: id }))
     expect(matchThread('4f2a', threads)).toEqual({ id: 'th-4f2a00000001' })
     expect(matchThread('th-4f2b', threads)).toEqual({ id: 'th-4f2b00000002' })
     expect('error' in matchThread('4f2', threads)).toBe(true)
@@ -42,7 +74,7 @@ describe('/nexus arguments', () => {
 })
 
 const idle: NexusRunState = { status: 'active', run: 'idle', parkedTasks: 0, queued: 0, pylon: 'running', failed: null }
-const empty: NexusWatch = { thread: 'th-4f2a00000001', rows: [], state: null, outage: null, ended: null }
+const empty: NexusWatch = { thread: 'th-4f2a00000001', rows: [], state: null, live: null, model: null, outage: null, ended: null }
 
 /** The watch's own lines for one turn: a question, a tool call and its result, an answer. */
 const stream = [
@@ -66,8 +98,8 @@ describe('watch stream', () => {
     expect(events.at(-1)).toBeUndefined()
     const watch = events.reduce((current: NexusWatch, event) => (event ? applyEvent(current, event) : current), empty)
     expect(watch.rows).toEqual([
-      { kind: 'user', text: 'run the tests' },
-      { kind: 'tool', id: 'c1', name: 'bash', summary: 'npm test', outcome: 'error' },
+      { kind: 'user', text: 'run the tests', at: null },
+      { kind: 'tool', id: 'c1', name: 'bash', summary: 'npm test', outcome: 'error', args: { command: 'npm  test' }, output: '', lines: 0, patch: null },
       { kind: 'assistant', text: 'Two tests fail.' },
     ])
     expect(watch.state).toEqual(idle)
@@ -103,7 +135,7 @@ describe('watch stream', () => {
   })
 
   test('a run seen working then idle settles even with the user message last', () => {
-    const asked = [{ kind: 'user' as const, text: 'go' }]
+    const asked: NexusRow[] = [{ kind: 'user', text: 'go', at: null }]
     expect(isSettled(idle, asked, false)).toBe(false)
     expect(isSettled(idle, asked, true)).toBe(true)
     expect(isSettled({ ...idle, queued: 1 }, asked, true)).toBe(false)
@@ -111,7 +143,7 @@ describe('watch stream', () => {
   })
 
   test('a failed pylon settles at once', () => {
-    const asked = [{ kind: 'user' as const, text: 'go' }]
+    const asked: NexusRow[] = [{ kind: 'user', text: 'go', at: null }]
     expect(isSettled({ ...idle, pylon: 'failed', failed: 'the VM did not boot' }, asked, false)).toBe(true)
     expect(isSettled({ ...idle, run: 'working', failed: 'the VM did not boot' }, asked, false)).toBe(true)
   })
@@ -123,19 +155,9 @@ describe('watch stream', () => {
     expect(applyEvent(down, { type: 'state', state: idle }).outage).toBeNull()
   })
 
-  test('the tail is the last lines, tool runs collapsed', () => {
-    const tools = Array.from({ length: 5 }, (_, index) => ({
-      kind: 'tool' as const,
-      id: `c${index}`,
-      name: 'read',
-      summary: `src/file${index}.ts`,
-      outcome: 'ok' as const,
-    }))
-    const rows = [{ kind: 'user' as const, text: 'look around' }, ...tools, { kind: 'assistant' as const, text: 'one two three four five six' }]
-    const text = tailLines(rows, 12, 20).map(line => line.map(span => span.text).join(''))
-    expect(text).toEqual(['› look', '  around', '', '  2 earlier…', '✓ read src/…', '✓ read src/…', '✓ read src/…', '', 'one two', 'three four', 'five six'])
-    expect(tailLines(rows, 12, 2).map(line => line.map(span => span.text).join(''))).toEqual(['three four', 'five six'])
-    expect(wrap('漢字漢字漢字 ok', 4)).toEqual(['漢字', '漢字', '漢字', 'ok'])
+  test('a clipped title counts wide characters as two cells', () => {
+    expect(clip('漢字漢字', 5)).toBe('漢字…')
+    expect(clip('short', 8)).toBe('short')
   })
 
   test('a failed command reads its JSON error line, else its exit code', () => {
@@ -144,5 +166,121 @@ describe('watch stream', () => {
       message: 'cannot reach the SOCKS proxy',
     })
     expect(parseFailure(4, '')).toEqual({ kind: 'not-found', message: 'the CLI exited with 4' })
+  })
+})
+
+describe('the console', () => {
+  test('threads carry their pylon and what is wanted of it, and show its desired and attach; a row or show without them throws', () => {
+    const [fresh] = parseThreads(THREADS)
+    expect(fresh).toMatchObject({ pylon: { node: 'firebat', actualState: 'running', failed: null }, desired: 'running', lastHumanActivityAt: THREADS[0]!.lastHumanActivityAt })
+    expect(() => parseThreads([{ ...THREADS[0], desired: undefined }])).toThrow('nexus threads printed a row (th-4f2a00000001) without desired')
+    expect(() => parseThreads([{ ...THREADS[0], pylon: null }])).toThrow('without its pylon')
+    const detail = parseDetail(DETAIL)
+    expect(detail).toMatchObject({ desired: 'running', attach: 'herdr --session nexus-7f3a', hasConversation: true, pylon: { retryRefused: null, observedAt: DETAIL.pylon.observedAt } })
+    expect(detail.sessions).toEqual([{ herdrPane: 'nexus:1.2', harness: 'claude-code', harnessSessionId: '9c1e', status: 'working' }])
+    expect(() => parseDetail({ ...DETAIL, desired: undefined })).toThrow('nexus show printed no desired')
+    expect(() => parseDetail({ ...DETAIL, attach: undefined })).toThrow('nexus show printed no attach')
+  })
+
+  test('a thread is as urgent as its worst fact: a failed pylon shows over the agent working', () => {
+    expect(threadState({ status: 'active', agentTurnRunning: true }, 'running')).toEqual(['agent working', 'work'])
+    expect(threadState({ status: 'active', agentTurnRunning: true }, 'failed')).toEqual(['failed', 'bad'])
+    expect(threadState({ status: 'archived', agentTurnRunning: false }, 'paused')).toEqual(['archived', 'muted'])
+    expect(threadState({ status: 'idle', agentTurnRunning: false }, 'absent')).toEqual(['not on its node', 'muted'])
+  })
+
+  test("a live event carries the queued messages, running tools' output, the partial answer and a retry", () => {
+    const event = parseWatchEvent(JSON.stringify({ type: 'live', thread: 'th', queued: ['also add a test', 3], tools: [{ callId: 'b2', output: 'x'.repeat(5_000) }, { output: 'no id' }], partial: 'Running', retry: null, later: 1 }))
+    expect(event?.type).toBe('live')
+    const watch = applyEvent(empty, event!)
+    expect(watch.live?.queued).toEqual(['also add a test'])
+    expect(watch.live?.tools.map(tool => tool.callId)).toEqual(['b2'])
+    expect(watch.live?.tools[0]!.output.length).toBeLessThan(2_100)
+    expect(watch.live?.partial).toBe('Running')
+    // The live event leaves the settle rule alone, so the model tools stay as pi-nexus has them.
+    const settled = { ...idle }
+    expect(isSettled(settled, [{ kind: 'assistant', text: 'done' }], false)).toBe(isSettled(settled, applyEvent({ ...empty, rows: [{ kind: 'assistant', text: 'done' }] }, event!).rows, false))
+  })
+
+  test('the rows keep what the console draws: arguments, output, the line count, the patch and the model', () => {
+    const watch = applyEvent(empty, { type: 'reset', entries: ENTRIES.map(one => ({ model: one.entry.model as never, text: one.text })) })
+    expect(watch.model).toBe('claude-opus-5-5')
+    const rows = watch.rows
+    expect(rows[0]).toMatchObject({ kind: 'user', at: T0 - 72_000 })
+    const failed = rows.find(row => row.kind === 'tool' && row.id === 'b1')
+    expect(failed).toMatchObject({ outcome: 'error', lines: 4, args: { command: 'npm test -- login' } })
+    expect(exitCode(failed?.kind === 'tool' ? failed.output : '')).toBe('1')
+    const edit = rows.find(row => row.kind === 'tool' && row.id === 'e1')
+    expect(edit?.kind === 'tool' && edit.patch).toBe(PATCH)
+    // A result whose call is not in the context still draws, under the result's own tool name.
+    const orphan = appendEntry([], { model: [{ role: 'toolResult', toolCallId: 'gone', toolName: 'grep', content: [{ type: 'text', text: 'a\nb' }] }], text: '' })
+    expect(orphan).toEqual([{ kind: 'tool', id: 'gone', name: 'grep', summary: '', outcome: 'ok', args: {}, output: 'a\nb', lines: 2, patch: null }])
+  })
+
+  test('four tool calls in a row fold into one block, the live run after the rows', () => {
+    const watch = applyEvent(empty, { type: 'reset', entries: ENTRIES.map(one => ({ model: one.entry.model as never, text: one.text })) })
+    const all = blocks(watch.rows, { queued: ['Also add a test.'], tools: [], partial: 'Running the suite', retry: 'overloaded' })
+    expect(all.map(block => block.kind)).toEqual(['user', 'assistant', 'tools', 'assistant', 'tools', 'assistant', 'notice', 'user'])
+    const steps = all[4]!
+    expect(steps.kind === 'tools' && steps.tools.length).toBe(5)
+    expect(foldSummary(steps.kind === 'tools' ? steps.tools : [])).toBe('Read 4 files, ran 1 command')
+    expect(all.at(-3)).toEqual({ kind: 'assistant', text: 'Running the suite', streaming: true })
+    expect(all.at(-1)).toEqual({ kind: 'user', text: 'Also add a test.', queued: true })
+  })
+
+  test("an edit's diff is its result's patch, numbered as the file is; without one it is built from the call and says so", () => {
+    const watch = applyEvent(empty, { type: 'reset', entries: ENTRIES.map(one => ({ model: one.entry.model as never, text: one.text })) })
+    const edit = watch.rows.find(row => row.kind === 'tool' && row.id === 'e1')
+    if (edit?.kind !== 'tool') throw new Error('no edit row')
+    expect(diffOf(edit)).toEqual({ source: PATCH.slice(PATCH.indexOf('@@')).replace(/\n$/, ''), added: 1, removed: 1, isNumbered: true, omitted: 0 })
+    const bare = diffOf({ ...edit, patch: null })
+    expect(bare).toEqual({ source: '@@ -1,1 +1,1 @@\n-const re = /^[^+]+@/\n+const re = /^[^@]+@/', added: 1, removed: 1, isNumbered: false, omitted: 0 })
+    expect(diffOf({ ...edit, name: 'write', patch: null, args: { path: 'a.txt', content: 'one\ntwo\n' } })).toEqual({ source: '@@ -0,0 +1,2 @@\n+one\n+two', added: 2, removed: 0, isNumbered: true, omitted: 0 })
+    expect(diffOf({ ...edit, name: 'bash', patch: null, args: { command: 'ls' } })).toBeNull()
+  })
+
+  test("a patch keeps its last blank context line, and a removed line starting with dashes counts as removed", () => {
+    const patch = (body: string) => diffOf({ kind: 'tool', id: 'e', name: 'edit', summary: '', outcome: 'ok', args: {}, output: '', lines: 0, patch: body })
+    // The hunk counts three lines on each side; the blank one is a single space.
+    expect(patch('--- a\n+++ a\n@@ -1,3 +1,3 @@\n-one\n+two\n three\n \n')?.source).toBe('@@ -1,3 +1,3 @@\n-one\n+two\n three\n ')
+    expect(patch('@@ -1,1 +1,1 @@\n--- a rule\n+++ a rule\n')).toMatchObject({ added: 1, removed: 1 })
+  })
+
+  test("a diff built from an edit's call keeps whole replacements up to the patch bound and counts the rest", () => {
+    const edits = Array.from({ length: 14 }, (_, n) => ({ oldText: `${n}${'o'.repeat(3_999)}`, newText: `${n}${'n'.repeat(3_999)}` }))
+    const diff = diffOf({ kind: 'tool', id: 'e', name: 'edit', summary: '', outcome: 'ok', args: { path: 'a.ts', edits }, output: '', lines: 0, patch: null })
+    expect(diff?.source.length).toBeLessThanOrEqual(20_000)
+    expect(diff?.source.split('\n').filter(line => line.startsWith('@@'))).toHaveLength(2)
+    expect(diff).toMatchObject({ added: 2, removed: 2, omitted: 12 })
+  })
+
+  test('closed threads fold under the open ones; a filter opens the fold it matches', () => {
+    const threads = parseThreads(THREADS)
+    const [api, web] = groupThreads(threads, '', {})
+    expect(api).toMatchObject({ project: 'api', closed: [], isUnfolded: false })
+    expect(web!.open.map(one => one.title)).toEqual(['Fix login form 500s'])
+    expect(web!.closed.map(one => one.title)).toEqual(['Old idea'])
+    expect(web!.isUnfolded).toBe(false)
+    expect(groupThreads(threads, '', { 'closed-web': true })[1]!.isUnfolded).toBe(true)
+    const filtered = groupThreads(threads, 'old', {})
+    expect(filtered.map(group => group.project)).toEqual(['web'])
+    expect(filtered[0]).toMatchObject({ open: [], isUnfolded: true })
+  })
+
+  test("times read as the dashboard's: spans, a run's clock, and never", () => {
+    expect(since(0, 5_000)).toBe('never')
+    expect(since(1_000, 30_000)).toBe('just now')
+    expect(since(0 + 1, 5 * 60_000)).toBe('5 min ago')
+    expect(clock(72_000)).toBe('1m 12s')
+    expect(clock(3 * 3_600_000 + 60_000)).toBe('3h 1m')
+  })
+
+  test('a preview links while it can be opened: ready, or paused, which a visit wakes; not while archived or starting', () => {
+    const detail = parseDetail(DETAIL)
+    const [web, api] = detail.previews
+    expect(previewLook(detail, web!)).toMatchObject({ linked: true, label: 'ready' })
+    expect(previewLook(detail, api!)).toMatchObject({ linked: false, label: 'starting' })
+    expect(previewLook({ ...detail, pylon: { ...detail.pylon, actualState: 'paused' } }, api!)).toMatchObject({ linked: true, hint: 'Opening it wakes the pylon.' })
+    expect(previewLook({ ...detail, thread: { ...detail.thread, status: 'archived' } }, web!)).toMatchObject({ linked: false, hint: 'Unarchive the thread to open it.' })
   })
 })

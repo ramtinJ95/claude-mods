@@ -1,7 +1,7 @@
 import { atom, read, update } from 'claude-code'
 import type { EngineInterface, Register, Timer } from 'claude-code'
 
-import type { NexusFailure, NexusList, NexusPane, NexusRunState, NexusThread, NexusWatch } from '../types'
+import type { NexusCatalog, NexusFailure, NexusList, NexusPane, NexusRunState, NexusShown, NexusStartDraft, NexusThread, NexusThreadRow, NexusWatch } from '../types'
 import {
   ACTIONS,
   type Action,
@@ -12,12 +12,16 @@ import {
   type WatchEvent,
   ago,
   applyEvent,
+  closedKey,
   isSettled,
   foldReply,
   leftOut,
   matchThread,
   parseCommand,
+  parseDetail,
   parseFailure,
+  parseNodes,
+  parseProjects,
   parseStarted,
   parseThreads,
   parseWatchEvent,
@@ -25,10 +29,12 @@ import {
   transcript,
 } from './model'
 import { needsHuman, TOOLS } from './tools'
-import { COMPOSE, ListView, type PaneActions, ThreadView } from './view'
+import { COMPOSE, type Draw, FILTER, ListView, type PaneActions, type Scene, StartView, ThreadView } from './view'
 
 const PANE = 'nexus'
 const POLL_MS = 5_000
+/** How often the run clock ticks while the thread shown is working. */
+const TICK_MS = 1_000
 /** A `$.process.run` of the CLI: its own requests give up after 30 s without data, and `start` makes two. */
 const RUN_MS = 70_000
 const READ_CHARS = 6_000
@@ -37,21 +43,36 @@ const REPLY_CHARS = 4_000
 const listAtom = atom({ plugin: 'nexus', key: 'list' } as const, { threads: null, failure: null, polledAt: null })
 const WATCH = { plugin: 'nexus', key: 'watch' } as const
 const watchAtom = atom(WATCH, null)
+const SHOWN = { plugin: 'nexus', key: 'shown' } as const
+const shownAtom = atom(SHOWN, null)
+const catalogAtom = atom({ plugin: 'nexus', key: 'catalog' } as const, { projects: null, nodes: null, nodesFailure: null, projectsFailure: null })
+const NOW = { plugin: 'nexus', key: 'now' } as const
+const nowAtom = atom(NOW, 0)
 const paneAtom = atom({ plugin: 'nexus', key: 'pane' } as const, {
+  view: 'list',
   selected: null,
-  mode: 'browse',
-  showArchived: false,
+  field: 'none',
+  toggled: {},
+  filter: '',
   draft: '',
+  start: null,
   notice: null,
 })
 
 /** The CLI to run, from the `cli` option. */
 let cli = 'nexus'
-/** The pane's two processes at most: one `threads` poll at a time, and one watch of the thread it shows. */
-let poller: { timer: Timer; isBusy: boolean; stop: () => void; stopped: Promise<void> } | undefined
+/**
+ * The pane's two processes at most: one poll at a time, of `threads` for the list or `show` for the thread shown,
+ * and one watch of that thread. The ticker only reads the watch's state, to move the run clock while it works.
+ */
+let poller: { timer: Timer; ticker: Timer; isBusy: boolean; stop: () => void; stopped: Promise<void> } | undefined
 /** The second ask for the keyboard after `/nexus`, cancelled when the pane closes first. */
 let refocus: Timer | undefined
 let watcher: { thread: string; stop: () => void } | undefined
+/** The thread whose visit is still to be recorded, once its first `show` says whether it is open. */
+let visit: string | undefined
+/** Start submissions so far, which number each form's `request`. */
+let starts = 0
 
 type Outcome<T> = { ok: true; value: T } | { ok: false; failure: NexusFailure }
 
@@ -76,7 +97,7 @@ async function nexus($: EngineInterface, args: readonly string[]): Promise<Outco
   }
 }
 
-function threadsFrom(got: Outcome<unknown>): Outcome<NexusThread[]> {
+function threadsFrom(got: Outcome<unknown>): Outcome<NexusThreadRow[]> {
   if (!got.ok) return got
   try {
     return { ok: true, value: parseThreads(got.value) }
@@ -85,8 +106,18 @@ function threadsFrom(got: Outcome<unknown>): Outcome<NexusThread[]> {
   }
 }
 
-async function listThreads($: EngineInterface, project?: string): Promise<Outcome<NexusThread[]>> {
+async function listThreads($: EngineInterface, project?: string): Promise<Outcome<NexusThreadRow[]>> {
   return threadsFrom(await nexus($, ['threads', ...(project ? [`--project=${project}`] : [])]))
+}
+
+/** `parse` over a command's JSON, its throw a failure. */
+function parsed<T>(got: Outcome<unknown>, parse: (json: unknown) => T): Outcome<T> {
+  if (!got.ok) return got
+  try {
+    return { ok: true, value: parse(got.value) }
+  } catch (error) {
+    return failed(messageOf(error))
+  }
 }
 
 type ChildEnd = { by: 'taker' } | { by: 'stop' } | { by: 'exit'; failure: NexusFailure | null }
@@ -150,12 +181,12 @@ async function followWatch(
   )
 }
 
-/** The pane's `threads` poll, as a child `stop` kills: a closed pane leaves no poll running. Undefined once stopped. */
-async function pollList($: EngineInterface, stop: Promise<void>): Promise<Outcome<NexusThread[]> | undefined> {
+/** One poll of the pane, `threads` or `show`, as a child `stop` kills: a closed pane leaves no poll running. Undefined once stopped. */
+async function pollJson($: EngineInterface, argv: readonly string[], stop: Promise<void>): Promise<Outcome<unknown> | undefined> {
   let stdout = ''
   const end = await runChild(
     $,
-    ['threads', '--json'],
+    [argv[0]!, '--json', ...argv.slice(1)],
     text => {
       stdout += text
       return false
@@ -165,9 +196,9 @@ async function pollList($: EngineInterface, stop: Promise<void>): Promise<Outcom
   if (end.by !== 'exit') return undefined
   if (end.failure) return { ok: false, failure: end.failure }
   try {
-    return threadsFrom({ ok: true, value: JSON.parse(stdout) })
+    return { ok: true, value: JSON.parse(stdout) }
   } catch {
-    return failed('nexus threads printed something that is not JSON')
+    return failed(`nexus ${argv[0]} printed something that is not JSON`)
   }
 }
 
@@ -195,13 +226,15 @@ function watchInPane($: EngineInterface, thread: string) {
   }
   watcher = mine
   void (async () => {
-    await $.state.set(WATCH, { thread, rows: [], state: null, outage: null, ended: null })
+    await $.state.set(WATCH, { thread, rows: [], state: null, live: null, model: null, outage: null, ended: null })
     const end = await followWatch(
       $,
       thread,
       async event => {
         if (watcher !== mine) return true
         await update($, watchAtom, current => (current ? applyEvent(current, event) : current))
+        // A changed state may come with changed details: the pylon, its previews, the parked tasks.
+        if (event.type === 'state') void poll($)
         return false
       },
       promise,
@@ -215,6 +248,7 @@ function watchInPane($: EngineInterface, thread: string) {
 
 function stopPane() {
   poller?.timer.cancel()
+  poller?.ticker.cancel()
   poller?.stop()
   poller = undefined
   refocus?.cancel()
@@ -223,10 +257,11 @@ function stopPane() {
 }
 
 /**
- * One `threads` poll, skipped while one runs or the pane is behind another; the pane gone stops both processes.
- * Closing the pane kills a poll in flight, and one that ends as the pane closes writes nothing.
+ * One poll of what the pane shows, skipped while one runs or the pane is behind another: `threads` for the list,
+ * `show` for a thread. The pane gone stops every process. Closing the pane kills a poll in flight, and one that
+ * ends as the pane closes writes nothing.
  */
-async function pollThreads($: EngineInterface) {
+async function poll($: EngineInterface) {
   const current = poller
   if (!current || current.isBusy) return
   current.isBusy = true
@@ -234,27 +269,71 @@ async function pollThreads($: EngineInterface) {
     const pane = (await $.ui.panes()).find(one => one.id === PANE)
     if (!pane) return stopPane()
     if (!pane.isShown) return
-    const got = await pollList($, current.stopped)
+    const { view, selected } = await read($, paneAtom)
+    if (view === 'start') return
+    const thread = view === 'list' ? null : selected
+    const got = await pollJson($, thread ? ['show', thread] : ['threads', '--all'], current.stopped)
     const now = await $.clock.now()
     if (!got || poller !== current) return
-    await update($, listAtom, (list): NexusList => (got.ok ? { threads: got.value, failure: null, polledAt: now } : { ...list, failure: got.failure }))
+    await $.state.set(NOW, now)
+    if (!thread) {
+      const threads = threadsFrom(got)
+      await update($, listAtom, (list): NexusList => (threads.ok ? { threads: threads.value, failure: null, polledAt: now } : { ...list, failure: threads.failure }))
+      return
+    }
+    const detail = parsed(got, parseDetail)
+    if ((await read($, paneAtom)).selected !== thread) return
+    if (detail.ok) void recordVisit($, detail.value.thread)
+    await update($, shownAtom, (shown): NexusShown =>
+      detail.ok ? { thread, detail: detail.value, failure: null } : { thread, detail: shown?.thread === thread ? shown.detail : null, failure: detail.failure },
+    )
   } finally {
     current.isBusy = false
   }
 }
 
-/** Starts what an open pane needs, keeping what runs: the poll, polled now, and the watch of the thread it shows. */
+/** Moves the run clock while the thread shown works, so its timer and spinner tick. */
+async function tick($: EngineInterface) {
+  const watch = await read($, watchAtom)
+  if (watch?.state?.run === 'working') await $.state.set(NOW, await $.clock.now())
+}
+
+/** `projects` and `nodes` for the start form, the list's nodes line and the previews' links. */
+async function loadCatalog($: EngineInterface, wanted: { projects: boolean }) {
+  const [nodes, projects] = await Promise.all([
+    nexus($, ['nodes']).then(got => parsed(got, parseNodes)),
+    wanted.projects ? nexus($, ['projects']).then(got => parsed(got, parseProjects)) : undefined,
+  ])
+  await update($, catalogAtom, (catalog): NexusCatalog => ({
+    ...catalog,
+    ...(nodes.ok ? { nodes: nodes.value, nodesFailure: null } : { nodesFailure: nodes.failure }),
+    ...(projects ? (projects.ok ? { projects: projects.value, projectsFailure: null } : { projectsFailure: projects.failure }) : {}),
+  }))
+}
+
+/** Starts what an open pane needs, keeping what runs: the poll, polled now, the ticker and the watch of the thread it shows. */
 async function startPane($: EngineInterface) {
   if (!poller) {
     const { promise, stop } = stopper()
-    poller = { timer: $.clock.every(POLL_MS, () => void pollThreads($)), isBusy: false, stop, stopped: promise }
+    poller = {
+      timer: $.clock.every(POLL_MS, () => void poll($)),
+      ticker: $.clock.every(TICK_MS, () => void tick($)),
+      isBusy: false,
+      stop,
+      stopped: promise,
+    }
+    void loadCatalog($, { projects: false })
   }
-  void pollThreads($)
-  const { selected } = await read($, paneAtom)
-  if (selected && watcher?.thread !== selected) watchInPane($, selected)
+  void poll($)
+  const { selected, view } = await read($, paneAtom)
+  if (selected && view !== 'list' && watcher?.thread !== selected) watchInPane($, selected)
 }
 
-const OPEN = { id: PANE, title: 'Nexus', focus: true, columns: 64 } as const
+/**
+ * The dock is as wide as the engine allows, at most 45% of the terminal, so the conversation reads like the
+ * transcript beside it. Seated above the prompt, the pane takes the full width.
+ */
+const OPEN = { id: PANE, title: 'Nexus', focus: true, columns: 200 } as const
 /** How long after `/nexus` the pane asks for the keys again, once the composer has let go of the command line. */
 const REFOCUS_MS = 300
 
@@ -282,9 +361,43 @@ async function setPane($: EngineInterface, change: (pane: NexusPane) => Partial<
   await update($, paneAtom, pane => ({ ...pane, notice: null, ...change(pane) }))
 }
 
+/** The pane showing `thread`, keeping what the person opened and closed in it when it was shown already. */
+const threadView = (pane: NexusPane, thread: string): Partial<NexusPane> => ({
+  view: 'thread',
+  selected: thread,
+  field: 'none',
+  draft: '',
+  start: null,
+  notice: null,
+  toggled: pane.selected === thread ? pane.toggled : {},
+})
+
+/** Shows a thread: its watch, and its details polled, the first of which records the visit as the dashboard's page does. */
 async function showThread($: EngineInterface, thread: string) {
-  await setPane($, () => ({ selected: thread, mode: 'browse', draft: '' }))
-  watchInPane($, thread)
+  await setPane($, pane => threadView(pane, thread))
+  await followThread($, thread)
+}
+
+/** What the thread just shown runs: its details polled afresh and its watch, while the pane is open. */
+async function followThread($: EngineInterface, thread: string) {
+  const shown = await read($, shownAtom)
+  if (shown?.thread !== thread) await $.state.set(SHOWN, null)
+  // The person may have moved on during those awaits: only the thread still shown is followed.
+  const pane = await read($, paneAtom)
+  if (pane.selected !== thread || pane.view === 'list' || pane.view === 'start') return
+  visit = thread
+  // A closed pane watches nothing: opening it again starts the watch of the thread it shows.
+  if (poller) watchInPane($, thread)
+  void poll($)
+}
+
+/** Records a visit to an open thread as human activity, which wakes its paused pylon; a closed one's stays paused. */
+async function recordVisit($: EngineInterface, thread: NexusThread) {
+  if (visit !== thread.id) return
+  visit = undefined
+  if (thread.status !== 'active' && thread.status !== 'idle') return
+  const woken = await nexus($, ['wake', thread.id])
+  if (!woken.ok) await setPane($, () => ({ notice: { text: `This visit was not recorded, so a paused pylon stays paused: ${sentence(woken.failure.message)}`, tone: 'error' } }))
 }
 
 /** A full thread ID for `arg`: as given, else the one thread whose ID starts with it, from the last poll or a fresh one. */
@@ -322,9 +435,17 @@ async function targetOf($: EngineInterface, arg: string | undefined): Promise<Ou
 async function act($: EngineInterface, action: Action, id: string): Promise<Outcome<string>> {
   const got = await nexus($, [action, id])
   if (!got.ok) return got
-  void pollThreads($)
+  void poll($)
   const title = await titleOf($, id)
   return { ok: true, value: `${ACTIONS[action]} ${id}${title ? ` (${title})` : ''}.` }
+}
+
+/** Deletes a thread once the person says so, naming what it removes. Keep comes first: the dialog's default is the harmless answer. */
+async function confirmDelete($: EngineInterface, id: string): Promise<Outcome<string>> {
+  const title = await lookUpTitle($, id)
+  const question = `${title ? `"${title}" (${id})` : id} and its pylon and conversation will be removed. Delete it?`
+  const answer = await $.ui.ask(question, ['Keep', 'Delete']).catch(() => 'Keep')
+  return answer === 'Delete' ? act($, 'delete', id) : { ok: true, value: `Kept ${id}.` }
 }
 
 /** A command's reply. The transcript heads it with the plugin's name, so a failure is its message alone. */
@@ -337,20 +458,20 @@ async function send($: EngineInterface, id: string, text: string): Promise<Outco
   return got.ok ? { ok: true, value: `Sent to ${id}.` } : got
 }
 
-async function start($: EngineInterface, project: string, message: string | undefined, title: string | undefined) {
+type StartFields = { project: string; title?: string | undefined; message?: string | undefined; node?: string | undefined; branch?: string | undefined }
+
+async function start($: EngineInterface, fields: StartFields) {
   const got = await nexus($, [
     'start',
-    `--project=${project}`,
-    ...(title ? [`--title=${title}`] : []),
-    ...(message ? [`--message=${message}`] : []),
+    `--project=${fields.project}`,
+    ...(fields.title ? [`--title=${fields.title}`] : []),
+    ...(fields.message ? [`--message=${fields.message}`] : []),
+    ...(fields.node ? [`--node=${fields.node}`] : []),
+    ...(fields.branch ? [`--branch=${fields.branch}`] : []),
   ])
   if (!got.ok) return got
-  void pollThreads($)
-  try {
-    return { ok: true as const, value: parseStarted(got.value) }
-  } catch (error) {
-    return failed(messageOf(error))
-  }
+  void poll($)
+  return parsed(got, parseStarted)
 }
 
 async function runCommand($: EngineInterface, args: string): Promise<string> {
@@ -373,7 +494,7 @@ async function runCommand($: EngineInterface, args: string): Promise<string> {
       return `Showing ${id.value}.${await openPane($)}`
     }
     case 'new': {
-      const started = await start($, command.project, command.message, command.title)
+      const started = await start($, { project: command.project, message: command.message, title: command.title })
       if (!started.ok) return say(started)
       const thread = started.value
       if (poller) await showThread($, thread.id)
@@ -386,13 +507,7 @@ async function runCommand($: EngineInterface, args: string): Promise<string> {
     case 'action': {
       const id = await targetOf($, command.thread)
       if (!id.ok) return say(id)
-      if (command.action === 'delete') {
-        const title = await lookUpTitle($, id.value)
-        const question = `${title ? `"${title}" (${id.value})` : id.value} and its pylon and conversation will be removed. Delete it?`
-        // Keep comes first, so the dialog's default is the harmless answer.
-        const answer = await $.ui.ask(question, ['Keep', 'Delete']).catch(() => 'Keep')
-        if (answer !== 'Delete') return `Kept ${id.value}.`
-      }
+      if (command.action === 'delete') return say(await confirmDelete($, id.value))
       return say(await act($, command.action, id.value))
     }
   }
@@ -429,7 +544,7 @@ const QUIET_MS = 1_000
  * only once the watch has been quiet for a moment, and a state settles it at once.
  */
 async function waitFor($: EngineInterface, thread: string, ms: number, signal: AbortSignal) {
-  let watch: NexusWatch = { thread, rows: [], state: null, outage: null, ended: null }
+  let watch: NexusWatch = { thread, rows: [], state: null, live: null, model: null, outage: null, ended: null }
   let reply: Reply | undefined
   const { promise, stop } = stopper()
   let timedOut = false
@@ -519,7 +634,7 @@ async function runTool($: EngineInterface, tool: keyof typeof TOOLS, input: Reco
       const project = str(input, 'project')
       const message = str(input, 'message')
       if (!project || !message) return { deny: 'project and message are required' }
-      const started = await start($, project, message, str(input, 'title'))
+      const started = await start($, { project, message, title: str(input, 'title') })
       return answer(started.ok ? { ok: true, value: { id: started.value.id, project: started.value.project, title: started.value.title } } : started)
     }
     case 'send': {
@@ -563,7 +678,7 @@ async function runTool($: EngineInterface, tool: keyof typeof TOOLS, input: Reco
       if (!id.ok) return answer(id)
       const got = await nexus($, ['archive', id.value])
       if (!got.ok) return answer(got)
-      void pollThreads($)
+      void poll($)
       return answer({ ok: true, value: { thread: id.value, status: 'archived' } })
     }
   }
@@ -573,59 +688,141 @@ function failedTool() {
   return { deny: 'nexus: the tool failed before it answered; try again.' }
 }
 
-/** The handlers the pane's buttons and field run, each with the render hook's `$`. */
+const emptyStart = (project = '', title = ''): NexusStartDraft => ({ title, project, node: '', branch: '', message: '', error: null, isStarting: false, request: 0 })
+
+/** Opens the start form, its project and title given for Start again, and reads the projects and nodes it offers. */
+async function openStart($: EngineInterface, project?: string, title?: string) {
+  await setPane($, () => ({ view: 'start', field: 'none', start: emptyStart(project, title) }))
+  await loadCatalog($, { projects: true })
+  const { projects } = await read($, catalogAtom)
+  await update($, paneAtom, pane => {
+    if (!pane.start) return pane
+    const offered = projects?.some(one => one.id === pane.start!.project)
+    if (pane.start.project && !offered && projects) return { ...pane, start: { ...pane.start, project: '', error: `Project ${pane.start.project} is not offered here.` } }
+    return pane.start.project || !projects?.[0] ? pane : { ...pane, start: { ...pane.start, project: projects[0].id } }
+  })
+}
+
+/** Starts the thread the form describes and shows it; a failure stays on the form. */
+async function submitStart($: EngineInterface) {
+  const { start: draft } = await read($, paneAtom)
+  if (!draft || draft.isStarting) return
+  const title = draft.title.trim()
+  const message = draft.message.trim()
+  if (!draft.project || (!title && !message)) {
+    await setStart($, { error: draft.project ? 'Give the thread a title or a first message.' : 'Pick a project.' })
+    return
+  }
+  starts += 1
+  const request = starts
+  await setStart($, { isStarting: true, error: null, request })
+  const started = await start($, { project: draft.project, title, message, node: draft.node, branch: draft.branch.trim() })
+  // The person may have left the form, or opened another, while the thread started: then the outcome is only said.
+  // Whose form it is and what it becomes are one update, so no other change of the pane comes between them.
+  const committed = await update($, paneAtom, (pane): NexusPane => {
+    if (pane.view !== 'start' || pane.start?.request !== request) {
+      const said = started.ok ? `Started ${started.value.title || started.value.id}.` : `The thread did not start: ${sentence(started.failure.message)}`
+      return { ...pane, notice: { text: said, tone: started.ok ? 'dim' : 'error' } }
+    }
+    if (!started.ok) return { ...pane, start: { ...pane.start, isStarting: false, error: sentence(started.failure.message) } }
+    return { ...pane, ...threadView(pane, started.value.id) }
+  })
+  // `update` runs its function again when its write loses a race, so what follows reads what it wrote.
+  if (started.ok && committed.view === 'thread' && committed.selected === started.value.id) await followThread($, started.value.id)
+}
+
+const setStart = ($: EngineInterface, change: Partial<NexusStartDraft>) =>
+  update($, paneAtom, pane => (pane.start ? { ...pane, start: { ...pane.start, ...change } } : pane))
+
+/** The handlers the pane's buttons and fields run, each with the render hook's `$`. */
 function paneActions($: EngineInterface): PaneActions {
   const notify = (outcome: Outcome<string>) =>
-    setPane($, () => ({ notice: outcome.ok ? { text: outcome.value, tone: 'dim' } : { text: outcome.failure.message, tone: 'error' } }))
+    setPane($, () => ({ notice: outcome.ok ? { text: outcome.value, tone: 'dim' } : { text: sentence(outcome.failure.message), tone: 'error' } }))
   const onShown = async (fn: (id: string) => Promise<Outcome<string>>) => {
     const { selected } = await read($, paneAtom)
     if (selected) await notify(await fn(selected))
   }
+  const run = (fn: () => Promise<unknown>) => void fn()
   return {
-    open: id => void showThread($, id),
+    open: id => run(() => showThread($, id)),
     back: () =>
-      void (async () => {
+      run(async () => {
+        const { view, selected } = await read($, paneAtom)
+        if (view === 'details' || (view === 'start' && selected)) return setPane($, () => ({ view: 'thread', field: 'none', start: null }))
         watcher?.stop()
-        await setPane($, () => ({ selected: null, mode: 'browse', draft: '' }))
-        await $.state.set(WATCH, null)
-      })(),
+        await setPane($, () => ({ view: 'list', selected: null, field: 'none', draft: '', start: null, toggled: {} }))
+        await Promise.all([$.state.set(WATCH, null), $.state.set(SHOWN, null)])
+        void poll($)
+      }),
     refresh: () =>
-      void (async () => {
-        const { selected } = await read($, paneAtom)
+      run(async () => {
+        const { selected, view } = await read($, paneAtom)
         await setPane($, () => ({}))
-        if (selected) watchInPane($, selected)
-        else await pollThreads($)
-      })(),
-    toggleArchived: () => void setPane($, pane => ({ showArchived: !pane.showArchived })),
+        if (selected && view !== 'list') watchInPane($, selected)
+        await Promise.all([poll($), loadCatalog($, { projects: false })])
+      }),
     close: () =>
-      void (async () => {
+      run(async () => {
         stopPane()
         await $.ui.close({ id: PANE })
-      })(),
-    compose: () =>
-      void (async () => {
-        await setPane($, () => ({ mode: 'compose' }))
-        await $.ui.focus({ requestId: PANE, key: COMPOSE })
-      })(),
-    draft: text => void update($, paneAtom, pane => ({ ...pane, draft: text })),
+      }),
+    toggle: (key, isOpen) => run(() => update($, paneAtom, pane => ({ ...pane, toggled: { ...pane.toggled, [key]: !isOpen } }))),
+    field: field =>
+      run(async () => {
+        await setPane($, () => ({ field }))
+        // The field's autoFocus takes the ring as it is drawn; this asks for it too, where a pane already holds the
+        // keyboard. A refused ask leaves the field drawn for a click or Tab, so it is not an error.
+        if (field !== 'none') await $.ui.focus({ requestId: PANE, key: field === 'compose' ? COMPOSE : FILTER }).catch(() => undefined)
+      }),
+    // Each change of the filter opens the closed groups it matches afresh, as the dashboard's does, so a group the
+    // person folded or opened before follows the new filter.
+    filter: text =>
+      run(() =>
+        update($, paneAtom, pane => ({ ...pane, filter: text, toggled: Object.fromEntries(Object.entries(pane.toggled).filter(([key]) => !key.startsWith(closedKey('')))) })),
+      ),
+    draft: text => run(() => update($, paneAtom, pane => ({ ...pane, draft: text }))),
     submit: text =>
-      void (async () => {
-        await setPane($, () => ({ mode: 'browse', draft: '' }))
-        if (text.trim()) await onShown(id => send($, id, text.trim()))
-      })(),
-    askAbort: () => void setPane($, () => ({ mode: 'confirm-abort' })),
-    keep: () => void setPane($, () => ({ mode: 'browse' })),
-    abort: () =>
-      void (async () => {
-        await setPane($, () => ({ mode: 'browse' }))
-        await onShown(id => act($, 'abort', id))
-      })(),
-    archive: () =>
-      void onShown(async id => {
-        const watch = await read($, watchAtom)
-        const list = await read($, listAtom)
-        const status = watch?.state?.status ?? list.threads?.find(thread => thread.id === id)?.status
-        return act($, status === 'archived' ? 'unarchive' : 'archive', id)
+      run(async () => {
+        // An empty Enter hands the keys back; a sent message keeps the composer, as Claude Code's prompt does.
+        if (!text.trim()) return setPane($, () => ({ field: 'none' }))
+        await setPane($, () => ({ draft: '' }))
+        await onShown(id => send($, id, text.trim()))
+      }),
+    // A key pressed means no field has the keys, so a composer the thread's change hid stays let go of after it.
+    act: action =>
+      run(async () => {
+        await setPane($, () => ({ field: 'none' }))
+        await onShown(id => act($, action, id))
+      }),
+    remove: () =>
+      run(async () => {
+        await setPane($, () => ({ field: 'none' }))
+        await onShown(id => confirmDelete($, id))
+      }),
+    details: () =>
+      run(async () => {
+        await setPane($, pane => ({ view: pane.view === 'details' ? 'thread' : 'details' }))
+        await Promise.all([poll($), loadCatalog($, { projects: false })])
+      }),
+    newThread: () => run(() => openStart($)),
+    startAgain: () =>
+      run(async () => {
+        const { selected } = await read($, paneAtom)
+        const thread = (await read($, shownAtom))?.detail?.thread ?? (await read($, listAtom)).threads?.find(one => one.id === selected)
+        await openStart($, thread?.project, thread?.title)
+      }),
+    startDraft: change => run(() => setStart($, { ...change, error: null })),
+    startSubmit: change =>
+      run(async () => {
+        if (change) await setStart($, change)
+        await submitStart($)
+      }),
+    copy: (text, surface) =>
+      run(async () => {
+        const copied = await $.ui.copy({ text, surface })
+        await setPane($, () => ({
+          notice: copied.isCopied ? { text: `Copied: ${text}`, tone: 'dim' } : { text: `Not copied (${copied.reason}); select it by hand.`, tone: 'error' },
+        }))
       }),
   }
 }
@@ -663,14 +860,29 @@ export const register: Register = (on, options) => {
       const { Text } = $.ui.resolve(e)
       return <Text dimColor>The Nexus pane needs a surface with text fields.</Text>
     }
-    const draw = $.ui.resolve(e)
-    const [list, watch, pane] = await Promise.all([read($, listAtom), read($, watchAtom), read($, paneAtom)])
-    const width = Math.max(24, e.props.bodyColumns)
+    const draw: Draw = $.ui.resolve(e)
+    const [list, watch, shown, catalog, pane, now] = await Promise.all([
+      read($, listAtom),
+      read($, watchAtom),
+      read($, shownAtom),
+      read($, catalogAtom),
+      read($, paneAtom),
+      read($, nowAtom),
+    ])
+    const scene: Scene = {
+      list,
+      watch,
+      shown,
+      catalog,
+      pane,
+      now: Math.max(now, list.polledAt ?? 0),
+      width: Math.max(24, e.props.bodyColumns),
+      isFocused: e.props.isFocused,
+      surface: e.surface,
+    }
     const actions = paneActions($)
-    const { isFocused } = e.props
-    if (!pane.selected) return ListView(draw, list, pane, actions, width, isFocused)
-    const thread = list.threads?.find(one => one.id === pane.selected)
-    return ThreadView(draw, watch?.thread === pane.selected ? watch : null, thread, pane, actions, width, Math.max(10, e.props.scroll.bodyRows), isFocused)
+    if (pane.view === 'start') return StartView(draw, scene, actions)
+    if (!pane.selected || pane.view === 'list') return ListView(draw, scene, actions)
+    return ThreadView(draw, scene, actions)
   })
 }
-
