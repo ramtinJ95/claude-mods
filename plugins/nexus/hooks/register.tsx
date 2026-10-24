@@ -7,6 +7,7 @@ import type {
   NexusHarness,
   NexusList,
   NexusOpenedSession,
+  NexusSession,
   NexusPane,
   NexusPortChange,
   NexusPreview,
@@ -57,6 +58,10 @@ import {
   parsePreview,
   parseProjects,
   parseSessionClosed,
+  parseVersion,
+  isOlder,
+  resumesOn,
+  sessionPlace,
   parseStarted,
   parseThreads,
   parseUnpreviewed,
@@ -978,14 +983,36 @@ async function openSession($: EngineInterface, thread: string, open: { harness?:
   return got.ok ? parsed(got, parseOpenedSession) : { ok: false, failure: newer(got.failure, 'session open', 'opening a session', '0.5.0') }
 }
 
-/** `nexus session close`: the pane closed, which ends its agent. A pane already closed succeeds. */
-async function closeSession($: EngineInterface, thread: string, pane: string): Promise<Outcome<null>> {
-  const got = await nexus($, ['session', 'close', '--', thread, pane], SESSION_MS)
-  return got.ok ? parsed(got, parseSessionClosed) : { ok: false, failure: newer(got.failure, 'session close', 'closing a session', '0.5.0') }
+/**
+ * `nexus session close` by the session's `id`: its pane closed, which ends its agent, or a failed session in no pane
+ * dropped, so no wake tries it again. The CLI never tries again: a paused session is refused (exit 5) and a pane not open
+ * is not found (exit 4), each with the CLI's own message. Closing by an ID that is no pane (`isPaneless`) needs CLI
+ * 0.8.0, so such a close that fails names the version when the CLI is older.
+ */
+async function closeSession($: EngineInterface, thread: string, id: string, isPaneless = false): Promise<Outcome<null>> {
+  const got = await nexus($, ['session', 'close', '--', thread, id], SESSION_MS)
+  if (got.ok) return parsed(got, parseSessionClosed)
+  const failure = newer(got.failure, 'session close', 'closing a session', '0.5.0')
+  if (failure !== got.failure || !isPaneless) return { ok: false, failure }
+  const version = await cliVersion($)
+  return {
+    ok: false,
+    failure: version && isOlder(version, [0, 8, 0]) ? { kind: failure.kind, message: `${cli} is ${version.join('.')}: closing a failed session needs Nexus CLI 0.8.0 or later (nexus --version)` } : failure,
+  }
+}
+
+/** The CLI's version, or null when `--version` printed none or did not run. */
+async function cliVersion($: EngineInterface): Promise<number[] | null> {
+  try {
+    const ran = await $.process.run([cli, '--version'], { timeoutMs: RUN_MS })
+    return ran.exitCode === 0 ? parseVersion(ran.stdout) : null
+  } catch {
+    return null
+  }
 }
 
 /**
- * The opens and closes this module runs, as `open:<n>` and `close:<thread>:<pane>`: a pane started afresh drops the
+ * The opens and closes this module runs, as `open:<n>` and `close:<thread>:<id>`: a pane started afresh drops the
  * rows of any other, which a reload ended. They run as `$.process.run`, so closing the pane does not end them.
  */
 const sessionOps = new Set<string>()
@@ -1009,7 +1036,10 @@ async function openInPane($: EngineInterface, thread: string, harness: NexusHarn
     await setPane($, () => ({ notice: { text: `Opening ${sessionName(harness, title)}. Its agent can take a minute to start.`, tone: 'dim' } }))
     const opened = await openSession($, thread, { harness, title: title ?? undefined })
     const at = await $.clock.now()
-    await changeSessions($, thread, was => ({ ...was, opening: was.opening.filter(one => one.id !== id), opened: opened.ok ? [...was.opened, { session: opened.value, at }] : was.opened }))
+    // A wake can move the session to another pane before the node reports it: the IDs listed now tell it from those before.
+    const shown = await read($, shownAtom)
+    const before = shown?.thread === thread && shown.detail ? shown.detail.sessions.map(one => one.id) : null
+    await changeSessions($, thread, was => ({ ...was, opening: was.opening.filter(one => one.id !== id), opened: opened.ok ? [...was.opened, { session: opened.value, at, before }] : was.opened }))
     if (!opened.ok) {
       const why = sentence(opened.failure.message)
       return await sayOf($, thread, `The session did not open: ${why}`, `The session in ${thread} did not open: ${why}`, 'error')
@@ -1024,41 +1054,49 @@ async function openInPane($: EngineInterface, thread: string, harness: NexusHarn
   }
 }
 
-/** A session as a person names it, from the details or an open the pane confirmed; `the session` when neither has it. */
-async function sessionLabel($: EngineInterface, thread: string, pane: string): Promise<string> {
+/** The session `id` as the details list it, or as an open the pane confirmed; undefined when neither has it. */
+async function sessionOf($: EngineInterface, thread: string, id: string): Promise<Pick<NexusSession, 'harness' | 'title' | 'herdrPane' | 'harnessSessionId' | 'state'> | undefined> {
   const shown = await read($, shownAtom)
-  const listed = shown?.thread === thread ? shown.detail?.sessions.find(one => one.herdrPane === pane) : undefined
-  const opened = (await read($, paneAtom)).sessionChanges[thread]?.opened.find(one => one.session.herdrPane === pane)?.session
-  const known = listed ?? opened
-  return known ? sessionName(known.harness, known.title) : 'the session'
+  const listed = shown?.thread === thread ? shown.detail?.sessions.find(one => one.id === id) : undefined
+  const opened = (await read($, paneAtom)).sessionChanges[thread]?.opened.find(one => one.session.herdrPane === id)?.session
+  return listed ?? (opened && { ...opened, harnessSessionId: null, state: 'running' as const })
 }
 
-/** Closes a session from the pane once the person says so. Keep comes first, so the dialog's default keeps it. */
-async function closeInPane($: EngineInterface, thread: string, pane: string) {
-  const name = await sessionLabel($, thread, pane)
-  const answer = await $.ui.ask(`Close ${name} in pane ${pane}? Its agent ends.`, ['Keep', 'Close']).catch(() => 'Keep')
+/**
+ * Closes a running or failed session from the pane once the person says so; the Sessions tab offers no close of a
+ * paused one. Keep comes first, so the dialog's default keeps it. A refusal shows the CLI's message as printed.
+ */
+async function closeInPane($: EngineInterface, thread: string, id: string) {
+  const session = await sessionOf($, thread, id)
+  const name = session ? sessionName(session.harness, session.title) : 'the session'
+  const place = sessionPlace(id, session)
+  const question = session?.state === 'failed' ? `Close ${name}, which the last wake did not bring back?` : `Close ${name} in ${place}? Its agent ends.`
+  const answer = await $.ui.ask(question, ['Keep', 'Close']).catch(() => 'Keep')
   // The dialog leaves the keys at the prompt (live test, 2.1.310): the pane asks them back, onto its tab. Putting them
   // on the row as well gave them to the composer, in normal mode, when a quick close took the row away.
   if ((await $.ui.panes()).some(one => one.id === PANE)) await $.ui.open(OPEN)
   if (answer !== 'Close') return setPane($, () => ({ notice: { text: 'Kept the session.', tone: 'dim' } }))
-  const op = `close:${thread}:${pane}`
-  if (sessionOps.has(op)) return setPane($, () => ({ notice: { text: `Pane ${pane} is already closing.`, tone: 'dim' } }))
+  const op = `close:${thread}:${id}`
+  const Place = place.replace(/^./, first => first.toUpperCase())
+  if (sessionOps.has(op)) return setPane($, () => ({ notice: { text: `${Place} is already closing.`, tone: 'dim' } }))
   sessionOps.add(op)
   try {
-    await changeSessions($, thread, was => ({ ...was, closing: [...was.closing, pane] }))
-    await setPane($, () => ({ notice: { text: `Closing pane ${pane}…`, tone: 'dim' } }))
-    const closed = await closeSession($, thread, pane)
+    await changeSessions($, thread, was => ({ ...was, closing: [...was.closing, id] }))
+    await setPane($, () => ({ notice: { text: `Closing ${place}…`, tone: 'dim' } }))
+    const closed = await closeSession($, thread, id, session !== undefined && session.herdrPane !== id)
     const at = await $.clock.now()
     await changeSessions($, thread, was => ({
       ...was,
-      closing: was.closing.filter(one => one !== pane),
-      ...(closed.ok ? { closed: { ...was.closed, [pane]: at }, opened: was.opened.filter(one => one.session.herdrPane !== pane) } : {}),
+      closing: was.closing.filter(one => one !== id),
+      ...(closed.ok
+        ? { closed: { ...was.closed, [id]: { at, harnessSessionId: session?.harnessSessionId ?? null } }, opened: was.opened.filter(one => one.session.herdrPane !== id) }
+        : {}),
     }))
     if (!closed.ok) {
       const why = sentence(closed.failure.message)
-      return await sayOf($, thread, `Pane ${pane} was not closed: ${why}`, `Pane ${pane} of ${thread} was not closed: ${why}`, 'error')
+      return await sayOf($, thread, `${Place} was not closed: ${why}`, `${Place} of ${thread} was not closed: ${why}`, 'error')
     }
-    await sayOf($, thread, `Closed pane ${pane}.`, `Closed pane ${pane} of ${thread}.`, 'dim')
+    await sayOf($, thread, `Closed ${place}.`, `Closed ${place} of ${thread}.`, 'dim')
     void poll($)
   } finally {
     sessionOps.delete(op)
@@ -1069,19 +1107,24 @@ async function closeInPane($: EngineInterface, thread: string, pane: string) {
  * The pane of the session `/nexus session close` without a pane closes: the person picks it, Keep them all first, so
  * the dialog's default and a dismissed dialog keep them. Else what to say instead.
  */
-async function askSession($: EngineInterface, thread: string): Promise<Outcome<{ pane: string } | { said: string }>> {
+async function askSession($: EngineInterface, thread: string): Promise<Outcome<{ session: NexusSession } | { said: string }>> {
   const detail = parsed(await nexus($, ['show', thread]), parseDetail)
   if (!detail.ok) return detail
-  const { sessions } = detail.value
-  if (sessions.length === 0) return { ok: true, value: { said: `${thread} has no sessions.` } }
+  // A paused session cannot be closed until it runs, so the dialog does not offer it.
+  const sessions = detail.value.sessions.filter(one => one.state !== 'paused')
+  const paused = detail.value.sessions.length - sessions.length
+  if (sessions.length === 0) {
+    const status = detail.value.thread.status
+    return { ok: true, value: { said: paused ? `The sessions of ${thread} are paused: they resume on ${resumesOn(status)}, and can be closed once they run.` : `${thread} has no sessions.` } }
+  }
   // The dialog takes four answers at most, Keep them all among them.
   if (sessions.length > 3) {
-    return { ok: true, value: { said: `${thread} has ${sessions.length} sessions, more than the dialog lists. /nexus session close ${thread} <pane> closes one of ${sessions.map(one => one.herdrPane).join(', ')}.` } }
+    return { ok: true, value: { said: `${thread} has ${sessions.length} sessions, more than the dialog lists. /nexus session close ${thread} <id> closes one of ${sessions.map(one => one.id).join(', ')}.` } }
   }
-  const labels = sessions.map(one => `${sessionName(one.harness, one.title)} in pane ${one.herdrPane}, ${one.status}`)
-  const answer = await $.ui.ask(`Close which session of ${thread}? Its agent ends.`, ['Keep them all', ...labels]).catch(() => 'Keep them all')
-  const pane = sessions[labels.indexOf(answer)]?.herdrPane
-  return { ok: true, value: pane ? { pane } : { said: `Kept the sessions of ${thread}.` } }
+  const labels = sessions.map(one => `${sessionName(one.harness, one.title)} in ${sessionPlace(one.id, one)}, ${one.state === 'failed' ? 'failed' : one.status}`)
+  const answer = await $.ui.ask(`Close which session of ${thread}?`, ['Keep them all', ...labels]).catch(() => 'Keep them all')
+  const session = sessions[labels.indexOf(answer)]
+  return { ok: true, value: session ? { session } : { said: `Kept the sessions of ${thread}.` } }
 }
 
 /** How to attach a terminal on this Mac to the thread's sessions: Claude Code cannot hand its own terminal over. */
@@ -1213,14 +1256,21 @@ async function runCommand($: EngineInterface, args: string): Promise<string> {
     case 'session-close': {
       const id = await resolveThread($, command.thread)
       if (!id.ok) return say(id)
-      const asked = command.pane ? { ok: true as const, value: { pane: command.pane } } : await askSession($, id.value)
+      // A session named outright goes to the CLI as it is, which refuses a paused one and a pane that is not open.
+      if (command.session) {
+        const closed = await closeSession($, id.value, command.session, command.session.startsWith('failed-'))
+        if (!closed.ok) return say(closed)
+        void poll($)
+        return `Closed session ${command.session} of ${id.value}.`
+      }
+      const asked = await askSession($, id.value)
       if (!asked.ok) return say(asked)
       if ('said' in asked.value) return asked.value.said
-      const { pane } = asked.value
-      const closed = await closeSession($, id.value, pane)
+      const { session } = asked.value
+      const closed = await closeSession($, id.value, session.id, session.herdrPane !== session.id)
       if (!closed.ok) return say(closed)
       void poll($)
-      return `Closed pane ${pane} of ${id.value}.`
+      return `Closed ${sessionPlace(session.id, session)} of ${id.value}.`
     }
     case 'attach': {
       const id = await resolveThread($, command.thread)
@@ -1774,7 +1824,7 @@ function paneActions($: EngineInterface, surface: RenderSurface): PaneActions {
       case 'new-session':
         return openSessionForm($)
       case 'close-session':
-        return closeInPane($, effect.thread, effect.pane)
+        return closeInPane($, effect.thread, effect.id)
       case 'attach':
         return attach(effect.thread, effect.isCopy)
       case 'refresh':

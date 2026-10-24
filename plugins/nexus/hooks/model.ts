@@ -153,20 +153,7 @@ export function parseDetail(json: unknown): NexusDetail {
       observedAt: strOrNull(pylon.observedAt),
       retryRefused: strOrNull(pylon.retryRefused),
     },
-    sessions: list(json.sessions).flatMap((raw): NexusSession[] =>
-      isRecord(raw) && typeof raw.herdrPane === 'string'
-        ? [
-            {
-              herdrPane: raw.herdrPane,
-              harness: HARNESS.has(str(raw.harness)) ? (raw.harness as NexusSession['harness']) : 'shell',
-              harnessSessionId: strOrNull(raw.harnessSessionId),
-              status: SESSION.has(str(raw.status)) ? (raw.status as NexusSession['status']) : 'unknown',
-              // Absent from a control plane older than CLI 0.5.0, which means none.
-              title: strOrNull(raw.title),
-            },
-          ]
-        : [],
-    ),
+    sessions: list(json.sessions).map(parseSession),
     previews: list(json.previews).map(raw => parsePreview(raw, 'show')),
     ports: parsePorts(json.ports, 'show'),
     outputs: list(json.outputs).flatMap(raw =>
@@ -184,6 +171,40 @@ const projectOf = (id: string, raw: Record<string, unknown>): NexusProject => ({
 export function parseProjects(json: unknown): NexusProject[] {
   if (!Array.isArray(json)) throw new Error('nexus projects did not print a list')
   return json.flatMap(raw => (isRecord(raw) && typeof raw.id === 'string' ? [projectOf(raw.id, raw)] : []))
+}
+
+/**
+ * One of `show`'s sessions. A control plane older than CLI 0.8.0 lists only running sessions and sends no `state`,
+ * `id` or `message`: no `state` is running, and no `id` is the pane. A state this mod does not know, a session with
+ * no ID, a running one with no pane or a failed one with no message is a contract error, since the Sessions tab offers
+ * a close by state and ID.
+ */
+function parseSession(raw: unknown): NexusSession {
+  if (!isRecord(raw)) throw contractError('show', 'a session that is not an object')
+  const state = raw.state ?? 'running'
+  const herdrPane = typeof raw.herdrPane === 'string' ? raw.herdrPane : null
+  const id = raw.id ?? herdrPane
+  if (typeof id !== 'string' || !id) throw contractError('show', 'a session without its id')
+  const common = {
+    id,
+    harness: HARNESS.has(str(raw.harness)) ? (raw.harness as NexusHarness) : 'shell',
+    harnessSessionId: strOrNull(raw.harnessSessionId),
+    status: SESSION.has(str(raw.status)) ? (raw.status as NexusSession['status']) : 'unknown',
+    // Absent from a control plane older than CLI 0.5.0, which means none.
+    title: strOrNull(raw.title),
+  } as const
+  switch (state) {
+    case 'running':
+      if (herdrPane === null) throw contractError('show', `a running session (${id}) without its herdrPane`)
+      return { ...common, state: 'running', herdrPane, message: null }
+    case 'paused':
+      return { ...common, state: 'paused', herdrPane, message: null }
+    case 'failed':
+      if (typeof raw.message !== 'string') throw contractError('show', `a failed session (${id}) without its message`)
+      return { ...common, state: 'failed', herdrPane, message: raw.message }
+    default:
+      throw contractError('show', `a session (${id}) in a state it does not know, ${clip(JSON.stringify(state), 40)}`)
+  }
 }
 
 /** `nexus project add`'s answer: the project it added. */
@@ -626,6 +647,27 @@ export const SSH_HINT = `Attaching needs Nexus CLI 0.5.0 and ssh to the pylon's 
 /** A session as a person names it: its harness, and its title when it has one, such as `Claude Code "login"`. */
 export const sessionName = (harness: NexusHarness, title: string | null | undefined) => `${HARNESS_LABEL[harness]}${title ? ` "${title}"` : ''}`
 
+/** How a person names the session `id` in a notice: by its pane while it has that pane, else by the ID `session close` takes. */
+export const sessionPlace = (id: string, session: Pick<NexusSession, 'herdrPane'> | undefined) => (session?.herdrPane === id || !session ? `pane ${id}` : `session ${id}`)
+
+/** What brings a paused session back: its pylon's wake, which for an archived thread only its unarchive gives. */
+export const resumesOn = (status: NexusThread['status'] | undefined) => (status === 'archived' ? 'unarchive' : 'wake')
+
+/** Why a paused session is not closed: `session close` refuses one without waking its pylon, so the pane does not ask. */
+export const pausedClose = (name: string, status: NexusThread['status'] | undefined) => `${name} is paused: it resumes on ${resumesOn(status)}, and can be closed once it runs.`
+
+/** The version `nexus --version` printed (`nexus 0.8.0`), or null when it printed none. */
+export function parseVersion(stdout: string): number[] | null {
+  const found = /(\d+)\.(\d+)\.(\d+)/.exec(stdout)
+  return found ? found.slice(1).map(Number) : null
+}
+
+/** Whether `version` comes before `than`, both as `parseVersion` gives them. */
+export const isOlder = (version: readonly number[], than: readonly number[]) => {
+  const at = version.findIndex((part, index) => part !== than[index])
+  return at !== -1 && version[at]! < than[at]!
+}
+
 /**
  * How long an open or close confirmed in the pane outweighs details that do not show it. The node reads its sessions
  * again once the CLI has answered, so the next details can still show them as they were.
@@ -635,27 +677,43 @@ export const SESSION_SETTLE_MS = 30_000
 export const NO_SESSION_CHANGES: NexusSessionChanges = { opening: [], opened: [], closing: [], closed: {} }
 
 /** A session as the Sessions tab lists it: `opened` is one the CLI opened that the node has not reported yet. */
-export type ShownSession = Omit<NexusSession, 'status'> & { status: NexusSession['status'] | 'opened' }
+export type ShownSession = NexusSession | (Omit<Extract<NexusSession, { state: 'running' }>, 'status'> & { status: 'opened' })
+
+type Opened = NexusSessionChanges['opened'][number]
+type Closed = NexusSessionChanges['closed'][string]
+
+/**
+ * Whether the details list `session` as the one an open confirmed: in its pane, or, since a wake can move a session to
+ * another pane, as a session of its harness and title that the details did not list when the open was confirmed.
+ */
+const isOpenedAs = (opened: Opened, session: NexusSession) =>
+  session.herdrPane === opened.session.herdrPane ||
+  (opened.before !== null && !opened.before.includes(session.id) && session.harness === opened.session.harness && session.title === opened.session.title)
+
+/** Whether the details list `session` as the one closed as `id`: by its ID, or by its harness's session ID, which a wake that moves its pane keeps. */
+const isClosedAs = (id: string, closed: Closed, session: NexusSession) =>
+  session.id === id || (closed.harnessSessionId !== null && session.harnessSessionId === closed.harnessSessionId)
 
 /**
  * The sessions as the details list them, with the confirmations they do not show yet, for `SESSION_SETTLE_MS` at
- * most: a pane just closed is gone, and a session just opened is there, `opened` until the node reports it.
+ * most: a session just closed is gone, and a session just opened is there, `opened` until the node reports it.
  */
 export function shownSessions(sessions: readonly NexusSession[], changes: NexusSessionChanges, now: number): ShownSession[] {
   const isFresh = (at: number) => now - at < SESSION_SETTLE_MS
-  const closed = (pane: string) => changes.closed[pane] !== undefined && isFresh(changes.closed[pane])
-  const listed = sessions.filter(session => !closed(session.herdrPane))
+  const closes = Object.entries(changes.closed).filter(([, closed]) => isFresh(closed.at))
+  const listed = sessions.filter(session => !closes.some(([id, closed]) => isClosedAs(id, closed, session)))
   const opened = changes.opened
-    .filter(({ session, at }) => isFresh(at) && !closed(session.herdrPane) && !sessions.some(one => one.herdrPane === session.herdrPane))
-    .map(({ session }): ShownSession => ({ ...session, status: 'opened', harnessSessionId: null }))
+    .filter(one => isFresh(one.at) && !closes.some(([id]) => id === one.session.herdrPane) && !sessions.some(session => isOpenedAs(one, session)))
+    .map(({ session }): ShownSession => ({ ...session, id: session.herdrPane, state: 'running', message: null, status: 'opened', harnessSessionId: null }))
   return [...listed, ...opened]
 }
 
 /** `changes` without the confirmations that `sessions`, just read, show, or that have waited `SESSION_SETTLE_MS`; the same object when none went. */
 export function settleSessions(changes: NexusSessionChanges, sessions: readonly NexusSession[], now: number): NexusSessionChanges {
-  const listed = (pane: string) => sessions.some(session => session.herdrPane === pane)
-  const opened = changes.opened.filter(({ session, at }) => !listed(session.herdrPane) && now - at < SESSION_SETTLE_MS)
-  const closed = Object.fromEntries(Object.entries(changes.closed).filter(([pane, at]) => listed(pane) && now - at < SESSION_SETTLE_MS))
+  const opened = changes.opened.filter(one => !sessions.some(session => isOpenedAs(one, session)) && now - one.at < SESSION_SETTLE_MS)
+  const closed = Object.fromEntries(
+    Object.entries(changes.closed).filter(([id, one]) => sessions.some(session => isClosedAs(id, one, session)) && now - one.at < SESSION_SETTLE_MS),
+  )
   if (opened.length === changes.opened.length && Object.keys(closed).length === Object.keys(changes.closed).length) return changes
   return { ...changes, opened, closed }
 }
@@ -828,8 +886,8 @@ export type NexusCommand =
   | { verb: 'scope'; project?: string | null }
   | { verb: 'add-project'; id: string; repoUrl: string; node: string; branch?: string }
   | { verb: 'session-open'; thread: string; harness?: NexusHarness; title?: string }
-  /** Without `pane`, it asks which of the thread's sessions to close. */
-  | { verb: 'session-close'; thread: string; pane?: string }
+  /** `session` is the ID `session close` takes, the pane for a session in one. Without it, it asks which to close. */
+  | { verb: 'session-close'; thread: string; session?: string }
   | { verb: 'attach'; thread: string }
   | { verb: 'invalid'; reason: string }
 
@@ -844,7 +902,7 @@ export const USAGE = [
   "/nexus project [id|all]         which project's threads show, or the one shown",
   '/nexus project add <id> <repo-url> --node <node> [--branch <branch>]',
   '/nexus session open <id> [--harness claude-code|pi|shell] [--title T]',
-  '/nexus session close <id> [pane]  without a pane, asks which',
+  '/nexus session close <id> [session]  a pane or failed-… ID; without one, asks which',
   '/nexus session attach <id>      the command that attaches a terminal to its sessions',
   '/nexus archive|unarchive|abort|retry|retry-pylon|delete [id]',
   'An ID may be a unique prefix (4f2a or th-4f2a). Without one, an action takes the thread open in the pane.',
@@ -964,8 +1022,8 @@ function session([command, ...args]: readonly string[], invalid: (reason: string
       return { verb: 'session-open', thread: positional[0]!, ...(flags.harness ? { harness: flags.harness as NexusHarness } : {}), ...(flags.title ? { title: flags.title } : {}) }
     }
     case 'close':
-      if (args.length === 0 || args.length > 2) return invalid('/nexus session close takes a thread ID, and may name a pane.')
-      return { verb: 'session-close', thread: args[0]!, ...(args[1] === undefined ? {} : { pane: args[1] }) }
+      if (args.length === 0 || args.length > 2) return invalid('/nexus session close takes a thread ID, and may name a session by its pane or ID.')
+      return { verb: 'session-close', thread: args[0]!, ...(args[1] === undefined ? {} : { session: args[1] }) }
     case 'attach':
       return args.length === 1 ? { verb: 'attach', thread: args[0]! } : invalid('/nexus session attach takes one thread ID.')
     default:
