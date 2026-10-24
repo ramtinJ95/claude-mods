@@ -130,7 +130,8 @@ export type PaneActions = {
   startProject: (project: string) => void
   /** Starts the thread, the field Enter was pressed in carrying its text: it may not have reported it yet. */
   startSubmit: (change?: Partial<Pick<NexusStartDraft, 'title' | 'branch' | 'message'>>) => void
-  projectDraft: (change: Partial<NexusProjectDraft>) => void
+  /** A change of the new project form; `at` is the field it was typed into, as drawn. */
+  projectDraft: (change: Partial<NexusProjectDraft>, at?: string) => void
   /** Adds the project, the field Enter was pressed in carrying its text, as for the start form. */
   projectSubmit: (change?: Partial<Pick<NexusProjectDraft, 'id' | 'repoUrl' | 'branch'>>) => void
 }
@@ -1691,7 +1692,7 @@ export function ProjectView(draw: Draw, scene: Scene, actions: PaneActions) {
             value={id.value}
             placeholder="lowercase letters, digits and dashes"
             submitLabel="add"
-            onInput={value => actions.projectDraft({ id: value })}
+            onInput={value => actions.projectDraft({ id: value }, id.key)}
             onSubmit={value => actions.projectSubmit({ id: value })}
           />
           <Input
@@ -1700,7 +1701,7 @@ export function ProjectView(draw: Draw, scene: Scene, actions: PaneActions) {
             value={repoUrl.value}
             placeholder="git@github.com:you/repo.git or https://…"
             submitLabel="add"
-            onInput={value => actions.projectDraft({ repoUrl: value })}
+            onInput={value => actions.projectDraft({ repoUrl: value }, repoUrl.key)}
             onSubmit={value => actions.projectSubmit({ repoUrl: value })}
           />
           {nodes && nodes.length > 0 ? (
@@ -1722,7 +1723,7 @@ export function ProjectView(draw: Draw, scene: Scene, actions: PaneActions) {
             value={branch.value}
             placeholder="main"
             submitLabel="add"
-            onInput={value => actions.projectDraft({ branch: value })}
+            onInput={value => actions.projectDraft({ branch: value }, branch.key)}
             onSubmit={value => actions.projectSubmit({ branch: value })}
           />
           <Text color="subtle">Its threads' pylons boot on the node and check out the branch, unless a thread asks for others.</Text>

@@ -1289,8 +1289,7 @@ const setProjectDraft = ($: EngineInterface, change: Partial<NexusProjectDraft>)
  * Adds the project the form describes and shows its threads; a failure stays on the form with the CLI's message as it
  * printed it, since it names what to fix. One that ends after the person left the form only says how it went.
  */
-async function submitProject($: EngineInterface) {
-  const { project: draft } = await read($, paneAtom)
+async function submitProject($: EngineInterface, draft: NexusProjectDraft | null) {
   if (!draft || draft.isAdding) return
   const add = { id: draft.id.trim(), repoUrl: draft.repoUrl.trim(), node: draft.node, branch: draft.branch.trim() || 'main' }
   const missing = !add.id ? 'A project needs an ID.' : !add.repoUrl ? 'A project needs a repo URL.' : !add.node ? 'Pick the node its pylons boot on.' : null
@@ -1537,14 +1536,14 @@ function paneActions($: EngineInterface, surface: RenderSurface): PaneActions {
         await submitStart($, sent)
         if (change) await inTurn(() => putBack($, START_KEYS, change, pane => pane.start))
       }),
-    projectDraft: change => run(() => setProjectDraft($, { ...change, error: null })),
+    projectDraft: (change, at) =>
+      run(() => update($, paneAtom, pane => (pane.project && (at === undefined || isDrawn(pane, at)) ? { ...pane, project: { ...pane.project, ...change, error: null } } : pane))),
     projectSubmit: change =>
       run(async () => {
-        if (change) {
-          await setProjectDraft($, change)
-          await putBack($, PROJECT_KEYS, change, pane => pane.project)
-        }
-        await submitProject($)
+        // As the start form's: what is added is the form as Enter left it.
+        const { project: sent } = await setProjectDraft($, change ?? {})
+        if (change) await putBack($, PROJECT_KEYS, change, pane => pane.project)
+        await submitProject($, sent)
       }),
   }
 }

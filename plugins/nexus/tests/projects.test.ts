@@ -244,6 +244,16 @@ test("a refused add shows the CLI's message as printed and keeps the form filled
   expect(await fields.shows('project-url')).toBe('git@github.com:me/web.git')
   expect(await shows(ui, 'nexus has no project add command: adding a project needs Nexus CLI 0.4.0 or later (nexus --version)')).toBe(true)
 
+  // Keys typed after Enter land in the field it emptied (live: 8 ms after Enter, they went out as the URL). The add is
+  // Enter's, and the next one sends what the form shows.
+  cli.fail.project = { exitCode: 5, error: 'project web exists' }
+  const url = await field(ui, 'project-url')
+  await fields.submit('project-url', { during: () => fields.typeInto(url, 'zz') })
+  expect(cli.runs.at(-1)).toEqual(['project', 'add', '--json', '--node=firebat', '--branch=trunk', '--', 'web', 'git@github.com:me/web.git'])
+  expect(await fields.shows('project-url')).toBe('zz')
+  await ui.press({ key: 'project-submit' })
+  expect(cli.runs.at(-1)).toEqual(['project', 'add', '--json', '--node=firebat', '--branch=trunk', '--', 'web', 'zz'])
+
   await ui.press({ key: 'project-cancel' })
   expect(await picker(ui)).toContain('❯ + New project…')
   expect(await title(ui)).toMatch(/^◆ Nexus threads · All projects/)
