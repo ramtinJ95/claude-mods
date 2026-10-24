@@ -404,6 +404,9 @@ describe('paused and failed sessions', () => {
     expect(settleSessions(changes, both, T0 + 1_000).opened).toEqual([])
     // One with no harness session ID could be A, moved, so only its pane tells; the row stays until it times out.
     expect(ids([...movedA, ...sessionsOf([claude('w4:p1', null)])])).toEqual([['w2:p1', 'working'], ['w4:p1', 'working'], ['w3:p1', 'opened']])
+    // A new session of another title or harness is not B.
+    expect(settleSessions(changes, [...movedA, ...sessionsOf([{ ...claude('w4:p1', 'bbbb'), title: 'other' }])], T0 + 1_000)).toBe(changes)
+    expect(settleSessions(changes, [...movedA, ...sessionsOf([{ ...claude('w4:p1', 'bbbb'), harness: 'pi' }])], T0 + 1_000)).toBe(changes)
     // A session listed before without its harness session ID, as Claude Code at its login is, reporting one now is not B.
     const late = sessionsOf([claude('w7:p1', 'eeee')])
     expect(settleSessions({ ...changes, opened: [{ ...opened, before: { ids: ['w1:p1', 'w7:p1'], harnessSessionIds: ['aaaa'] } }] }, late, T0 + 1_000).opened).toHaveLength(1)
