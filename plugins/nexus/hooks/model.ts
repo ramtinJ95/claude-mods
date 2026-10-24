@@ -484,6 +484,10 @@ export function groupThreads(threads: readonly NexusThreadRow[], filter: string,
 
 export const closedKey = (project: string) => `closed-${project}`
 
+/** The list's rows in the order drawn, each group's fold where it folds: what the cursor walks. */
+export const listOrder = (groups: readonly ProjectGroup[]): { id: string }[] =>
+  groups.flatMap(group => [...group.open, ...(group.closed.length > 0 ? [{ id: closedKey(group.project) }] : []), ...(group.isUnfolded ? group.closed : [])])
+
 /** "3 archived, 1 deleted". */
 export function closedLabel(threads: readonly NexusThread[]): string {
   const deleted = threads.filter(thread => thread.status === 'deleted').length

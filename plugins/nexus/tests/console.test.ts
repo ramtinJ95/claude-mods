@@ -145,6 +145,20 @@ test('f filters by title in filter mode, opens a closed group it matches, and En
   expect(await fields.shows('filter')).toBe('old idea')
 })
 
+test("Enter puts the cursor on the first thread its own filter keeps, though the filter's change has not landed", async ($, on) => {
+  const cli = fake()
+  const { nexus, mount } = await boot($, on, cli)
+  await nexus('')
+  const ui = await mount()
+  await keys(ui, 'h')
+  // The cursor is on Fix login form 500s, which "o" keeps, but API docs comes first.
+  expect(await cursorOn(ui)).toBe(ID)
+  await keys(ui, 'f')
+  const fields = typing(ui)
+  await fields.submit('filter', { typing: 'o' })
+  expect(await cursorOn(ui)).toBe('th-7c0000000003')
+})
+
 test('Enter in a filter emptied again opens nothing and leaves the cursor where it was', async ($, on) => {
   const cli = fake()
   const { nexus, mount } = await boot($, on, cli)

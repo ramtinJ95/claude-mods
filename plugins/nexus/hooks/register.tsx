@@ -29,9 +29,11 @@ import {
   ago,
   applyEvent,
   closedKey,
+  groupThreads,
   isSettled,
   foldReply,
   leftOut,
+  listOrder,
   matchThread,
   parseCommand,
   parseDetail,
@@ -1291,18 +1293,17 @@ function paneActions($: EngineInterface, surface: RenderSurface): PaneActions {
     // Each change of the filter opens the closed groups it matches afresh, as the dashboard's does, so a group the
     // person folded or opened before follows the new filter.
     filter: (text, at) => run(() => update($, paneAtom, pane => (isDrawn(pane, at) ? filtered(pane, text) : pane))),
-    filterDone: (text, first) =>
+    filterDone: text =>
       run(async () => {
-        // Enter's text is the filter, though its last change may not have landed yet; the first match drawn is then
-        // another filter's. An empty filter matches every thread, so the cursor stays on its own. Enter emptied the
-        // field, so f would edit nothing: it is put again with that text.
-        const pane = await update($, paneAtom, (was): NexusPane => ({
-          ...filtered(was, text),
-          mode: 'normal',
-          listCursor: (text !== '' && text === was.filter ? first : null) ?? was.listCursor,
-          listTop: 0,
-          fields: putFields(was.fields, { [FILTER]: text }),
-        }))
+        const { threads } = await read($, listAtom)
+        // Enter's text is the filter, though its last change may not have landed yet, so its first match is read from
+        // the list here, not from a drawing made for an older filter. An empty filter keeps every thread, so the cursor
+        // stays where the person left it. Enter emptied the field, so f would edit nothing: it is put again.
+        const pane = await update($, paneAtom, (was): NexusPane => {
+          const next = filtered(was, text)
+          const first = text.trim() === '' ? undefined : listOrder(groupThreads(threads ?? [], text, next.toggled)).find(one => !one.id.startsWith('closed-'))
+          return { ...next, mode: 'normal', listCursor: first?.id ?? was.listCursor, listTop: 0, fields: putFields(was.fields, { [FILTER]: text }) }
+        })
         await focusRing($, pane)
       }),
     draft: text => run(() => update($, paneAtom, pane => ({ ...pane, draft: text }))),

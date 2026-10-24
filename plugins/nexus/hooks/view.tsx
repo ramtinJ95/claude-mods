@@ -58,6 +58,7 @@ import {
   exitCode,
   foldSummary,
   groupThreads,
+  listOrder,
   linkedPort,
   NO_CHANGE,
   portChange,
@@ -114,7 +115,7 @@ export type PaneActions = {
   /** A change of the filter, typed into the field drawn as `at`. */
   filter: (text: string, at: string) => void
   /** Enter in the filter: back to normal mode, the cursor on the first thread it keeps, or where it was when it is empty. */
-  filterDone: (text: string, first: string | null) => void
+  filterDone: (text: string) => void
   draft: (text: string) => void
   submit: (text: string) => void
   back: () => void
@@ -453,7 +454,7 @@ export function ListView(draw: Draw, scene: Scene, actions: PaneActions) {
   const groups = groupThreads(threads, pane.filter, pane.toggled)
   const now = list.polledAt ?? scene.now
   const isFiltering = pane.mode === 'filter'
-  const order = groups.flatMap(group => [...group.open, ...(group.closed.length > 0 ? [{ id: closedKey(group.project) }] : []), ...(group.isUnfolded ? group.closed : [])])
+  const order = listOrder(groups)
   const cursor = order.some(one => one.id === pane.listCursor) ? pane.listCursor : (order[0]?.id ?? null)
   const items: NavItem[] = []
   const drawn: RenderChildren[] = []
@@ -514,7 +515,7 @@ export function ListView(draw: Draw, scene: Scene, actions: PaneActions) {
     ),
     isFiltering ? (
       <Box key="filter-box" marginTop={1} borderStyle="round" borderColor="promptBorder" paddingX={1}>
-        <Input key={fieldKey(pane.fields, FILTER)} autoFocus label="⌕" value={pane.fields[FILTER]?.text} placeholder="filter threads by title" submitLabel="done" onInput={text => actions.filter(text, fieldKey(pane.fields, FILTER))} onSubmit={text => actions.filterDone(text, order.find(one => !one.id.startsWith('closed-'))?.id ?? null)} />
+        <Input key={fieldKey(pane.fields, FILTER)} autoFocus label="⌕" value={pane.fields[FILTER]?.text} placeholder="filter threads by title" submitLabel="done" onInput={text => actions.filter(text, fieldKey(pane.fields, FILTER))} onSubmit={actions.filterDone} />
       </Box>
     ) : (
       pane.filter && <Text key="filtered" color="subtle">{`⌕ ${pane.filter}   f edits it, an empty filter shows all`}</Text>
