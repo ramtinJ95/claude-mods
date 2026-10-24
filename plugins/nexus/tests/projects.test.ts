@@ -289,3 +289,15 @@ test("the threads tool lists every project's threads whatever the pane shows", a
   const { result } = (await $.tool.call({ tool: 'mcp__nexus__threads' } as never)) as { result: unknown }
   expect(new Set((JSON.parse(String(result)) as { project: string }[]).map(one => one.project))).toEqual(new Set(['web', 'api']))
 })
+
+test("Enter in the filter puts the cursor on the first thread it keeps in the project shown", async ($, on) => {
+  const cli = fake()
+  const { nexus, mount } = await boot($, on, cli)
+  await nexus('project web')
+  await nexus('')
+  const ui = await mount()
+  await keys(ui, 'hf')
+  // "d" keeps API docs, first across every project, and in web only the archived Old idea, under its fold.
+  await typing(ui).submit('filter', { typing: 'd' })
+  expect((await ui.findAll({ type: 'Button' })).find(one => one.text.startsWith('❯'))?.key).toBe('th-9b0000000002')
+})

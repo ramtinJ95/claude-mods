@@ -1495,13 +1495,13 @@ function paneActions($: EngineInterface, surface: RenderSurface): PaneActions {
     filter: (text, at) => run(() => inTurn(() => update($, paneAtom, pane => (isDrawn(pane, at) ? filtered(pane, text) : pane)))),
     filterDone: text =>
       run(() => inTurn(async () => {
-        const { threads } = await read($, listAtom)
+        const threads = inScope((await read($, listAtom)).threads ?? [], await read($, scopeAtom))
         // Enter's text is the filter, though its last change may not have landed yet, so its first match is read from
         // the list here, not from a drawing made for an older filter. An empty filter keeps every thread, so the cursor
         // stays where the person left it. Enter emptied the field, so f would edit nothing: it is put again.
         const pane = await update($, paneAtom, (was): NexusPane => {
           const next = filtered(was, text)
-          const first = text.trim() === '' ? undefined : listOrder(groupThreads(threads ?? [], text, next.toggled)).find(one => !one.id.startsWith('closed-'))
+          const first = text.trim() === '' ? undefined : listOrder(groupThreads(threads, text, next.toggled)).find(one => !one.id.startsWith('closed-'))
           return { ...next, mode: 'normal', listCursor: first?.id ?? was.listCursor, listTop: 0, fields: putFields(was.fields, { [FILTER]: text }) }
         })
         await focusRing($, pane)
