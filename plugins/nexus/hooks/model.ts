@@ -96,6 +96,12 @@ export function parsePreview(raw: unknown, command: string): NexusPreview {
   return { service: raw.service, httpsPort: num(raw.httpsPort), ready: raw.ready === true, url: raw.url }
 }
 
+/** `unpreview` prints a literal null; anything else is a CLI this mod does not know, so the close is not taken as done. */
+export function parseUnpreviewed(raw: unknown): null {
+  if (raw !== null) throw new Error(`nexus unpreview printed ${clip(JSON.stringify(raw), 60)} where docs/cli.md says null: the CLI and this mod disagree on the contract`)
+  return null
+}
+
 /** `ListeningPort[] | null`, as `show` and a watch `state` print it: a missing list is a contract error, not "unknown". */
 export function parsePorts(raw: unknown, command: string): NexusPort[] | null {
   if (raw === null) return null

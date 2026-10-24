@@ -119,6 +119,8 @@ export type Fake = {
   slow: Record<string, number>
   /** A verb that fails: its exit code and stderr. */
   fail: Record<string, { exitCode: number; error: string }>
+  /** What a verb prints in place of its usual answer, as a CLI that disagrees with docs/cli.md would. */
+  printed: Record<string, unknown>
   /** Whether `preview` and `unpreview` change what `show` lists, as the control plane does; false as if another client undid each at once. */
   publishes: boolean
   /** The answer AskUserQuestion gives. */
@@ -132,7 +134,7 @@ export type Fake = {
 }
 
 export function fake(change: Partial<Fake> = {}): Fake {
-  return { runs: [], spawns: [], threads: THREADS, detail: DETAIL, watch: [{ type: 'reset', thread: ID, entries: ENTRIES }, state('working'), live()], slow: {}, fail: {}, publishes: true, answer: 'Keep', asked: [], copied: [], opens: 0, isOpen: false, store: { themeNotice: true }, ...change }
+  return { runs: [], spawns: [], threads: THREADS, detail: DETAIL, watch: [{ type: 'reset', thread: ID, entries: ENTRIES }, state('working'), live()], slow: {}, fail: {}, printed: {}, publishes: true, answer: 'Keep', asked: [], copied: [], opens: 0, isOpen: false, store: { themeNotice: true }, ...change }
 }
 
 /** `detail` with the linked preview of `port` published, or gone when `preview` is null. */
@@ -199,7 +201,7 @@ export async function boot(...[$, on, cli]: [...Body, Fake]) {
       if (cli.publishes && (argv[0] === 'preview' || argv[0] === 'unpreview')) {
         cli.detail = withPreview(cli.detail, Number(argv[3]), argv[0] === 'preview' ? OPENED : null)
       }
-      yield { stream: 'stdout' as const, text: JSON.stringify(answers[argv[0]!]?.() ?? null) }
+      yield { stream: 'stdout' as const, text: JSON.stringify(argv[0]! in cli.printed ? cli.printed[argv[0]!] : (answers[argv[0]!]?.() ?? null)) }
     }
     return { value: { code: 0, signal: null } }
   })

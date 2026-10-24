@@ -41,6 +41,7 @@ import {
   parseProjects,
   parseStarted,
   parseThreads,
+  parseUnpreviewed,
   parseWatchEvent,
   sentence,
   stripChips,
@@ -672,12 +673,31 @@ async function previewPort($: EngineInterface, thread: string, port: number, sto
 /** `nexus unpreview <thread> <port>`: the port's linked preview closed, waking a paused pylon first. Undefined once stopped. */
 async function unpreviewPort($: EngineInterface, thread: string, port: number, stop: Promise<void>): Promise<Outcome<null> | undefined> {
   const got = await childJson($, ['unpreview', thread, String(port)], stop)
-  if (!got || got.ok) return got && { ok: true, value: null }
+  if (!got || got.ok) return got && parsed(got, parseUnpreviewed)
   // A CLI before 0.3.0 has no unpreview, and says only that it does not know the command.
   if (got.failure.message === 'unknown command unpreview') {
     return { ok: false, failure: { kind: got.failure.kind, message: `${cli} has no unpreview command: unpublishing a preview needs Nexus CLI 0.3.0 or later (nexus --version)` } }
   }
   return got
+}
+
+/**
+ * The ports with a publish or unpublish under way, as `thread:port`, whether the pane, /nexus or a model tool started
+ * it. A second operation on one is refused rather than queued: the two could finish in either order, so an unpublish
+ * that ends first would be undone by the publish it raced.
+ */
+const changing = new Set<string>()
+
+/** Runs `operation` while it holds the port, or says why it cannot: another operation holds it. */
+async function holdingPort<T>(thread: string, port: number, operation: () => Promise<T>): Promise<{ value: T } | { refused: string }> {
+  const key = `${thread}:${port}`
+  if (changing.has(key)) return { refused: `Port ${port} on ${thread} is already being published or unpublished. Try again when it finishes.` }
+  changing.add(key)
+  try {
+    return { value: await operation() }
+  } finally {
+    changing.delete(key)
+  }
 }
 
 /**
@@ -694,21 +714,19 @@ async function changePort($: EngineInterface, selected: string, port: number, ac
       const ports = pane.portChanges[selected] ?? {}
       return { ...pane, portChanges: { ...pane.portChanges, [selected]: { ...ports, [key]: change(ports[key] ?? NO_CHANGE) } } }
     })
-  // Whether the port is free and this operation takes it are one update, so two presses never both start.
-  let isStarted = false
-  await write(was => {
-    isStarted = !was.pending
-    return isStarted ? { ...was, pending: action, failure: null } : was
+  const held = await holdingPort(selected, port, async () => {
+    await write(was => ({ ...was, pending: action, failure: null }))
+    const got = action === 'open' ? await previewPort($, selected, port, current.stopped) : await unpreviewPort($, selected, port, current.stopped)
+    if (!got) return write(was => ({ ...was, pending: null }))
+    if (!got.ok) return write(was => ({ ...was, pending: null, failure: { action, message: sentence(got.failure.message) } }))
+    sequence += 1
+    const seq = sequence
+    await write(() => ({ confirmed: { preview: got.value, seq }, pending: null, failure: null }))
+    // The details list the port afresh: under Previews once opened, under Ports once closed.
+    void poll($)
   })
-  if (!isStarted) return
-  const got = action === 'open' ? await previewPort($, selected, port, current.stopped) : await unpreviewPort($, selected, port, current.stopped)
-  if (!got) return write(was => ({ ...was, pending: null }))
-  if (!got.ok) return write(was => ({ ...was, pending: null, failure: { action, message: sentence(got.failure.message) } }))
-  sequence += 1
-  const seq = sequence
-  await write(() => ({ confirmed: { preview: got.value, seq }, pending: null, failure: null }))
-  // The details list the port afresh: under Previews once opened, under Ports once closed.
-  void poll($)
+  // The pane offers no second operation of its own, so what holds the port is /nexus or a model tool.
+  if ('refused' in held) await setPane($, () => ({ notice: { text: held.refused, tone: 'error' } }))
 }
 
 async function act($: EngineInterface, action: Action, id: string): Promise<Outcome<string>> {
@@ -797,7 +815,9 @@ async function runCommand($: EngineInterface, args: string): Promise<string> {
     case 'unpublish': {
       const id = await targetOf($, command.thread)
       if (!id.ok) return say(id)
-      const closed = await unpreviewPort($, id.value, command.port, new Promise(() => {}))
+      const held = await holdingPort(id.value, command.port, () => unpreviewPort($, id.value, command.port, new Promise(() => {})))
+      if ('refused' in held) return held.refused
+      const closed = held.value
       if (closed && !closed.ok) return say(closed)
       void poll($)
       return `Unpublished port ${command.port} of ${id.value}. Publishing it again may give it a new URL.`
@@ -978,7 +998,9 @@ async function runTool($: EngineInterface, tool: keyof typeof TOOLS, input: Reco
       if (typeof input.port !== 'number') return { deny: 'port is required' }
       // An abort during the lookup above fired no event the wait below could hear: it would publish the port anyway.
       if (signal.aborted) return { deny: 'nexus: cancelled before the port was published' }
-      const got = await previewPort($, id.value, input.port, new Promise(resolve => signal.addEventListener('abort', () => resolve())))
+      const held = await holdingPort(id.value, input.port, () => previewPort($, id.value, input.port as number, new Promise(resolve => signal.addEventListener('abort', () => resolve()))))
+      if ('refused' in held) return { deny: held.refused }
+      const got = held.value
       if (!got) return { deny: 'nexus: cancelled while waiting for the preview; the port may be published already' }
       return answer(got.ok ? { ok: true, value: { thread: id.value, port: input.port, url: got.value.url, ready: got.value.ready } } : got)
     }
@@ -987,7 +1009,9 @@ async function runTool($: EngineInterface, tool: keyof typeof TOOLS, input: Reco
       if (!id.ok) return answer(id)
       if (typeof input.port !== 'number') return { deny: 'port is required' }
       if (signal.aborted) return { deny: 'nexus: cancelled before the preview was closed' }
-      const got = await unpreviewPort($, id.value, input.port, new Promise(resolve => signal.addEventListener('abort', () => resolve())))
+      const held = await holdingPort(id.value, input.port, () => unpreviewPort($, id.value, input.port as number, new Promise(resolve => signal.addEventListener('abort', () => resolve()))))
+      if ('refused' in held) return { deny: held.refused }
+      const got = held.value
       if (!got) return { deny: 'nexus: cancelled while closing the preview; it may be closed already' }
       if (!got.ok) return answer(got)
       void poll($)
