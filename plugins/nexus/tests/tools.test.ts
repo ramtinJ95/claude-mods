@@ -11,6 +11,7 @@ const said = reply(2, 'Done.')
 /** The mod's `wait` and `read` tools over a watch that prints the given events and then holds, as a live watch does. */
 async function tools(...[$, on]: Parameters<TestBody>) {
   const clock = mock.clock(on)
+  mock.env(on, {})
   let events: unknown[] = []
   on('command.register', () => ({ value: { command: 'nexus' } }))
   on('tool.register', (_, e) => ({ value: { tool: `mcp__nexus__${e.name}` } }))

@@ -1,7 +1,7 @@
 // How the pane looks: a dock with a title bar, the thread list grouped by project,
-// one thread under three tabs (its conversation drawn as a Claude Code transcript
-// draws its own, its details, its ports), the Actions menu, the key help and the
-// start form. Each function takes the surface's elements, what the atoms hold and
+// one thread under four tabs (its conversation drawn as a Claude Code transcript
+// draws its own, its details, its ports, its pylon's sessions), the Actions menu,
+// the key help and the forms. Each function takes the surface's elements, what the atoms hold and
 // the handlers the hooks module made, and holds no state of its own. Every colour
 // is a theme key, so the pane follows the person's theme.
 import type {
@@ -30,6 +30,7 @@ import type {
   NexusPortChange,
   NexusPreview,
   NexusProjectDraft,
+  NexusSessionDraft,
   NexusShown,
   NexusStartDraft,
   NexusTab,
@@ -44,7 +45,12 @@ import {
   DESIRED_TONE,
   FOLD_AT,
   HARNESS_LABEL,
+  HARNESSES,
+  NO_SESSION_CHANGES,
   SESSION_TONE,
+  SSH_HINT,
+  type ShownSession,
+  attachCommand,
   type Tone,
   TONE_COLOR,
   type ToolRow,
@@ -68,6 +74,8 @@ import {
   runOf,
   scopeLabel,
   sentence,
+  sessionName,
+  shownSessions,
   since,
   span,
   spinner,
@@ -107,6 +115,10 @@ export type Scene = {
   placement: 'dock' | 'inline'
   isFocused: boolean
   surface: RenderSurface
+  /** Claude Code runs inside Herdr, where Enter's attach opens a tab rather than copying the command. */
+  inHerdr: boolean
+  /** The CLI the `cli` option names, which the attach command shown runs. */
+  cli: string
 }
 
 export type PaneActions = {
@@ -134,6 +146,10 @@ export type PaneActions = {
   projectDraft: (change: Partial<NexusProjectDraft>, at?: string) => void
   /** Adds the project, the field Enter was pressed in carrying its text, as for the start form. */
   projectSubmit: (change?: Partial<Pick<NexusProjectDraft, 'id' | 'repoUrl' | 'branch'>>) => void
+  /** A change of the open a session form; `at` is the field it was typed into, as drawn. */
+  sessionDraft: (change: Partial<NexusSessionDraft>, at?: string) => void
+  /** Opens the session, the title's Enter carrying its text, as for the start form. */
+  sessionSubmit: (change?: Partial<Pick<NexusSessionDraft, 'title'>>) => void
 }
 
 
@@ -591,12 +607,15 @@ function threadOf(scene: Scene): { id: string; thread: NexusThread | undefined; 
   return { id, thread: detail?.thread ?? scene.list.threads?.find(one => one.id === id), detail }
 }
 
-const TAB_LABEL: Record<NexusTab, string> = { conversation: 'Conversation', details: 'Details', ports: 'Ports' }
+const TAB_LABEL: Record<NexusTab, string> = { conversation: 'Conversation', details: 'Details', ports: 'Ports', sessions: 'Sessions' }
 
 /** What the body laid out for the keys, filled in once it is drawn: Enter on the active tab acts on it as o does. */
 type Holder = { nav: Nav }
 
-function Header(draw: Draw, scene: Scene, actions: PaneActions, ports: number, holder: Holder) {
+/** The rows the Ports and Sessions tabs list, which their labels count. */
+type Counts = Partial<Record<NexusTab, number>>
+
+function Header(draw: Draw, scene: Scene, actions: PaneActions, counts: Counts, holder: Holder) {
   const { Box, Text, Button } = draw
   const { id, thread, detail } = threadOf(scene)
   const watch = scene.watch?.thread === id ? scene.watch : null
@@ -618,7 +637,8 @@ function Header(draw: Draw, scene: Scene, actions: PaneActions, ports: number, h
         ? 'not connected'
         : 'connecting'
   const tab = (key: NexusTab) => {
-    const label = `${TAB_LABEL[key]}${key === 'ports' && ports > 0 ? ` ${ports}` : ''}`
+    const count = counts[key] ?? 0
+    const label = `${TAB_LABEL[key]}${count > 0 ? ` ${count}` : ''}`
     const isOn = scene.pane.tab === key && !scene.pane.overlay
     return (
       <Button
@@ -657,6 +677,7 @@ function Header(draw: Draw, scene: Scene, actions: PaneActions, ports: number, h
         {tab('conversation')}
         {tab('details')}
         {tab('ports')}
+        {tab('sessions')}
         <Box flexGrow={1} />
         <Text color={scene.pane.overlay?.kind === 'menu' ? 'claude' : 'subtle'}>m actions</Text>
       </Box>
@@ -695,6 +716,7 @@ function menuOf(scene: Scene): { action: MenuAction; label: string }[] {
     ...(status === 'active' || status === 'idle' ? [{ action: 'archive' as const, label: 'Archive' }] : []),
     ...(status === 'archived' ? [{ action: 'unarchive' as const, label: 'Unarchive' }] : []),
     ...(detail ? [{ action: 'copy-attach' as const, label: 'Copy the attach command' }] : []),
+    ...(status === 'active' || status === 'idle' ? [{ action: 'open-session' as const, label: 'Open a session: Claude Code, pi or a shell' }, { action: 'attach' as const, label: scene.inHerdr ? 'Attach in a new Herdr tab' : 'Attach: copy nexus attach, to run in a terminal' }] : []),
     { action: 'rewatch' as const, label: 'Watch again' },
     ...(status !== 'deleted' ? [{ action: 'delete' as const, label: 'Delete…  (asks first, Keep is the default)' }] : []),
   ]
@@ -712,8 +734,10 @@ export function ThreadView(draw: Draw, scene: Scene, actions: PaneActions) {
   const canInsert = status !== 'deleted' && status !== 'archived' && !failed && (!detail || detail.hasConversation)
   const { pane } = scene
   const ports = detail ? portsOf(scene, detail) : null
+  const sessions = detail ? sessionsOf(scene, detail) : null
   const holder: Holder = { nav: { context: 'none' } }
-  const header = Header(draw, scene, actions, ports ? ports.previews.length + (ports.unpublished?.length ?? 0) : 0, holder)
+  const counts = { ports: ports ? ports.previews.length + (ports.unpublished?.length ?? 0) : 0, sessions: sessions?.length ?? 0 }
+  const header = Header(draw, scene, actions, counts, holder)
   const runLine = RunLine(draw, scene)
   const composer = Composer(draw, scene, actions, { failed, refused }, canInsert)
   const isInserting = pane.mode === 'insert' && canInsert
@@ -730,7 +754,9 @@ export function ThreadView(draw: Draw, scene: Scene, actions: PaneActions) {
           ? [['j/k', 'block'], ['d/u', 'page'], ...(scrolled ? [['ge', 'follow'] as [string, string]] : []), ['o', 'open'], ['h/l', 'tabs'], ...(canInsert ? [['i', 'write'] as [string, string]] : []), ['m', 'actions'], ['s', 'keys']]
           : pane.tab === 'details'
             ? [['j/k', 'scroll'], ['y', 'copy attach'], ['h/l', 'tabs'], ['m', 'actions'], ['s', 'keys']]
-            : [['j/k', 'move'], ['⏎', 'publish · copy'], ['x', 'unpublish'], ['y', 'copy URL'], ['h/l', 'tabs'], ['s', 'keys']]
+            : pane.tab === 'ports'
+              ? [['j/k', 'move'], ['⏎', 'publish · copy'], ['x', 'unpublish'], ['y', 'copy URL'], ['h/l', 'tabs'], ['s', 'keys']]
+              : [['j/k', 'move'], ...(scene.inHerdr ? ([['⏎', 'attach'], ['y', 'copy attach']] as [string, string][]) : [['⏎/y', 'copy attach'] as [string, string]]), ['x', 'close'], ['n', 'open'], ['h/l', 'tabs'], ['s', 'keys']]
   // A composer the thread's change took away leaves the letters to the keys.
   const footer = [runLine, composer, Notice(draw, pane), ModeLine(draw, scene, hints, isInserting ? 'insert' : 'normal')]
   const area = Math.max(3, scene.rows - rowsOf(header, scene.width) - rowsOf(footer, scene.width))
@@ -745,7 +771,9 @@ export function ThreadView(draw: Draw, scene: Scene, actions: PaneActions) {
           ? Conversation(draw, scene, actions, area, DRAWN_LIMIT - drawnChars([header, footer]), canInsert)
           : pane.tab === 'details'
             ? DetailsBody(draw, scene, area, canInsert)
-            : PortsBody(draw, scene, actions, area, canInsert)
+            : pane.tab === 'ports'
+              ? PortsBody(draw, scene, actions, area, canInsert)
+              : SessionsBody(draw, scene, actions, area, canInsert)
   holder.nav = body.nav
   return Frame(
     draw,
@@ -1378,7 +1406,7 @@ function whyNotClosable(preview: NexusPreview, change: NexusPortChange, canRun: 
   return change.pending === 'open' ? 'Its publish is still under way.' : 'It is closing already.'
 }
 
-/** The pylon, the thread's outputs, its sessions and the attach command: read-only, scrolled by the keys. */
+/** The pylon, the thread's outputs and the attach command from a shell in it: read-only, scrolled by the keys. */
 function DetailsBody(draw: Draw, scene: Scene, area: number, canInsert: boolean): Body {
   const { Box, Text } = draw
   const { detail } = threadOf(scene)
@@ -1417,16 +1445,6 @@ function DetailsBody(draw: Draw, scene: Scene, area: number, canInsert: boolean)
         <Box key={`output-${index}`} flexDirection="row" columnGap={1}>
           <Text color="subtle">{output.kind.padEnd(8)}</Text>
           <Text>{output.ref}</Text>
-        </Box>
-      ))}
-      {SectionRule(draw, scene, 'Sessions', String(detail.sessions.length), 'sessions')}
-      {detail.sessions.length === 0 && <Text color="subtle">No sessions.</Text>}
-      {detail.sessions.map(session => (
-        <Box key={`session-${session.herdrPane}`} flexDirection="row" columnGap={1}>
-          <Text>{HARNESS_LABEL[session.harness]}</Text>
-          {state(session.status, SESSION_TONE[session.status])}
-          <Text color="subtle">{session.herdrPane}</Text>
-          {session.harnessSessionId && <Text color="subtle">{`session ${session.harnessSessionId}`}</Text>}
         </Box>
       ))}
       {SectionRule(draw, scene, 'Attach', '', 'attach')}
@@ -1560,6 +1578,108 @@ function PortRow(draw: Draw, actions: PaneActions, thread: string, port: NexusPo
     </Box>,
     { key, enter: { kind: 'publish', thread, port: port.port }, x: { kind: 'say', text: `Port ${port.port} has no preview to unpublish.` } },
   ]
+}
+
+/** The sessions as the Sessions tab lists them: the details with what the person confirmed since they were read. */
+function sessionsOf(scene: Scene, detail: NexusDetail): ShownSession[] {
+  return shownSessions(detail.sessions, scene.pane.sessionChanges[detail.thread.id] ?? NO_SESSION_CHANGES, scene.now)
+}
+
+/**
+ * The pylon's sessions, one row each, as the dashboard lists them: harness, title, state, pane and session ID. The
+ * opens under way follow, then how to attach from this Mac. Enter and y give the attach command wherever the cursor
+ * is, and x closes the session under it, after asking.
+ */
+function SessionsBody(draw: Draw, scene: Scene, actions: PaneActions, area: number, canInsert: boolean): Body {
+  const { Box, Text, Button } = draw
+  const { id, detail } = threadOf(scene)
+  const empty = { context: 'sessions' as const, items: [], area, canInsert, cursor: null, thread: id }
+  if (!detail) return { nav: empty, node: <Text color="subtle">{scene.shown?.failure ? '' : 'Loading the sessions…'}</Text> }
+  const changes = scene.pane.sessionChanges[detail.thread.id] ?? NO_SESSION_CHANGES
+  const sessions = sessionsOf(scene, detail)
+  const keys = sessions.map(session => `session-${session.herdrPane}`)
+  const cursor = keys.find(key => key === scene.pane.sessionCursor) ?? keys[0] ?? null
+  const items: NavItem[] = []
+  const drawn: RenderChildren[] = []
+  let y = 0
+  const place = (node: RenderChildren, item?: Omit<NavItem, 'top' | 'height'>) => {
+    const height = rowsOf(node, scene.width)
+    if (item) items.push({ ...item, top: y, height })
+    drawn.push(node)
+    y += height
+  }
+  const attach: Effect = { kind: 'attach', thread: detail.thread.id, isCopy: false }
+  const copy: Effect = { kind: 'attach', thread: detail.thread.id, isCopy: true }
+  place(SectionRule(draw, scene, 'Sessions', String(sessions.length), 'sessions'))
+  if (sessions.length === 0 && changes.opening.length === 0) place(<Text key="no-sessions" color="subtle">No sessions. n opens one: Claude Code, pi or a shell.</Text>)
+  for (const session of sessions) {
+    const key = `session-${session.herdrPane}`
+    const isCursor = cursor === key
+    const isClosing = changes.closing.includes(session.herdrPane)
+    const [status, tone]: [string, Tone] = isClosing ? ['closing…', 'busy'] : [session.status, SESSION_TONE[session.status]]
+    place(
+      <Box key={`row-${key}`} flexDirection="column">
+        <Button key={key} plain autoFocus={isCursor ? true : undefined} onPress={() => actions.effect(attach)}>
+          {Pointer(draw, isCursor)}
+          <Text>{HARNESS_LABEL[session.harness].padEnd(12)}</Text>
+          {session.title ? <Text bold>{`${session.title}  `}</Text> : ''}
+          {Dot(draw, tone)}
+          <Text>{` ${status}  `}</Text>
+          <Text color="subtle">{session.herdrPane}</Text>
+          <Text color="subtle">{session.harnessSessionId ? `  session ${session.harnessSessionId}` : ''}</Text>
+        </Button>
+        {isCursor && !isClosing && (
+          <Box paddingLeft={4}>
+            <Text color="subtle">{scene.inHerdr ? '⏎ attaches in a new Herdr tab, y copies nexus attach, x closes the session' : '⏎ or y copies nexus attach, x closes the session'}</Text>
+          </Box>
+        )}
+      </Box>,
+      {
+        key,
+        enter: attach,
+        y: copy,
+        x: isClosing ? { kind: 'say', text: `Pane ${session.herdrPane} is already closing.` } : { kind: 'close-session', thread: detail.thread.id, pane: session.herdrPane },
+      },
+    )
+  }
+  for (const opening of changes.opening) {
+    place(
+      <Box key={`opening-${opening.id}`} flexDirection="column">
+        <Text>
+          {'  '}
+          {Dot(draw, 'busy')}
+          <Text color="subtle">{` Opening ${sessionName(opening.harness, opening.title)}…`}</Text>
+        </Text>
+        <Box paddingLeft={4}>
+          <Text color="subtle">Waking the pylon if it is paused, then starting the agent, which can take a minute.</Text>
+        </Box>
+      </Box>,
+    )
+  }
+  place(SectionRule(draw, scene, 'Attach from this Mac', '', 'attach-mac'))
+  place(<Text key="attach-command">{`  ${attachCommand(scene.cli, detail.thread.id)}`}</Text>)
+  place(
+    <Text key="attach-how" color="subtle">
+      {scene.inHerdr
+        ? "⏎ runs it in a new tab of this Herdr workspace, and y copies it. Each session is a workspace in the pylon's Herdr, so pick one there, and detach from the pylon's Herdr to come back."
+        : "⏎ and y copy it: run it in a terminal or a Herdr tab. Each session is a workspace in the pylon's Herdr, so pick one there, and detach from Herdr to come back."}
+    </Text>,
+  )
+  place(
+    <Text key="attach-ssh" color="subtle">
+      {SSH_HINT}
+    </Text>,
+  )
+  const current = items.find(item => item.key === cursor)
+  const top = keepInView(0, current, area)
+  return {
+    nav: { ...empty, items, cursor },
+    node: (
+      <Box key="sessions-list" flexDirection="column" flexShrink={0} marginTop={-top}>
+        {drawn}
+      </Box>
+    ),
+  }
 }
 
 export const START_KEYS = { title: 'start-title', project: 'start-project', node: 'start-node', branch: 'start-branch', message: 'start-message' } as const
@@ -1736,6 +1856,64 @@ export function ProjectView(draw: Draw, scene: Scene, actions: PaneActions) {
           <Box flexDirection="row" columnGap={2} marginTop={1}>
             <Button key="project-submit" variant="primary" label={draft.isAdding ? 'Adding…' : 'Add project'} onPress={() => actions.projectSubmit()} />
             <Button key="project-cancel" label="Cancel" onPress={actions.back} />
+          </Box>
+        </Box>
+      </Box>,
+    ],
+  )
+}
+
+export const SESSION_KEYS = { harness: 'open-session-harness', title: 'open-session-title' } as const
+
+/** The form that opens a session in the pylon, as `nexus session open` takes it: the harness and an optional title. */
+export function SessionView(draw: Draw, scene: Scene, actions: PaneActions) {
+  const { Box, Text, Button, Input, Select } = draw
+  const draft = scene.pane.session
+  if (!draft) return <Text color="subtle">The open a session form is closed.</Text>
+  const { id, thread } = threadOf(scene)
+  const title = { key: fieldKey(scene.pane.fields, SESSION_KEYS.title), value: scene.pane.fields[SESSION_KEYS.title]?.text }
+  return Frame(
+    draw,
+    scene,
+    [
+      <Box key="session" flexDirection="column" flexGrow={1}>
+        {TitleBar(
+          draw,
+          scene,
+          <Text>
+            <Text bold color="claude">
+              ◆ Nexus
+            </Text>
+            <Text color="subtle"> › </Text>
+            <Text bold>Open a session in the pylon</Text>
+            <Text color="subtle">{` of ${thread?.title ?? id}`}</Text>
+          </Text>,
+          'tab moves between the fields',
+          'right',
+        )}
+        <Box flexDirection="column" marginTop={1} rowGap={0}>
+          <Select
+            key={SESSION_KEYS.harness}
+            autoFocus
+            label="Harness"
+            value={draft.harness}
+            options={HARNESSES.map(harness => ({ value: harness, label: HARNESS_LABEL[harness] }))}
+            onSelect={value => actions.sessionDraft({ harness: value as NexusSessionDraft['harness'] })}
+          />
+          <Input
+            key={title.key}
+            label="Title  "
+            value={title.value}
+            placeholder={`optional; ${draft.harness} when empty`}
+            submitLabel="open"
+            onInput={value => actions.sessionDraft({ title: value }, title.key)}
+            onSubmit={value => actions.sessionSubmit({ title: value })}
+          />
+          <Text color="subtle">A Herdr workspace in the pylon's checkout with the agent in it. Waking a paused pylon and starting the agent can take a minute.</Text>
+          {Notice(draw, scene.pane)}
+          <Box flexDirection="row" columnGap={2} marginTop={1}>
+            <Button key="open-session-submit" variant="primary" label="Open session" onPress={() => actions.sessionSubmit()} />
+            <Button key="open-session-cancel" label="Cancel" onPress={actions.back} />
           </Box>
         </Box>
       </Box>,

@@ -14,7 +14,10 @@ import type {
   NexusProject,
   NexusRow,
   NexusRunState,
+  NexusHarness,
+  NexusOpenedSession,
   NexusSession,
+  NexusSessionChanges,
   NexusStrip,
   NexusThread,
   NexusThreadRow,
@@ -126,7 +129,9 @@ export function portChange(changes: Record<string, NexusPortChange>, port: numbe
   return change.confirmed && change.confirmed.seq < askedSeq ? { ...change, confirmed: null } : change
 }
 
-const HARNESS = new Set(['claude-code', 'pi', 'shell'])
+/** The agents `session open` can start in a pylon, its default first. */
+export const HARNESSES: readonly NexusHarness[] = ['claude-code', 'pi', 'shell']
+const HARNESS = new Set<string>(HARNESSES)
 const SESSION = new Set(['working', 'idle', 'blocked', 'done', 'unknown'])
 const OUTPUT = new Set(['branch', 'diff', 'preview', 'file'])
 
@@ -156,6 +161,8 @@ export function parseDetail(json: unknown): NexusDetail {
               harness: HARNESS.has(str(raw.harness)) ? (raw.harness as NexusSession['harness']) : 'shell',
               harnessSessionId: strOrNull(raw.harnessSessionId),
               status: SESSION.has(str(raw.status)) ? (raw.status as NexusSession['status']) : 'unknown',
+              // Absent from a control plane older than CLI 0.5.0, which means none.
+              title: strOrNull(raw.title),
             },
           ]
         : [],
@@ -180,6 +187,20 @@ export function parseProjects(json: unknown): NexusProject[] {
 }
 
 /** `nexus project add`'s answer: the project it added. */
+/** `session open`'s `OpenedSession`, each field required: the pane is what a close and the Sessions tab name it by. */
+export function parseOpenedSession(json: unknown): NexusOpenedSession {
+  if (!isRecord(json) || typeof json.herdrPane !== 'string' || typeof json.title !== 'string' || !HARNESS.has(str(json.harness))) {
+    throw contractError('session open', 'no OpenedSession')
+  }
+  return { herdrPane: json.herdrPane, harness: json.harness as NexusHarness, title: json.title }
+}
+
+/** `session close` prints a literal null. */
+export function parseSessionClosed(raw: unknown): null {
+  if (raw !== null) throw new Error(`nexus session close printed ${clip(JSON.stringify(raw), 60)} where docs/cli.md says null: the CLI and this mod disagree on the contract`)
+  return null
+}
+
 export function parseAdded(json: unknown): NexusProject {
   if (!isRecord(json) || typeof json.id !== 'string') throw new Error('nexus project add did not print the project it added')
   return projectOf(json.id, json)
@@ -568,7 +589,76 @@ export function previewLook(detail: Pick<NexusDetail, 'thread' | 'pylon'>, previ
 
 /** Who opened the thread's pane, what it runs and where: the dashboard's session labels. */
 export const HARNESS_LABEL: Record<NexusSession['harness'], string> = { 'claude-code': 'Claude Code', pi: 'pi', shell: 'Shell' }
-export const SESSION_TONE: Record<NexusSession['status'], Tone> = { working: 'work', idle: 'idle', blocked: 'bad', done: 'ok', unknown: 'muted' }
+export const SESSION_TONE: Record<ShownSession['status'], Tone> = { working: 'work', idle: 'idle', blocked: 'bad', done: 'ok', unknown: 'muted', opened: 'muted' }
+
+/** The command that attaches a terminal on this Mac to the thread's pylon, through the CLI `cli` names, as a shell takes it. */
+export const attachCommand = (cli: string, thread: string) => `${shellQuote(cli)} attach ${shellQuote(thread)}`
+/** `word` as one word to a POSIX shell or zsh: bare when nothing in it is special, else single-quoted. */
+export const shellQuote = (word: string) => (/^[\w@%+=:,./-]+$/.test(word) ? word : `'${word.replaceAll("'", `'\\''`)}'`)
+
+/** The pane of the tab `herdr tab create` printed, or null for output that names none. */
+export function parseHerdrTab(stdout: string): string | null {
+  try {
+    const json: unknown = JSON.parse(stdout)
+    const pane = isRecord(json) && isRecord(json.result) && isRecord(json.result.root_pane) ? json.result.root_pane.pane_id : undefined
+    return typeof pane === 'string' && pane ? pane : null
+  } catch {
+    return null
+  }
+}
+
+/** Why a herdr command failed: the message of the error it printed, else its output, else its exit code. */
+export function herdrError(exitCode: number, stdout: string, stderr: string): string {
+  for (const text of [stderr, stdout]) {
+    try {
+      const json: unknown = JSON.parse(text)
+      if (isRecord(json) && isRecord(json.error) && typeof json.error.message === 'string') return json.error.message
+    } catch {
+      // Not herdr's JSON: its usage text or a shell's message.
+    }
+  }
+  return stderr.trim() || stdout.trim() || `herdr exited with ${exitCode}`
+}
+
+/** How to reach a pylon's node when ssh cannot as it is, which the CLI's own failure repeats. */
+export const SSH_HINT = `Attaching needs Nexus CLI 0.5.0 and ssh to the pylon's node. When ssh needs another user or an alias for the node, set "ssh": {"<node>": "<user@host or alias>"} in ~/.config/nexus/cli.json, or NEXUS_ATTACH, as the CLI's docs/cli.md describes.`
+
+/** A session as a person names it: its harness, and its title when it has one, such as `Claude Code "login"`. */
+export const sessionName = (harness: NexusHarness, title: string | null | undefined) => `${HARNESS_LABEL[harness]}${title ? ` "${title}"` : ''}`
+
+/**
+ * How long an open or close confirmed in the pane outweighs details that do not show it. The node reads its sessions
+ * again once the CLI has answered, so the next details can still show them as they were.
+ */
+export const SESSION_SETTLE_MS = 30_000
+
+export const NO_SESSION_CHANGES: NexusSessionChanges = { opening: [], opened: [], closing: [], closed: {} }
+
+/** A session as the Sessions tab lists it: `opened` is one the CLI opened that the node has not reported yet. */
+export type ShownSession = Omit<NexusSession, 'status'> & { status: NexusSession['status'] | 'opened' }
+
+/**
+ * The sessions as the details list them, with the confirmations they do not show yet, for `SESSION_SETTLE_MS` at
+ * most: a pane just closed is gone, and a session just opened is there, `opened` until the node reports it.
+ */
+export function shownSessions(sessions: readonly NexusSession[], changes: NexusSessionChanges, now: number): ShownSession[] {
+  const isFresh = (at: number) => now - at < SESSION_SETTLE_MS
+  const closed = (pane: string) => changes.closed[pane] !== undefined && isFresh(changes.closed[pane])
+  const listed = sessions.filter(session => !closed(session.herdrPane))
+  const opened = changes.opened
+    .filter(({ session, at }) => isFresh(at) && !closed(session.herdrPane) && !sessions.some(one => one.herdrPane === session.herdrPane))
+    .map(({ session }): ShownSession => ({ ...session, status: 'opened', harnessSessionId: null }))
+  return [...listed, ...opened]
+}
+
+/** `changes` without the confirmations that `sessions`, just read, show, or that have waited `SESSION_SETTLE_MS`; the same object when none went. */
+export function settleSessions(changes: NexusSessionChanges, sessions: readonly NexusSession[], now: number): NexusSessionChanges {
+  const listed = (pane: string) => sessions.some(session => session.herdrPane === pane)
+  const opened = changes.opened.filter(({ session, at }) => !listed(session.herdrPane) && now - at < SESSION_SETTLE_MS)
+  const closed = Object.fromEntries(Object.entries(changes.closed).filter(([pane, at]) => listed(pane) && now - at < SESSION_SETTLE_MS))
+  if (opened.length === changes.opened.length && Object.keys(closed).length === Object.keys(changes.closed).length) return changes
+  return { ...changes, opened, closed }
+}
 
 export type ToolRow = Extract<NexusRow, { kind: 'tool' }>
 
@@ -737,6 +827,10 @@ export type NexusCommand =
   /** `project` undefined asks which project is shown, null shows every project. */
   | { verb: 'scope'; project?: string | null }
   | { verb: 'add-project'; id: string; repoUrl: string; node: string; branch?: string }
+  | { verb: 'session-open'; thread: string; harness?: NexusHarness; title?: string }
+  /** Without `pane`, it asks which of the thread's sessions to close. */
+  | { verb: 'session-close'; thread: string; pane?: string }
+  | { verb: 'attach'; thread: string }
   | { verb: 'invalid'; reason: string }
 
 export const USAGE = [
@@ -749,6 +843,9 @@ export const USAGE = [
   '/nexus strip on|off             show or hide the threads above the prompt',
   "/nexus project [id|all]         which project's threads show, or the one shown",
   '/nexus project add <id> <repo-url> --node <node> [--branch <branch>]',
+  '/nexus session open <id> [--harness claude-code|pi|shell] [--title T]',
+  '/nexus session close <id> [pane]  without a pane, asks which',
+  '/nexus session attach <id>      the command that attaches a terminal to its sessions',
   '/nexus archive|unarchive|abort|retry|retry-pylon|delete [id]',
   'An ID may be a unique prefix (4f2a or th-4f2a). Without one, an action takes the thread open in the pane.',
 ].join('\n')
@@ -802,12 +899,77 @@ export function parseCommand(args: string): NexusCommand {
       if (after) return invalid('/nexus project takes one project ID, all, or add.')
       return first ? { verb: 'scope', project: first === 'all' ? null : first } : { verb: 'scope' }
     }
+    case 'session': {
+      const parts = words(rest)
+      return parts ? session(parts, invalid) : invalid('/nexus session has a quote it does not close.')
+    }
     default: {
       if (!Object.hasOwn(ACTIONS, verb)) return invalid(`/nexus has no ${verb}.`)
       const [thread, extra] = split(rest)
       if (extra) return invalid(`/nexus ${verb} takes at most one thread ID.`)
       return { verb: 'action', action: verb as Action, ...(thread ? { thread } : {}) }
     }
+  }
+}
+
+/**
+ * `text` split into words as a shell splits them, so a title can hold spaces: at whitespace outside quotes, a quote
+ * anywhere in a word quoting up to its close (`--title="two words"`), and a backslash outside single quotes taking the
+ * next character as it is. Null for a quote left open.
+ */
+function words(text: string): string[] | null {
+  const found: string[] = []
+  let word: string | null = null
+  let quote: '"' | "'" | null = null
+  for (let at = 0; at < text.length; at++) {
+    const char = text[at]!
+    if (quote) {
+      if (char === quote) quote = null
+      else if (char === '\\' && quote === '"' && (text[at + 1] === '"' || text[at + 1] === '\\')) word = `${word ?? ''}${text[++at]}`
+      else word = `${word ?? ''}${char}`
+    } else if (/\s/.test(char)) {
+      if (word !== null) found.push(word)
+      word = null
+    } else if (char === '"' || char === "'") {
+      quote = char
+      word ??= ''
+    } else if (char === '\\' && at + 1 < text.length) word = `${word ?? ''}${text[++at]}`
+    else word = `${word ?? ''}${char}`
+  }
+  if (quote) return null
+  if (word !== null) found.push(word)
+  return found
+}
+
+/** `/nexus session open|close|attach` and their arguments. */
+function session([command, ...args]: readonly string[], invalid: (reason: string) => NexusCommand): NexusCommand {
+  switch (command) {
+    case 'open': {
+      const positional: string[] = []
+      const flags: { harness?: string; title?: string } = {}
+      for (let at = 0; at < args.length; at++) {
+        const arg = args[at]!
+        if (!arg.startsWith('--')) {
+          positional.push(arg)
+          continue
+        }
+        const [flag, inline] = arg.slice(2).split(/=(.*)/s) as [string, string | undefined]
+        if (flag !== 'harness' && flag !== 'title') return invalid(`/nexus session open takes only --harness and --title, not --${flag}.`)
+        const value = inline ?? args[++at]
+        if (!value) return invalid(`/nexus session open needs a ${flag} after --${flag}.`)
+        flags[flag] = value
+      }
+      if (positional.length !== 1) return invalid('/nexus session open takes one thread ID.')
+      if (flags.harness !== undefined && !HARNESS.has(flags.harness)) return invalid(`/nexus session open takes a harness of ${HARNESSES.join(', ')}, not ${flags.harness}.`)
+      return { verb: 'session-open', thread: positional[0]!, ...(flags.harness ? { harness: flags.harness as NexusHarness } : {}), ...(flags.title ? { title: flags.title } : {}) }
+    }
+    case 'close':
+      if (args.length === 0 || args.length > 2) return invalid('/nexus session close takes a thread ID, and may name a pane.')
+      return { verb: 'session-close', thread: args[0]!, ...(args[1] === undefined ? {} : { pane: args[1] }) }
+    case 'attach':
+      return args.length === 1 ? { verb: 'attach', thread: args[0]! } : invalid('/nexus session attach takes one thread ID.')
+    default:
+      return invalid(command === undefined ? '/nexus session takes open, close or attach.' : `/nexus session has no ${command}.`)
   }
 }
 

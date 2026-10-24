@@ -16,14 +16,17 @@ const PANE: NexusPane = {
   scroll: null,
   detailsTop: 0,
   portCursor: null,
+  sessionCursor: null,
   toggled: {},
   filter: '',
   draft: '',
   start: null,
   project: null,
+  session: null,
   fields: {},
   notice: null,
   portChanges: {},
+  sessionChanges: {},
 }
 
 /** Items of the given heights stacked from the top, keyed `b0`, `b1`, … */

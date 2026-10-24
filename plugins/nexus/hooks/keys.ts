@@ -72,12 +72,14 @@ export const HELP: readonly { title: string; keys: readonly [keys: string, what:
     keys: [
       ['h l', 'previous · next tab; h on Conversation goes back to the threads'],
       ['i a', 'write a message (insert mode); enter sends, an empty enter or esc leaves'],
-      ['m', 'actions: abort, retry, archive, delete, start again, copy attach'],
+      ['m', 'actions: abort, retry, archive, delete, start again, copy attach, sessions'],
+      ['n', 'open a session in the pylon: Claude Code, pi or a shell'],
       ['y', 'copy the block under the cursor, a URL, or the attach command'],
       ['r', 'watch again'],
     ],
   },
   { title: 'Ports', keys: [['enter', 'publish a port, or copy a preview’s URL'], ['x', 'unpublish the linked preview under the cursor']] },
+  { title: 'Sessions', keys: [['enter', 'attach in a new Herdr tab, inside Herdr; else copy nexus attach'], ['y', 'copy nexus attach, to run in a terminal'], ['x', 'close the session under the cursor, after asking'], ['n', 'open a session']] },
 ]
 
 /** What a single press asks for that only the hooks module can do. */
@@ -101,11 +103,17 @@ export type Effect =
   /** A project chosen in the picker, null for every project. */
   | { kind: 'scope'; project: string | null }
   | { kind: 'new-project' }
+  /** The open a session form, for the thread shown. */
+  | { kind: 'new-session' }
+  /** Asks, then closes the session in `pane` of `thread`. */
+  | { kind: 'close-session'; thread: string; pane: string }
+  /** `nexus attach` for `thread`'s sessions: run in a new Herdr tab inside Herdr, else copied; `isCopy` always copies. */
+  | { kind: 'attach'; thread: string; isCopy: boolean }
   | { kind: 'refresh' }
   | { kind: 'close' }
 
 /** What the Actions menu runs: the CLI's verbs on a thread, and the pane's own. */
-export type MenuAction = Action | 'start-again' | 'copy-attach' | 'rewatch'
+export type MenuAction = Action | 'start-again' | 'copy-attach' | 'open-session' | 'attach' | 'rewatch'
 
 /** A press on an item that changes only the pane: a fold, a tool row or a closed group opened or closed. */
 export type Toggle = { kind: 'toggle'; key: string; isOpen: boolean }
@@ -123,12 +131,14 @@ export type Nav =
   | { context: 'details'; total: number; area: number; canInsert: boolean; attach: string | null }
   /** `cursor` as drawn: a port that moved between Previews and Ports keeps it. */
   | { context: 'ports'; items: NavItem[]; area: number; canInsert: boolean; cursor: string | null }
+  /** Enter and y act on the thread, whatever row the cursor is on: they give the attach command. */
+  | { context: 'sessions'; items: NavItem[]; area: number; canInsert: boolean; cursor: string | null; thread: string }
   | { context: 'menu'; items: NavItem[]; area: number }
   | { context: 'projects'; items: NavItem[]; area: number; drawn: string }
   | { context: 'help'; total: number; area: number }
   | { context: 'none' }
 
-export const TABS: readonly NexusTab[] = ['conversation', 'details', 'ports']
+export const TABS: readonly NexusTab[] = ['conversation', 'details', 'ports', 'sessions']
 
 /** The keys of the composer and the list's filter, the two fields that take typed letters. */
 export const COMPOSE = 'compose'
@@ -294,7 +304,7 @@ export function press(before: NexusPane, pressed: Command, nav: Nav): Step {
   }
 
   // What every thread tab answers alike.
-  const thread = nav.context === 'conversation' || nav.context === 'details' || nav.context === 'ports' ? nav : null
+  const thread = nav.context === 'conversation' || nav.context === 'details' || nav.context === 'ports' || nav.context === 'sessions' ? nav : null
   if (thread) {
     switch (command) {
       case 'menu':
@@ -320,8 +330,9 @@ export function press(before: NexusPane, pressed: Command, nav: Nav): Step {
       return nav.context === 'list' || thread ? done({ overlay: { kind: 'projects', cursor: null } }, [{ kind: 'projects' }]) : done()
     case 'close':
       return done({}, [{ kind: 'close' }])
+    // In a thread, n opens a session in its pylon, as in pi-nexus; the list starts a thread.
     case 'new':
-      return done({}, [{ kind: 'new' }])
+      return done({}, [thread ? { kind: 'new-session' } : { kind: 'new' }])
     case 'refresh':
       return done({}, [{ kind: 'refresh' }])
   }
@@ -371,6 +382,16 @@ export function press(before: NexusPane, pressed: Command, nav: Nav): Step {
       if (command === 'yank') return apply(current?.y)
       return done()
     }
+    case 'sessions': {
+      const current = nav.items.find(item => item.key === nav.cursor) ?? nav.items[0]
+      if (isMotion(command)) {
+        const key = moveOver(nav.items, current?.key ?? null, command, nav.area)
+        return done({ sessionCursor: key ?? null }, key ? [{ kind: 'focus', key }] : [])
+      }
+      if (command === 'open' || command === 'yank') return done({}, [{ kind: 'attach', thread: nav.thread, isCopy: command === 'yank' }])
+      if (command === 'unpublish') return current?.x ? apply(current.x) : done({}, [{ kind: 'say', text: 'No session to close. n opens one.' }])
+      return done()
+    }
     default:
       return done()
   }
@@ -386,6 +407,7 @@ export function ringMoved(pane: NexusPane, element: string): NexusPane {
   if (element.startsWith('menu-') && pane.overlay?.kind === 'menu') return { ...base, overlay: { kind: 'menu', cursor: element } }
   if (element.startsWith('scope-') && pane.overlay?.kind === 'projects') return { ...base, overlay: { kind: 'projects', cursor: element } }
   if (element.startsWith('preview-') || element.startsWith('port-')) return { ...base, portCursor: element }
+  if (element.startsWith('session-')) return { ...base, sessionCursor: element }
   if (pane.view === 'list') return { ...base, listCursor: element }
   if (pane.view === 'start' && pane.start) return { ...base, start: { ...pane.start, focused: field } }
   return base

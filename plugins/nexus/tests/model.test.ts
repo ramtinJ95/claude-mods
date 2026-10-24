@@ -6,6 +6,7 @@ import {
   type WatchEvent,
   appendEntry,
   applyEvent,
+  attachCommand,
   blocks,
   clip,
   clock,
@@ -14,6 +15,7 @@ import {
   foldReply,
   foldSummary,
   groupThreads,
+  herdrError,
   isSettled,
   keepTail,
   leftOut,
@@ -21,9 +23,11 @@ import {
   parseCommand,
   parseDetail,
   parseFailure,
+  parseHerdrTab,
   parseThreads,
   parseWatchEvent,
   previewLook,
+  shellQuote,
   since,
   threadState,
 } from '../hooks/model'
@@ -185,7 +189,7 @@ describe('the console', () => {
     expect(() => parseThreads([{ ...THREADS[0], pylon: null }])).toThrow('without its pylon')
     const detail = parseDetail(DETAIL)
     expect(detail).toMatchObject({ desired: 'running', attach: 'herdr --session nexus-7f3a', hasConversation: true, pylon: { retryRefused: null, observedAt: DETAIL.pylon.observedAt } })
-    expect(detail.sessions).toEqual([{ herdrPane: 'nexus:1.2', harness: 'claude-code', harnessSessionId: '9c1e', status: 'working' }])
+    expect(detail.sessions).toEqual([{ herdrPane: 'nexus:1.2', harness: 'claude-code', harnessSessionId: '9c1e', status: 'working', title: null }])
     expect(() => parseDetail({ ...DETAIL, desired: undefined })).toThrow('nexus show printed no desired')
     expect(() => parseDetail({ ...DETAIL, attach: undefined })).toThrow('nexus show printed no attach')
   })
@@ -322,5 +326,44 @@ describe('the console', () => {
     expect(previewLook(detail, api!)).toMatchObject({ linked: false, label: 'starting' })
     expect(previewLook({ ...detail, pylon: { ...detail.pylon, actualState: 'paused' } }, api!)).toMatchObject({ linked: true, hint: 'Opening it wakes the pylon.' })
     expect(previewLook({ ...detail, thread: { ...detail.thread, status: 'archived' } }, web!)).toMatchObject({ linked: false, hint: 'Unarchive the thread to open it.' })
+  })
+})
+
+describe('/nexus session', () => {
+  test('quotes anywhere in a word, as a shell reads them: --title="two words" is one title, its quotes gone', () => {
+    const id = 'th-4f2a00000001'
+    expect(parseCommand(`session open ${id} --title="two words"`)).toEqual({ verb: 'session-open', thread: id, title: 'two words' })
+    expect(parseCommand(`session open ${id} --title="login"`)).toEqual({ verb: 'session-open', thread: id, title: 'login' })
+    expect(parseCommand(`session open ${id} --title 'two words' --harness=shell`)).toEqual({ verb: 'session-open', thread: id, title: 'two words', harness: 'shell' })
+    expect(parseCommand(`session open ${id} --title=it\\'s" a "test`)).toEqual({ verb: 'session-open', thread: id, title: "it's a test" })
+    expect(parseCommand(`session open ${id} --title="it's"`)).toEqual({ verb: 'session-open', thread: id, title: "it's" })
+    expect(parseCommand(`session open ${id} --title="two words`)).toEqual({ verb: 'invalid', reason: expect.stringMatching(/^\/nexus session has a quote it does not close\./) })
+  })
+})
+
+describe('attaching in a Herdr tab', () => {
+  test('the attach command names the configured CLI, quoted for a shell, and plain nexus by default', () => {
+    expect(attachCommand('nexus', 'th-4f2a00000001')).toBe('nexus attach th-4f2a00000001')
+    expect(attachCommand('/Users/me/My Tools/nexus', 'th-4f2a00000001')).toBe("'/Users/me/My Tools/nexus' attach th-4f2a00000001")
+  })
+
+  test('shellQuote leaves a plain word bare and single-quotes anything else, a quote inside closed and escaped', () => {
+    expect(shellQuote('nexus')).toBe('nexus')
+    expect(shellQuote('/usr/local/bin/nexus')).toBe('/usr/local/bin/nexus')
+    expect(shellQuote('th-4f2a00000001')).toBe('th-4f2a00000001')
+    expect(shellQuote('/Users/me/My Tools/nexus')).toBe("'/Users/me/My Tools/nexus'")
+    expect(shellQuote("/opt/it's/nexus")).toBe("'/opt/it'\\''s/nexus'")
+    expect(shellQuote("a b'c")).toBe("'a b'\\''c'")
+    expect(shellQuote('$(rm -rf ~); `x`')).toBe("'$(rm -rf ~); `x`'")
+    expect(shellQuote('')).toBe("''")
+  })
+
+  test("herdr's tab and its errors: the root pane, else null; the error's message, else what it printed, else its exit code", () => {
+    expect(parseHerdrTab('{"id":"cli:tab:create","result":{"tab":{"tab_id":"w7:t1"},"root_pane":{"pane_id":"w7:p2"}}}')).toBe('w7:p2')
+    expect(parseHerdrTab('{"result":{}}')).toBe(null)
+    expect(parseHerdrTab('not json')).toBe(null)
+    expect(herdrError(1, '', '{"error":{"code":"workspace_not_found","message":"workspace w9 not found"},"id":"cli:tab:create"}\n')).toBe('workspace w9 not found')
+    expect(herdrError(2, '', 'error: unexpected argument --nope\n')).toBe('error: unexpected argument --nope')
+    expect(herdrError(1, '', '')).toBe('herdr exited with 1')
   })
 })
