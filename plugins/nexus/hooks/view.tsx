@@ -883,7 +883,7 @@ function DetailsBody(draw: Draw, scene: Scene, actions: PaneActions) {
               <Text bold>{preview.service}</Text>
               {port !== undefined && preview.service !== `port-${port}` && <Text color="subtle">{`port ${port}`}</Text>}
               <Text color="subtle">{look.label}</Text>
-              {look.linked ? <Link href={preview.url} label={preview.url} /> : <Text color="subtle">{preview.url}</Text>}
+              {look.linked ? <Link href={preview.url} /> : <Text color="subtle">{preview.url}</Text>}
             </Box>
             {look.hint && <Text color="subtle">{`  ${look.hint}`}</Text>}
           </Box>
@@ -949,7 +949,7 @@ function PortRow(draw: Draw, scene: Scene, actions: PaneActions, port: NexusPort
       <Box key={key} flexDirection="row" columnGap={1}>
         {Dot(draw, 'ok')}
         <Text bold>{String(port.port)}</Text>
-        <Link href={opening.preview.url} label={opening.preview.url} />
+        <Link href={opening.preview.url} />
       </Box>
     )
   }
