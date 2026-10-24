@@ -257,7 +257,7 @@ export const field = async (ui: Ui, name: string) => (await ui.findAll({ type: '
 /**
  * What the fields of a mounted pane show, as 2.1.310's field store keeps it (read from its renderer): the typing, by
  * key, until a drawing gives that key a `value` other than the one this mount last drew, then that `value`; Enter empties
- * the field it submits once its hooks are done, unless it was typed in since. The kit
+ * the field it submits once its hooks answer, unless it was typed in since, and the pane's answer at once. The kit
  * draws no fields, so this reads each drawing the test takes as the engine reads every drawing. A pane closed loses its
  * store, so a pane opened again is a new mount with a new `typing`.
  */
@@ -281,9 +281,10 @@ export function typing(ui: Ui) {
       await ui.input({ key, text, kind: 'change' })
     },
     /**
-     * Enter in the field `name`: the engine delivers its text and, once the submit's hooks are done, empties the field
-     * unless it was typed in since. `typing` is text whose changes have not landed yet; `during` types while the
-     * submit runs.
+     * Enter in the field `name`: the engine delivers its text and empties the field once the submit's hooks answer,
+     * which the pane's do at once, as they start their work without waiting for it. The kit's `ui.input` waits for that
+     * work, so the field is emptied as the submit is sent. `typing` is text whose changes have not landed yet; `during`
+     * types into the emptied field while the submit's work runs.
      */
     async submit(name: string, options: { typing?: string; during?: () => Promise<void> } = {}) {
       await read()
@@ -291,9 +292,9 @@ export function typing(ui: Ui) {
       if (options.typing !== undefined) typed.set(key, options.typing)
       const text = typed.get(key) ?? ((await ui.find({ type: 'Input', key }))?.props.value as string | undefined) ?? ''
       const submitted = ui.input({ key, text, kind: 'submit' })
+      typed.set(key, '')
       await options.during?.()
       await submitted
-      if ((typed.get(key) ?? text) === text) typed.set(key, '')
     },
     /** Types `text` over the field `key` as it is drawn now, its change still on its way to the mod. */
     async typeInto(key: string, text: string) {

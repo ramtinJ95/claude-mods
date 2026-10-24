@@ -1338,7 +1338,7 @@ test('a start the control plane refuses stays on the form with its reason', asyn
   expect(await fields.shows('start-title')).toBe('Try it again')
 })
 
-test('Enter starts the text it delivered, and keys typed after it leave the form sending what it shows', async ($, on) => {
+test('Enter starts the text it delivered, and keys typed after it are the next draft', async ($, on) => {
   const cli = fake({ fail: { start: { exitCode: 1, error: 'no image is current' } } })
   const { nexus, mount } = await boot($, on, cli)
   await nexus('')
@@ -1348,15 +1348,13 @@ test('Enter starts the text it delivered, and keys typed after it leave the form
   await fields.type('start-title', 'Try it')
   // The engine empties the field as soon as the submit's hooks answer, so the next keys land in it before the CLI runs.
   const key = await field(ui, 'start-title')
-  const submitted = ui.input({ key, text: 'Try it', kind: 'submit' })
-  await fields.typeInto(key, 'zz')
-  await submitted
+  await fields.submit('start-title', { during: () => fields.typeInto(key, 'zz') })
   expect(await shows(ui, 'no image is current.')).toBe(true)
   expect(cli.runs.filter(argv => argv[0] === 'start')).toEqual([['start', '--json', '--project=web', '--title=Try it']])
-  // Whether those keys stayed in the field or went with it as the form put it back, the button sends what it shows.
-  const shown = await fields.shows('start-title')
+  // The field keeps the keys, and the form holds them: the button sends what the field shows.
+  expect(await fields.shows('start-title')).toBe('zz')
   await ui.press({ key: 'start-submit' })
-  expect(cli.runs.filter(argv => argv[0] === 'start').at(-1)).toEqual(['start', '--json', '--project=web', `--title=${shown}`])
+  expect(cli.runs.filter(argv => argv[0] === 'start').at(-1)).toEqual(['start', '--json', '--project=web', '--title=zz'])
 })
 
 test("a thread whose agent has not acted yet says never, as Details does, not the time since 1970", async ($, on) => {
