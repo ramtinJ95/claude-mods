@@ -404,8 +404,24 @@ describe('paused and failed sessions', () => {
     expect(settleSessions(changes, both, T0 + 1_000).opened).toEqual([])
     // One with no harness session ID could be A, moved, so only its pane tells; the row stays until it times out.
     expect(ids([...movedA, ...sessionsOf([claude('w4:p1', null)])])).toEqual([['w2:p1', 'working'], ['w4:p1', 'working'], ['w3:p1', 'opened']])
+    // A session listed before without its harness session ID, as Claude Code at its login is, reporting one now is not B.
+    const late = sessionsOf([claude('w7:p1', 'eeee')])
+    expect(settleSessions({ ...changes, opened: [{ ...opened, before: { ids: ['w1:p1', 'w7:p1'], harnessSessionIds: ['aaaa'] } }] }, late, T0 + 1_000).opened).toHaveLength(1)
     // Without what was listed before, only the pane tells.
     expect(ids(both, { ...changes, opened: [{ ...opened, before: null }] })).toEqual([['w2:p1', 'working'], ['w4:p1', 'working'], ['w3:p1', 'opened']])
+  })
+
+  test("stale details listing the pane's earlier session in the open's pane do not settle the open", () => {
+    // The earlier "review" in w3:p1 closed, and the open got its pane; details read before the node noticed still list it.
+    const opened: NexusSessionChanges['opened'][number] = { session: { herdrPane: 'w3:p1', harness: 'claude-code', title: 'review' }, at: T0, before: { ids: ['w3:p1'], harnessSessionIds: ['old1'] } }
+    const changes = { opening: [], opened: [opened], closing: [], closed: {} }
+    const stale = sessionsOf([{ ...PANE, herdrPane: 'w3:p1', id: 'w3:p1', state: 'running', harnessSessionId: 'old1' }])
+    expect(settleSessions(changes, stale, T0 + 1_000)).toBe(changes)
+    expect(shownSessions(stale, changes, T0 + 1_000).map(row => [row.id, row.status])).toEqual([['w3:p1', 'working'], ['w3:p1', 'opened']])
+    expect(settleSessions(changes, stale, T0 + 30_000).opened).toEqual([])
+    // The open's own session in that pane settles it.
+    const fresh = sessionsOf([{ ...PANE, herdrPane: 'w3:p1', id: 'w3:p1', state: 'running', harnessSessionId: 'new1' }])
+    expect(settleSessions(changes, fresh, T0 + 1_000).opened).toEqual([])
   })
 
   test('two opens of one harness and title never settle against one session', () => {

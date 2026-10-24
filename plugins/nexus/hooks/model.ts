@@ -684,7 +684,8 @@ type Closed = NexusSessionChanges['closed'][string]
 
 /**
  * The opens the details list, each against a session of its own. A pane names one session, so an open listed in its
- * pane is matched first. A wake can move a session to another pane, so an open is also matched by a session of its
+ * pane is matched first, unless that session's harness session ID was listed before the open: stale details then show
+ * the pane's earlier session. A wake can move a session to another pane, so an open is also matched by a session of its
  * harness and title whose harness session ID the details did not list when the open was confirmed (`before`), which an
  * existing session that moved keeps. A session with no harness session ID could be one that moved, so it matches only
  * by pane, and an open nothing matches keeps its row until `SESSION_SETTLE_MS`.
@@ -698,7 +699,9 @@ function listedOpens(opens: readonly Opened[], sessions: readonly NexusSession[]
     taken.add(session)
     listed.add(one)
   }
-  for (const one of opens) claim(one, session => session.herdrPane === one.session.herdrPane)
+  // Stale details can still list the pane's earlier session there: one whose harness session ID was listed before is not the open's.
+  const wasListed = (one: Opened, session: NexusSession) => session.harnessSessionId !== null && (one.before?.harnessSessionIds.includes(session.harnessSessionId) ?? false)
+  for (const one of opens) claim(one, session => session.herdrPane === one.session.herdrPane && !wasListed(one, session))
   for (const one of opens) {
     const { before } = one
     if (listed.has(one) || !before) continue
@@ -706,7 +709,7 @@ function listedOpens(opens: readonly Opened[], sessions: readonly NexusSession[]
       one,
       session =>
         session.harnessSessionId !== null &&
-        !before.harnessSessionIds.includes(session.harnessSessionId) &&
+        !wasListed(one, session) &&
         !before.ids.includes(session.id) &&
         session.harness === one.session.harness &&
         session.title === one.session.title,
