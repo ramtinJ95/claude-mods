@@ -8,6 +8,8 @@ import type {
   NexusFailure,
   NexusLive,
   NexusNode,
+  NexusPort,
+  NexusPreview,
   NexusProject,
   NexusRow,
   NexusRunState,
@@ -85,6 +87,23 @@ export function parseStarted(json: unknown): NexusThread {
   return thread
 }
 
+/** A `Preview`, its `url` required: the CLI owns the URL, so one missing is a contract error rather than one rebuilt. */
+export function parsePreview(raw: unknown, command: string): NexusPreview {
+  if (!isRecord(raw) || typeof raw.service !== 'string') throw contractError(command, 'a preview without its service')
+  if (typeof raw.url !== 'string') throw contractError(command, `a preview (${raw.service}) without its url`)
+  return { service: raw.service, httpsPort: num(raw.httpsPort), ready: raw.ready === true, url: raw.url }
+}
+
+/** `ListeningPort[] | null`, as `show` and a watch `state` print it: a missing list is a contract error, not "unknown". */
+export function parsePorts(raw: unknown, command: string): NexusPort[] | null {
+  if (raw === null) return null
+  if (!Array.isArray(raw)) throw contractError(command, 'no ports')
+  return raw.map(one => {
+    if (!isRecord(one) || typeof one.port !== 'number') throw contractError(command, 'a port without its number')
+    return { port: one.port, service: strOrNull(one.service), preview: one.preview === null ? null : parsePreview(one.preview, command) }
+  })
+}
+
 const HARNESS = new Set(['claude-code', 'pi', 'shell'])
 const SESSION = new Set(['working', 'idle', 'blocked', 'done', 'unknown'])
 const OUTPUT = new Set(['branch', 'diff', 'preview', 'file'])
@@ -119,9 +138,8 @@ export function parseDetail(json: unknown): NexusDetail {
           ]
         : [],
     ),
-    previews: list(json.previews).flatMap(raw =>
-      isRecord(raw) && typeof raw.service === 'string' ? [{ service: raw.service, httpsPort: num(raw.httpsPort), ready: raw.ready === true }] : [],
-    ),
+    previews: list(json.previews).map(raw => parsePreview(raw, 'show')),
+    ports: parsePorts(json.ports, 'show'),
     outputs: list(json.outputs).flatMap(raw =>
       isRecord(raw) && OUTPUT.has(str(raw.kind)) ? [{ kind: raw.kind as NexusDetail['outputs'][number]['kind'], ref: str(raw.ref) }] : [],
     ),
@@ -183,7 +201,10 @@ function parseEntry(entry: unknown, text: unknown): WatchEntry {
 /** Live output kept per running call: its tail, enough for the few lines a row shows. */
 const LIVE_CHARS = 2_000
 
-/** One line of `watch --json`; undefined for a line or an event type this version does not know. */
+/**
+ * One line of `watch --json`; undefined for a line or an event type this version does not know. A `state` without
+ * a field docs/cli.md requires and the mod reads throws.
+ */
 export function parseWatchEvent(line: string): WatchEvent | undefined {
   let raw: unknown
   try {
@@ -210,6 +231,7 @@ export function parseWatchEvent(line: string): WatchEvent | undefined {
           queued: num(raw.queued),
           pylon: typeof raw.pylon === 'string' ? raw.pylon : 'unknown',
           failed: typeof raw.failed === 'string' ? raw.failed : null,
+          ports: parsePorts(raw.ports, 'watch'),
         },
       }
     case 'live':
@@ -320,16 +342,23 @@ function modelIn(model: string | null, entry: WatchEntry): string | null {
 /** Rows kept per thread: the pane shows a tail, and `$.state` holds JSON for every redraw. */
 const KEPT_ROWS = 400
 
+/** `rows` cut to the tail kept, counting what the cut dropped onto `dropped`. */
+function kept(rows: NexusRow[], dropped: number): Pick<NexusWatch, 'rows' | 'dropped'> {
+  const cut = Math.max(0, rows.length - KEPT_ROWS)
+  return { rows: rows.slice(cut), dropped: dropped + cut }
+}
+
+/** The watch after one event. A `live` event changes nothing here: the pane keeps it apart from the rows. */
 export function applyEvent(watch: NexusWatch, event: WatchEvent): NexusWatch {
   switch (event.type) {
     case 'reset':
-      return { ...watch, rows: event.entries.reduce(appendEntry, [] as NexusRow[]).slice(-KEPT_ROWS), model: event.entries.reduce(modelIn, null) }
+      return { ...watch, ...kept(event.entries.reduce(appendEntry, [] as NexusRow[]), 0), model: event.entries.reduce(modelIn, null) }
     case 'entry':
-      return { ...watch, rows: appendEntry(watch.rows, event.entry).slice(-KEPT_ROWS), model: modelIn(watch.model, event.entry) }
+      return { ...watch, ...kept(appendEntry(watch.rows, event.entry), watch.dropped), model: modelIn(watch.model, event.entry) }
     case 'state':
       return { ...watch, state: event.state, outage: null }
     case 'live':
-      return { ...watch, live: event.live }
+      return watch
     case 'error':
       return { ...watch, outage: `${event.kind === 'failed' ? 'The control plane is failing' : 'Nexus is unreachable'}: ${sentence(event.message)}` }
   }
@@ -488,13 +517,11 @@ export function clock(ms: number): string {
   return s < 60 ? `${s}s` : s < 3600 ? `${Math.floor(s / 60)}m ${s % 60}s` : `${Math.floor(s / 3600)}h ${Math.floor((s % 3600) / 60)}m`
 }
 
-export const previewUrl = (node: Pick<NexusNode, 'tailnetHost'>, httpsPort: number) => `https://${node.tailnetHost}:${httpsPort}/`
-
 /**
  * A paused pylon's preview keeps its link, because a visit wakes the pylon. An archived thread's stays paused
  * whatever the visit, so its link would only show the waking page.
  */
-export function previewLook(detail: Pick<NexusDetail, 'thread' | 'pylon'>, preview: NexusDetail['previews'][number]) {
+export function previewLook(detail: Pick<NexusDetail, 'thread' | 'pylon'>, preview: NexusPreview) {
   if (detail.thread.status === 'archived') return { linked: false, label: 'paused', tone: 'idle' as Tone, hint: 'Unarchive the thread to open it.' }
   if (detail.pylon.actualState === 'paused') return { linked: true, label: 'paused', tone: 'idle' as Tone, hint: 'Opening it wakes the pylon.' }
   return preview.ready ? { linked: true, label: 'ready', tone: 'ok' as Tone, hint: null } : { linked: false, label: 'starting', tone: 'busy' as Tone, hint: null }
@@ -515,27 +542,35 @@ export const toolStatus = (tool: ToolRow, isWorking: boolean): ToolStatus =>
 /** One block of the conversation as drawn. A run of tool calls this long folds into one line. */
 export const FOLD_AT = 4
 
-export type Block =
-  | { kind: 'user'; text: string; queued: boolean }
-  | { kind: 'assistant'; text: string; streaming: boolean }
+/**
+ * A block's `key` names the row it starts at, counted from the watch's first, so keeping a shorter tail of rows
+ * changes no key. `isLive` marks what the run shows of itself, which the next live event replaces.
+ */
+export type Block = { key: string; isLive: boolean } & (
+  | { kind: 'user'; text: string }
+  | { kind: 'assistant'; text: string }
   | { kind: 'notice'; tone: 'error' | 'dim' | 'warning'; text: string }
   | { kind: 'tools'; tools: ToolRow[] }
+)
 
-/** The rows, then what the run shows of itself: the answer streaming, a retry waiting, and the queued messages. */
-export function blocks(rows: readonly NexusRow[], live: NexusLive | null): Block[] {
+/**
+ * The rows, `dropped` of them before the first, then what the run shows of itself: the answer streaming, a retry
+ * waiting, and the queued messages. The answer streaming takes the key of the row it becomes once committed.
+ */
+export function blocks(rows: readonly NexusRow[], dropped: number, live: NexusLive | null): Block[] {
   const out: Block[] = []
-  for (const row of rows) {
+  rows.forEach((row, index) => {
     const last = out.at(-1)
+    const key = `row-${dropped + index}`
     if (row.kind === 'tool') {
       if (last?.kind === 'tools') last.tools.push(row)
-      else out.push({ kind: 'tools', tools: [row] })
-    } else if (row.kind === 'user') out.push({ kind: 'user', text: row.text, queued: false })
-    else if (row.kind === 'assistant') out.push({ kind: 'assistant', text: row.text, streaming: false })
-    else out.push({ kind: 'notice', tone: row.tone, text: row.text })
-  }
-  if (live?.partial?.trim()) out.push({ kind: 'assistant', text: live.partial.trim(), streaming: true })
-  if (live?.retry) out.push({ kind: 'notice', tone: 'warning', text: `The model request failed and will be retried: ${live.retry}` })
-  for (const text of live?.queued ?? []) out.push({ kind: 'user', text, queued: true })
+      else out.push({ key, isLive: false, kind: 'tools', tools: [row] })
+    } else if (row.kind === 'notice') out.push({ key, isLive: false, kind: 'notice', tone: row.tone, text: row.text })
+    else out.push({ key, isLive: false, kind: row.kind, text: row.text })
+  })
+  if (live?.partial?.trim()) out.push({ key: `row-${dropped + rows.length}`, isLive: true, kind: 'assistant', text: live.partial.trim() })
+  if (live?.retry) out.push({ key: 'live-retry', isLive: true, kind: 'notice', tone: 'warning', text: `The model request failed and will be retried: ${live.retry}` })
+  live?.queued.forEach((text, index) => out.push({ key: `live-queued-${index}`, isLive: true, kind: 'user', text }))
   return out
 }
 

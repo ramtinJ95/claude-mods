@@ -2,7 +2,7 @@
 // text rides on every request that loads them: keep it short and fixed.
 // Deleting a thread and retrying a pylon are left to the person's /nexus.
 import type { ToolSpec } from 'claude-code'
-import type { NexusRunState } from '../types'
+import type { NexusPort, NexusRunState } from '../types'
 
 const thread = { type: 'string', description: 'Thread ID, or a unique prefix of one' }
 
@@ -30,7 +30,7 @@ export const TOOLS = {
   },
   read: {
     name: 'read',
-    description: "A Nexus thread's state (status, run, pylon) and the latest part of its conversation.",
+    description: "A Nexus thread's state (status, run, pylon, listening ports with any preview URL; ports null: unknown) and the latest part of its conversation.",
     inputSchema: { type: 'object', additionalProperties: false, properties: { thread }, required: ['thread'] },
   },
   wait: {
@@ -43,12 +43,30 @@ export const TOOLS = {
       required: ['thread'],
     },
   },
+  preview: {
+    name: 'preview',
+    description:
+      "Publish a port the thread's pylon listens on as a preview, open to the home tailnet for the thread's life, and return its URL once it is served (up to 2 min).",
+    inputSchema: {
+      type: 'object',
+      additionalProperties: false,
+      properties: { thread, port: { type: 'integer', minimum: 1, maximum: 65535 } },
+      required: ['thread', 'port'],
+    },
+  },
   archive: {
     name: 'archive',
     description: 'Archive a Nexus thread, which pauses its VM. The person can unarchive it.',
     inputSchema: { type: 'object', additionalProperties: false, properties: { thread }, required: ['thread'] },
   },
 } as const satisfies Record<string, ToolSpec>
+
+/** A listening port as the model reads it: its service and its preview's URL, when it has them. */
+export const portFacts = (port: NexusPort) => ({
+  port: port.port,
+  ...(port.service ? { service: port.service } : {}),
+  ...(port.preview ? { url: port.preview.url, ready: port.preview.ready } : {}),
+})
 
 /** What only a person can do for a thread, so the model says so rather than waiting again. pi-nexus words it the same. */
 export function needsHuman(state: NexusRunState | null): string | undefined {

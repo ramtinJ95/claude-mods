@@ -17,7 +17,22 @@ import type {
   TextProps,
 } from 'claude-code'
 
-import type { NexusActual, NexusCatalog, NexusDesired, NexusDetail, NexusList, NexusNode, NexusPane, NexusShown, NexusStartDraft, NexusThread, NexusThreadRow, NexusWatch } from '../types'
+import type {
+  NexusActual,
+  NexusCatalog,
+  NexusDesired,
+  NexusDetail,
+  NexusList,
+  NexusLive,
+  NexusNode,
+  NexusPane,
+  NexusPort,
+  NexusShown,
+  NexusStartDraft,
+  NexusThread,
+  NexusThreadRow,
+  NexusWatch,
+} from '../types'
 import {
   type Action,
   ACTUAL_BADGE,
@@ -41,7 +56,6 @@ import {
   foldSummary,
   groupThreads,
   previewLook,
-  previewUrl,
   runOf,
   sentence,
   since,
@@ -68,6 +82,8 @@ export type Draw = {
 export type Scene = {
   list: NexusList
   watch: NexusWatch | null
+  /** The watch's latest live event for the thread shown. */
+  live: NexusLive | null
   shown: NexusShown | null
   catalog: NexusCatalog
   pane: NexusPane
@@ -92,6 +108,8 @@ export type PaneActions = {
   act: (action: Exclude<Action, 'delete'>) => void
   remove: () => void
   details: () => void
+  /** Publishes a port of the thread shown as a preview. */
+  openPort: (port: number) => void
   newThread: () => void
   startAgain: () => void
   startDraft: (change: Partial<NexusStartDraft>) => void
@@ -315,6 +333,13 @@ function Header(draw: Draw, scene: Scene) {
  * conversation.
  */
 const DRAWN_LIMIT = 90_000
+/**
+ * What the run in flight draws, and the rest of the view, are given room in steps this big, so older blocks are not
+ * left out and back in as an answer streams, a running call prints or the run clock ticks: the drawing above them
+ * holds still for a reader who scrolled up.
+ */
+const ROOM_STEP = 5_000
+const stepUp = (chars: number) => Math.ceil(chars / ROOM_STEP) * ROOM_STEP
 /** Diff lines an edit shows before the person opens it. */
 const DIFF_LINES = 40
 /** Output lines a settled call shows before the person opens it, and a running call's live tail. */
@@ -353,7 +378,7 @@ export function ThreadView(draw: Draw, scene: Scene, actions: PaneActions) {
   const notice = Notice(draw, scene.pane)
   const keyRows = Keys(draw, scene, isThread ? keys : detailsKeys(scene, actions, keys, detail), isComposing)
   // The conversation takes what the rest of the view leaves of the limit, measured as drawn.
-  const room = DRAWN_LIMIT - drawnChars([header, runLine, composer, notice, keyRows])
+  const room = DRAWN_LIMIT - stepUp(drawnChars([header, runLine, composer, notice, keyRows]))
   return (
     <Box flexDirection="column">
       {header}
@@ -375,10 +400,14 @@ function Conversation(draw: Draw, scene: Scene, actions: PaneActions, room: numb
   }
   if (detail && !detail.hasConversation) return <Text color="subtle">This thread has no agent conversation.</Text>
   if (!watch?.state) return null
-  const all = blocks(watch.rows, watch.live)
+  const all = blocks(watch.rows, watch.dropped, scene.live)
   if (all.length === 0) return <Text color="subtle">No messages yet.</Text>
   const isWorking = watch.state.run === 'working'
-  const running = new Map((watch.live?.tools ?? []).map(tool => [tool.callId, tool.output]))
+  const running = new Map((scene.live?.tools ?? []).map(tool => [tool.callId, tool.output]))
+  // What the run changes from one live event to the next: its own blocks, and the calls from the oldest still running.
+  const firstRunning = all.findIndex(block => block.kind === 'tools' && block.tools.some(tool => running.has(tool.id)))
+  const firstLive = all.findIndex(block => block.isLive)
+  const changing = Math.min(...[firstRunning, firstLive, all.length].filter(index => index >= 0))
   // Newest first while the drawn text fits in `room`, so a long thread costs its tail. A block that does not fit
   // draws its newest steps, and the newest block, step or text bigger than all of `room` is cut with a note.
   const drawn: RenderChildren[] = []
@@ -388,8 +417,10 @@ function Conversation(draw: Draw, scene: Scene, actions: PaneActions, room: numb
   for (; at >= 0; at -= 1) {
     const block = all[at]!
     const isNewest = drawn.length === 0
+    // The settled blocks get what is left once what the run changes has its room in whole steps.
+    if (at === changing - 1) left = room - Math.min(room, stepUp(room - left))
     if (block.kind !== 'tools') {
-      const node = BlockView(draw, block, at)
+      const node = BlockView(draw, block)
       const size = drawnChars(node)
       if (size <= left) {
         drawn.unshift(node)
@@ -410,7 +441,7 @@ function Conversation(draw: Draw, scene: Scene, actions: PaneActions, room: numb
     let from = tools.length
     while (from > 0 && size + sizes[from - 1]! <= left) size += sizes[--from]!
     if (from === 0 && size <= left) {
-      drawn.unshift(ToolsBlock(draw, at, header, tools))
+      drawn.unshift(ToolsBlock(draw, block.key, header, tools))
       left -= size
       continue
     }
@@ -418,8 +449,8 @@ function Conversation(draw: Draw, scene: Scene, actions: PaneActions, room: numb
       if (!isNewest) break
       // The fold's line and the newest step are cut together, so neither can take more than the room.
       from = Math.max(0, tools.length - 1)
-      drawn.unshift(Cut(draw, ToolsBlock(draw, at, header, tools.slice(from)), left))
-    } else drawn.unshift(ToolsBlock(draw, at, header, tools.slice(from)))
+      drawn.unshift(Cut(draw, ToolsBlock(draw, block.key, header, tools.slice(from)), left))
+    } else drawn.unshift(ToolsBlock(draw, block.key, header, tools.slice(from)))
     steps = from
     at -= 1
     break
@@ -529,23 +560,23 @@ function otherArgs(tool: ToolRow, diff: ReturnType<typeof diffOf>): string {
   return Object.keys(rest).length === 0 ? '' : JSON.stringify(rest, null, 2)
 }
 
-/** One text block of the conversation: the person's message, an answer or a notice. */
-function BlockView(draw: Draw, block: Exclude<Block, { kind: 'tools' }>, index: number) {
+/** One text block of the conversation: the person's message, an answer or a notice. An answer streams under the key it keeps once committed. */
+function BlockView(draw: Draw, block: Extract<Block, { kind: 'user' | 'assistant' | 'notice' }>) {
   const { Box, Text, Markdown } = draw
   switch (block.kind) {
     case 'user':
       return (
-        <Box key={`block-${index}`} flexDirection="row" marginTop={1}>
+        <Box key={block.key} flexDirection="row" marginTop={1}>
           <Text color="subtle">{'❯ '}</Text>
           <Box flexDirection="column" flexShrink={1}>
             <Text color="text">{block.text}</Text>
-            {block.queued && <Text color="subtle">queued, sends after this run</Text>}
+            {block.isLive && <Text color="subtle">queued, sends after this run</Text>}
           </Box>
         </Box>
       )
     case 'assistant':
       return (
-        <Box key={`block-${index}`} flexDirection="row" marginTop={1}>
+        <Box key={block.key} flexDirection="row" marginTop={1}>
           <Text color="text">{'⏺ '}</Text>
           <Box flexDirection="column" flexShrink={1}>
             <Markdown text={block.text} />
@@ -554,12 +585,12 @@ function BlockView(draw: Draw, block: Exclude<Block, { kind: 'tools' }>, index: 
       )
     case 'notice':
       return block.tone === 'dim' ? (
-        <Box key={`block-${index}`} flexDirection="row">
+        <Box key={block.key} flexDirection="row">
           <Text color="subtle">{'  ⎿  '}</Text>
           <Text color="subtle">{block.text}</Text>
         </Box>
       ) : (
-        <Box key={`block-${index}`} flexDirection="row" marginTop={1}>
+        <Box key={block.key} flexDirection="row" marginTop={1}>
           <Text color={block.tone}>{'⏺ '}</Text>
           <Box flexShrink={1}>
             <Text color={block.tone}>{block.text}</Text>
@@ -586,10 +617,10 @@ function FoldLine(draw: Draw, scene: Scene, actions: PaneActions, block: Extract
 }
 
 /** A run of calls: its fold's line, when it folds, over the steps drawn. */
-function ToolsBlock(draw: Draw, index: number, header: RenderChildren, tools: readonly RenderChildren[]) {
+function ToolsBlock(draw: Draw, key: string, header: RenderChildren, tools: readonly RenderChildren[]) {
   const { Box } = draw
   return (
-    <Box key={`block-${index}`} flexDirection="column">
+    <Box key={key} flexDirection="column">
       {header}
       {tools.length > 0 && (header ? <Box flexDirection="column" paddingLeft={2}>{tools}</Box> : tools)}
     </Box>
@@ -791,8 +822,14 @@ function detailsKeys(scene: Scene, actions: PaneActions, threadKeys: readonly Ke
   ]
 }
 
-/** The dashboard's inspector: the pylon, its previews, the thread's outputs and its sessions. */
-function DetailsBody(draw: Draw, scene: Scene, _actions: PaneActions) {
+/** Gondolin's ingress reaches only the pylon's 127.0.0.1, so a server bound only to ::1 is neither listed nor reachable. */
+const UNREACHABLE_HINT = "A server bound only to ::1 can't be previewed, so bind it to 0.0.0.0 or 127.0.0.1."
+
+/**
+ * The dashboard's inspector: the pylon, its previews, the ports that listen with none, the thread's outputs and its
+ * sessions. Each port is listed once: under Previews once it has one, under Ports until then.
+ */
+function DetailsBody(draw: Draw, scene: Scene, actions: PaneActions) {
   const { Box, Text, Link } = draw
   const { detail } = threadOf(scene)
   if (!detail) return <Text color="subtle">{scene.shown?.failure ? '' : 'Loading the details…'}</Text>
@@ -818,8 +855,10 @@ function DetailsBody(draw: Draw, scene: Scene, _actions: PaneActions) {
       </Text>
     </Box>
   )
-  const previewOf = new Map(detail.previews.map(preview => [preview.service, preview]))
-  const linkFor = (port: number) => (node?.tailnetHost ? previewUrl(node, port) : null)
+  const portOf = new Map((detail.ports ?? []).flatMap(one => (one.preview ? [[one.preview.service, one.port] as const] : [])))
+  const unpublished = detail.ports?.filter(one => one.preview === null) ?? null
+  // A preview output stays only for a preview the control plane no longer lists, as the dashboard's outputs do.
+  const outputs = detail.outputs.filter(output => output.kind !== 'preview' || !detail.previews.some(preview => preview.service === output.ref))
   const observed = pylon.observedAt === null ? 'never' : `${since(Date.parse(pylon.observedAt), scene.now)}${offline ? ' (stale)' : ''}`
   return (
     <Box flexDirection="column">
@@ -836,31 +875,38 @@ function DetailsBody(draw: Draw, scene: Scene, _actions: PaneActions) {
       {detail.previews.length === 0 && <Text color="subtle">No previews.</Text>}
       {detail.previews.map(preview => {
         const look = previewLook(detail, preview)
-        const url = linkFor(preview.httpsPort)
+        const port = portOf.get(preview.service)
         return (
           <Box key={`preview-${preview.service}`} flexDirection="column">
             <Box flexDirection="row" columnGap={1}>
               {Dot(draw, look.tone)}
               <Text bold>{preview.service}</Text>
+              {port !== undefined && preview.service !== `port-${port}` && <Text color="subtle">{`port ${port}`}</Text>}
               <Text color="subtle">{look.label}</Text>
-              {look.linked && url ? <Link href={url} label={url} /> : <Text color="subtle">{`port ${preview.httpsPort}`}</Text>}
+              {look.linked ? <Link href={preview.url} label={preview.url} /> : <Text color="subtle">{preview.url}</Text>}
             </Box>
             {look.hint && <Text color="subtle">{`  ${look.hint}`}</Text>}
           </Box>
         )
       })}
-      {heading('Outputs', detail.outputs.length)}
-      {detail.outputs.length === 0 && <Text color="subtle">No outputs yet.</Text>}
-      {detail.outputs.map((output, index) => {
-        const preview = output.kind === 'preview' ? previewOf.get(output.ref) : undefined
-        const url = preview && previewLook(detail, preview).linked ? linkFor(preview.httpsPort) : null
-        return (
-          <Box key={`output-${index}`} flexDirection="row" columnGap={1}>
-            <Text color="subtle">{output.kind.padEnd(8)}</Text>
-            {url ? <Link href={url} label={output.ref} /> : <Text>{output.ref}</Text>}
-          </Box>
-        )
-      })}
+      {heading('Ports', unpublished?.length ?? 0)}
+      {unpublished === null ? (
+        <Text color="subtle">The pylon's ports could not be read.</Text>
+      ) : unpublished.length > 0 ? (
+        unpublished.map(port => PortRow(draw, scene, actions, port, unpublished.filter(one => one.service === null).indexOf(port)))
+      ) : pylon.actualState !== 'running' ? (
+        <Text color="subtle">Ports show while the pylon runs.</Text>
+      ) : (
+        <Text color="subtle">{`${detail.ports?.length === 0 ? 'Nothing listens yet.' : 'Every port that listens is under Previews.'} ${UNREACHABLE_HINT}`}</Text>
+      )}
+      {heading('Outputs', outputs.length)}
+      {outputs.length === 0 && <Text color="subtle">No outputs yet.</Text>}
+      {outputs.map((output, index) => (
+        <Box key={`output-${index}`} flexDirection="row" columnGap={1}>
+          <Text color="subtle">{output.kind.padEnd(8)}</Text>
+          <Text>{output.ref}</Text>
+        </Box>
+      ))}
       {heading('Sessions', detail.sessions.length)}
       {detail.sessions.length === 0 && <Text color="subtle">No sessions.</Text>}
       {detail.sessions.map(session => (
@@ -875,6 +921,50 @@ function DetailsBody(draw: Draw, scene: Scene, _actions: PaneActions) {
         <Text color="subtle">Attach from a shell in the pylon:</Text>
         <Text>{`  ${detail.attach}`}</Text>
       </Box>
+    </Box>
+  )
+}
+
+/**
+ * A port that listens with no preview. One no service owns opens on its digit, as the list opens a thread, or on
+ * Enter; it says so while the CLI waits for its URL, then links it until the next details list it under Previews,
+ * and a failure says why and opens again. A service without a preview cannot be previewed, which the CLI refuses,
+ * so its port only names it.
+ */
+function PortRow(draw: Draw, scene: Scene, actions: PaneActions, port: NexusPort, index: number) {
+  const { Box, Text, Button, Link } = draw
+  const key = `port-${port.port}`
+  if (port.service !== null) {
+    return (
+      <Box key={key} flexDirection="row" columnGap={1}>
+        {Dot(draw, 'muted')}
+        <Text bold>{String(port.port)}</Text>
+        <Text color="subtle">{`${port.service}, a service with no preview`}</Text>
+      </Box>
+    )
+  }
+  const opening = scene.pane.openings[String(port.port)]
+  if (opening?.phase === 'open') {
+    return (
+      <Box key={key} flexDirection="row" columnGap={1}>
+        {Dot(draw, 'ok')}
+        <Text bold>{String(port.port)}</Text>
+        <Link href={opening.preview.url} label={opening.preview.url} />
+      </Box>
+    )
+  }
+  const [tone, note]: [Tone, string] =
+    opening?.phase === 'opening'
+      ? ['busy', 'opening: publishing it and waiting for the node to serve its URL…']
+      : opening?.phase === 'failed'
+        ? ['bad', 'did not open; press again to retry']
+        : ['muted', 'no preview yet; press to open one']
+  return (
+    <Box key={key} flexDirection="column">
+      <Button key={key} plain hotkey={index < 9 ? String(index + 1) : undefined} onPress={() => actions.openPort(port.port)}>
+        {Dot(draw, tone)} <Text bold>{String(port.port)}</Text> <Text color="subtle">{note}</Text>
+      </Button>
+      {opening?.phase === 'failed' && <Text color="error">{`  ${opening.message}`}</Text>}
     </Box>
   )
 }

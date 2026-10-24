@@ -31,7 +31,20 @@ export type NexusFailure = {
   message: string
 }
 
-/** A watch `state` event: the thread's status, its run and its pylon. */
+/** A preview of one of a pylon's services: `Preview` in the Nexus repository's src/control/registry.ts. */
+export type NexusPreview = {
+  service: string
+  httpsPort: number
+  /** The node publishes it and has warmed its URL; it says nothing of the pylon answering. */
+  ready: boolean
+  /** The CLI's own URL, used as it is. */
+  url: string
+}
+
+/** A TCP port a preview can reach in the pylon, and the preview of the service that owns it. */
+export type NexusPort = { port: number; service: string | null; preview: NexusPreview | null }
+
+/** A watch `state` event: the thread's status, its run, its pylon and the ports it listens on. */
 export type NexusRunState = {
   status: NexusThread['status']
   run: 'idle' | 'working' | 'parked'
@@ -39,6 +52,8 @@ export type NexusRunState = {
   queued: number
   pylon: string
   failed: string | null
+  /** In port order; [] while the pylon is not running, null while its node could not read them. */
+  ports: NexusPort[] | null
 }
 
 /** A watch `live` event: what the current run shows before it is committed to the conversation. */
@@ -76,14 +91,14 @@ export type NexusRow =
 /** The latest `threads` poll. A failed poll keeps the threads it had and says why. */
 export type NexusList = { threads: NexusThreadRow[] | null; failure: NexusFailure | null; polledAt: number | null }
 
-/** The thread open in the pane, as its watch has reported it. */
+/** The thread open in the pane, as its watch has reported it, but for its `live` events. */
 export type NexusWatch = {
   thread: string
   rows: NexusRow[]
+  /** How many rows came before `rows[0]` since the last reset: the rows kept are a tail. */
+  dropped: number
   /** Null until the watch's first poll answers. */
   state: NexusRunState | null
-  /** Null until the first `live` event, and from a control plane that sends none. */
-  live: NexusLive | null
   /** The model of the newest answer, which the next message goes to. */
   model: string | null
   /** The outage the watch reported last, cleared by its next state. */
@@ -99,12 +114,20 @@ export type NexusSession = {
   status: 'working' | 'idle' | 'blocked' | 'done' | 'unknown'
 }
 
-/** `show --json`: a thread with its pylon, sessions, previews and outputs. */
+/**
+ * The watch's latest `live` event for the thread open in the pane. It has an atom of its own: a streaming answer
+ * prints ten a second, and writing it with the rows would copy every row each time.
+ */
+export type NexusLiveShown = { thread: string; live: NexusLive }
+
+/** `show --json`: a thread with its pylon, sessions, previews, ports and outputs. */
 export type NexusDetail = {
   thread: NexusThread
   pylon: { id: string; node: string; actualState: NexusActual; failed: string | null; observedAt: string | null; retryRefused: string | null }
   sessions: NexusSession[]
-  previews: { service: string; httpsPort: number; ready: boolean }[]
+  previews: NexusPreview[]
+  /** In port order; [] while the pylon is not running, null while its node could not read them. */
+  ports: NexusPort[] | null
   outputs: { kind: 'branch' | 'diff' | 'preview' | 'file'; ref: string }[]
   /** Null for a thread with no conversation. */
   agent: { parkedTasks: number } | null
@@ -145,6 +168,9 @@ export type NexusStartDraft = {
 
 export type NexusView = 'list' | 'thread' | 'details' | 'start'
 
+/** A port the person asked to open: `nexus preview --wait` under way, the preview it printed, or why it failed. */
+export type NexusOpening = { phase: 'opening' } | { phase: 'open'; preview: NexusPreview } | { phase: 'failed'; message: string }
+
 export type NexusPane = {
   view: NexusView
   /** The thread shown, or null for the list. */
@@ -159,6 +185,8 @@ export type NexusPane = {
   start: NexusStartDraft | null
   /** The outcome of the last press, until the next one. */
   notice: { text: string; tone: 'error' | 'dim' } | null
+  /** The ports of the thread shown that the person opened, by port; cleared when another thread opens. */
+  openings: Record<string, NexusOpening>
 }
 
 declare module 'claude-code' {
@@ -166,6 +194,7 @@ declare module 'claude-code' {
     nexus: {
       list: NexusList
       watch: NexusWatch | null
+      live: NexusLiveShown | null
       shown: NexusShown | null
       catalog: NexusCatalog
       pane: NexusPane

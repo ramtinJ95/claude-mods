@@ -27,7 +27,7 @@ import {
   since,
   threadState,
 } from '../hooks/model'
-import { DETAIL, ENTRIES, PATCH, T0, THREADS } from './fake-cli'
+import { DETAIL, ENTRIES, PATCH, T0, THREADS, WEB_PREVIEW, state } from './fake-cli'
 
 const thread = (over: Partial<NexusThread>): NexusThread => ({
   id: 'th-4f2a00000001',
@@ -73,8 +73,8 @@ describe('/nexus arguments', () => {
   })
 })
 
-const idle: NexusRunState = { status: 'active', run: 'idle', parkedTasks: 0, queued: 0, pylon: 'running', failed: null }
-const empty: NexusWatch = { thread: 'th-4f2a00000001', rows: [], state: null, live: null, model: null, outage: null, ended: null }
+const idle: NexusRunState = { status: 'active', run: 'idle', parkedTasks: 0, queued: 0, pylon: 'running', failed: null, ports: [] }
+const empty: NexusWatch = { thread: 'th-4f2a00000001', rows: [], dropped: 0, state: null, model: null, outage: null, ended: null }
 
 /** The watch's own lines for one turn: a question, a tool call and its result, an answer. */
 const stream = [
@@ -182,6 +182,25 @@ describe('the console', () => {
     expect(() => parseDetail({ ...DETAIL, attach: undefined })).toThrow('nexus show printed no attach')
   })
 
+  test("previews keep the CLI's url and ports their preview; either missing is a contract error, and null ports mean unknown", () => {
+    const detail = parseDetail(DETAIL)
+    expect(detail.previews[0]).toEqual({ service: 'web', httpsPort: 10201, ready: true, url: 'https://rj-firebat.example.ts.net:10201/' })
+    expect(detail.ports).toEqual([
+      { port: 3000, service: 'web', preview: detail.previews[0] },
+      { port: 5173, service: null, preview: null },
+      { port: 9229, service: 'worker', preview: null },
+    ])
+    expect(parseDetail({ ...DETAIL, ports: null }).ports).toBeNull()
+    const { url: _, ...noUrl } = WEB_PREVIEW
+    expect(() => parseDetail({ ...DETAIL, previews: [noUrl] })).toThrow('nexus show printed a preview (web) without its url, which docs/cli.md requires')
+    expect(() => parseDetail({ ...DETAIL, ports: undefined })).toThrow('nexus show printed no ports')
+    expect(() => parseDetail({ ...DETAIL, ports: [{ port: 3000, service: 'web', preview: noUrl }] })).toThrow('without its url')
+    const watched = parseWatchEvent(JSON.stringify(state('idle')))
+    expect(watched?.type === 'state' && watched.state.ports?.map(one => one.port)).toEqual([3000, 5173, 9229])
+    const { ports: __, ...old } = state('idle')
+    expect(() => parseWatchEvent(JSON.stringify(old))).toThrow('nexus watch printed no ports')
+  })
+
   test('a thread is as urgent as its worst fact: a failed pylon shows over the agent working', () => {
     expect(threadState({ status: 'active', agentTurnRunning: true }, 'running')).toEqual(['agent working', 'work'])
     expect(threadState({ status: 'active', agentTurnRunning: true }, 'failed')).toEqual(['failed', 'bad'])
@@ -191,15 +210,14 @@ describe('the console', () => {
 
   test("a live event carries the queued messages, running tools' output, the partial answer and a retry", () => {
     const event = parseWatchEvent(JSON.stringify({ type: 'live', thread: 'th', queued: ['also add a test', 3], tools: [{ callId: 'b2', output: 'x'.repeat(5_000) }, { output: 'no id' }], partial: 'Running', retry: null, later: 1 }))
-    expect(event?.type).toBe('live')
-    const watch = applyEvent(empty, event!)
-    expect(watch.live?.queued).toEqual(['also add a test'])
-    expect(watch.live?.tools.map(tool => tool.callId)).toEqual(['b2'])
-    expect(watch.live?.tools[0]!.output.length).toBeLessThan(2_100)
-    expect(watch.live?.partial).toBe('Running')
-    // The live event leaves the settle rule alone, so the model tools stay as pi-nexus has them.
-    const settled = { ...idle }
-    expect(isSettled(settled, [{ kind: 'assistant', text: 'done' }], false)).toBe(isSettled(settled, applyEvent({ ...empty, rows: [{ kind: 'assistant', text: 'done' }] }, event!).rows, false))
+    if (event?.type !== 'live') throw new Error('not a live event')
+    expect(event.live.queued).toEqual(['also add a test'])
+    expect(event.live.tools.map(tool => tool.callId)).toEqual(['b2'])
+    expect(event.live.tools[0]!.output.length).toBeLessThan(2_100)
+    expect(event.live.partial).toBe('Running')
+    // The live event leaves the rows and the settle rule alone, so the model tools stay as pi-nexus has them.
+    const done = { ...empty, rows: [{ kind: 'assistant' as const, text: 'done' }] }
+    expect(applyEvent(done, event)).toBe(done)
   })
 
   test('the rows keep what the console draws: arguments, output, the line count, the patch and the model', () => {
@@ -219,13 +237,25 @@ describe('the console', () => {
 
   test('four tool calls in a row fold into one block, the live run after the rows', () => {
     const watch = applyEvent(empty, { type: 'reset', entries: ENTRIES.map(one => ({ model: one.entry.model as never, text: one.text })) })
-    const all = blocks(watch.rows, { queued: ['Also add a test.'], tools: [], partial: 'Running the suite', retry: 'overloaded' })
+    const all = blocks(watch.rows, 0, { queued: ['Also add a test.'], tools: [], partial: 'Running the suite', retry: 'overloaded' })
     expect(all.map(block => block.kind)).toEqual(['user', 'assistant', 'tools', 'assistant', 'tools', 'assistant', 'notice', 'user'])
     const steps = all[4]!
     expect(steps.kind === 'tools' && steps.tools.length).toBe(5)
     expect(foldSummary(steps.kind === 'tools' ? steps.tools : [])).toBe('Read 4 files, ran 1 command')
-    expect(all.at(-3)).toEqual({ kind: 'assistant', text: 'Running the suite', streaming: true })
-    expect(all.at(-1)).toEqual({ kind: 'user', text: 'Also add a test.', queued: true })
+    // The answer streaming takes the key of the row it becomes once committed.
+    expect(all.at(-3)).toEqual({ key: `row-${watch.rows.length}`, isLive: true, kind: 'assistant', text: 'Running the suite' })
+    expect(all.at(-1)).toEqual({ key: 'live-queued-0', isLive: true, kind: 'user', text: 'Also add a test.' })
+  })
+
+  test('a block keeps its key as the rows kept move past the oldest', () => {
+    const said = (n: number): WatchEvent => ({ type: 'entry', entry: { model: [{ role: 'assistant', content: [{ type: 'text', text: `answer ${n}` }] }], text: '' } })
+    const long = Array.from({ length: 450 }, (_, n) => said(n)).reduce(applyEvent, empty)
+    expect(long.rows).toHaveLength(400)
+    expect(long.dropped).toBe(50)
+    const last = blocks(long.rows, long.dropped, null).at(-1)
+    expect(last).toMatchObject({ key: 'row-449', text: 'answer 449' })
+    const longer = applyEvent(long, said(450))
+    expect(blocks(longer.rows, longer.dropped, null).find(block => block.key === 'row-449')).toMatchObject({ text: 'answer 449' })
   })
 
   test("an edit's diff is its result's patch, numbered as the file is; without one it is built from the call and says so", () => {
