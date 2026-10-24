@@ -12,6 +12,7 @@ const PANE: NexusPane = {
   pending: null,
   listCursor: null,
   listTop: 0,
+  isRetaken: false,
   scroll: null,
   detailsTop: 0,
   portCursor: null,

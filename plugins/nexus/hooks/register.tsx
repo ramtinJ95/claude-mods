@@ -89,6 +89,7 @@ const paneAtom = atom({ plugin: 'nexus', key: 'pane' } as const, {
   pending: null,
   listCursor: null,
   listTop: 0,
+  isRetaken: false,
   scroll: null,
   detailsTop: 0,
   portCursor: null,
@@ -611,7 +612,9 @@ async function openFromStrip($: EngineInterface, id: string) {
 async function recover($: EngineInterface) {
   recovering = undefined
   const pane = await update($, paneAtom, (was): NexusPane =>
-    was.mode === 'normal' && !was.overlay ? was : { ...was, mode: 'normal', overlay: null, pending: null, ...(was.mode === 'filter' ? { filter: '', fields: putFields(was.fields, { [FILTER]: '' }) } : {}) },
+    was.mode === 'normal' && !was.overlay
+      ? was
+      : { ...was, mode: 'normal', overlay: null, pending: null, isRetaken: was.view === 'list', ...(was.mode === 'filter' ? { filter: '', fields: putFields(was.fields, { [FILTER]: '' }) } : {}) },
   )
   // A pane closed since stays closed; asking for the keys it holds already changes nothing.
   if (!(await $.ui.panes()).some(one => one.id === PANE)) return
@@ -1279,11 +1282,25 @@ function paneActions($: EngineInterface, surface: RenderSurface): PaneActions {
         await update($, paneAtom, pane => {
           const step = press(pane, command, nav)
           effects = step.effects
-          return step.pane
+          return { ...step.pane, isRetaken: false }
         })
         for (const effect of effects) await perform(effect)
       }),
-    effect: effect => run(() => perform(effect)),
+    effect: effect =>
+      run(async () => {
+        if (effect.kind === 'open') {
+          let isHeld = false
+          await update($, paneAtom, pane => {
+            isHeld = pane.isRetaken
+            return isHeld ? { ...pane, isRetaken: false } : pane
+          })
+          if (isHeld) {
+            const title = (await read($, listAtom)).threads?.find(thread => thread.id === effect.thread)?.title ?? effect.thread
+            return setPane($, () => ({ notice: { text: `The pane took the keys back after losing them, so that Enter opened nothing. Enter again opens ${title}.`, tone: 'dim' } }))
+          }
+        }
+        return perform(effect)
+      }),
     toggle: (key, isOpen) => run(() => update($, paneAtom, pane => ({ ...pane, toggled: { ...pane.toggled, [key]: !isOpen } }))),
     tab: tab =>
       run(async () => {
@@ -1405,7 +1422,7 @@ export const register: Register = (on, options) => {
   // The arrows, Tab and a click move the ring themselves: the cursor and the mode follow it.
   on('ui.focus', { component: 'Pane', requestId: PANE }, async ($, e, next) => {
     const element = e.element
-    if (e.origin.kind === 'person' && element) await update($, paneAtom, pane => ringMoved(pane, element))
+    if (e.origin.kind === 'person' && element) await update($, paneAtom, pane => ({ ...ringMoved(pane, element), isRetaken: false }))
     const moved = await next(e)
     if (!moved.deny) ringAt = element ?? null
     return moved

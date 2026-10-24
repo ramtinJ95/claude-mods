@@ -35,7 +35,7 @@ The pane is driven like vim. Claude Code gives a pane only plain letters and dig
 | `s` | The key help, which `j`/`k`, `d`/`u` and `g g`/`g e` scroll when the pane is too short for it |
 | `q` | Close the help or the menu, else the pane |
 
-Esc in normal mode hands the keyboard back to the prompt and leaves the pane open.
+Esc in normal mode hands the keyboard back to the prompt and leaves the pane open. When the pane takes the keyboard back after losing it in the filter or a field, as after Esc there, the next Enter on a thread in the list opens nothing and says what a second Enter would open, since it may have been typed for the field.
 
 ### Views
 

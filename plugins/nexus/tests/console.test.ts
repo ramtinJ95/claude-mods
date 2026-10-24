@@ -196,6 +196,35 @@ test('Esc from the filter, which hands the keys to the prompt, clears it and tak
   expect(await ui.find({ type: 'Button', key: 'th-7c0000000003' })).toBeDefined()
 })
 
+test('after the pane takes the keys back unasked, Enter on the row the ring lands on says what it would open first', async ($, on) => {
+  const cli = fake()
+  const { clock, nexus, mount } = await boot($, on, cli)
+  await nexus('')
+  const ui = await mount()
+  await keys(ui, 'hf')
+  await ui.input({ key: await field(ui, 'filter'), text: 'old', kind: 'change' })
+  // The keys left the filter without an Enter, as Esc or the engine moving them takes them: an Enter typed for the
+  // filter may come after the pane takes them back.
+  await ui.redraw({ title: 'Nexus', isFocused: false, bodyColumns: 100, placement: 'dock', scroll: { offset: 0, bodyRows: 60 }, view: {} } as never)
+  await clock.advance(1)
+  await ui.redraw({ title: 'Nexus', isFocused: true, bodyColumns: 100, placement: 'dock', scroll: { offset: 0, bodyRows: 60 }, view: {} } as never)
+  const row = await cursorOn(ui)
+  expect(row).toBe(ID)
+  await ui.press({ key: ID })
+  expect(await shows(ui, /^◆ Nexus\s/)).toBe(true)
+  expect(await shows(ui, 'The pane took the keys back after losing them, so that Enter opened nothing. Enter again opens Fix login form 500s.')).toBe(true)
+  await ui.press({ key: ID })
+  expect(await shows(ui, /^‹ web \/ Fix login form 500s$/)).toBe(true)
+  // A key the person presses first is theirs: Enter then opens at once.
+  await keys(ui, 'hf')
+  await ui.redraw({ title: 'Nexus', isFocused: false, bodyColumns: 100, placement: 'dock', scroll: { offset: 0, bodyRows: 60 }, view: {} } as never)
+  await clock.advance(1)
+  await ui.redraw({ title: 'Nexus', isFocused: true, bodyColumns: 100, placement: 'dock', scroll: { offset: 0, bodyRows: 60 }, view: {} } as never)
+  await keys(ui, 'jk')
+  await ui.press({ key: ID })
+  expect(await shows(ui, /^‹ web \/ Fix login form 500s$/)).toBe(true)
+})
+
 test('a thread draws as a Claude Code transcript: prompts, ⏺ answers in Markdown, tool calls with ⎿ results, edits as diffs', async ($, on) => {
   const cli = fake()
   const { nexus, mount } = await boot($, on, cli)

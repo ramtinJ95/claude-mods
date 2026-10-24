@@ -226,6 +226,12 @@ export type NexusPane = {
   listCursor: string | null
   /** The list's first row shown, as last scrolled; each drawing clamps it so the cursor shows. */
   listTop: number
+  /**
+   * The pane took the keys back without the person asking (`recover`) and put the ring on the list's cursor. An Enter
+   * typed for the field the keys left may still be on its way, so the next Enter on a row opens nothing and says what
+   * a second would open. The person's next key or move of the ring clears it.
+   */
+  isRetaken: boolean
   scroll: NexusScroll
   /** The details' first row shown. */
   detailsTop: number
