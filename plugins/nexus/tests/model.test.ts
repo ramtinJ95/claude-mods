@@ -185,7 +185,7 @@ describe('the console', () => {
     expect(() => parseThreads([{ ...THREADS[0], pylon: null }])).toThrow('without its pylon')
     const detail = parseDetail(DETAIL)
     expect(detail).toMatchObject({ desired: 'running', attach: 'herdr --session nexus-7f3a', hasConversation: true, pylon: { retryRefused: null, observedAt: DETAIL.pylon.observedAt } })
-    expect(detail.sessions).toEqual([{ herdrPane: 'nexus:1.2', harness: 'claude-code', harnessSessionId: '9c1e', status: 'working' }])
+    expect(detail.sessions).toEqual([{ herdrPane: 'nexus:1.2', harness: 'claude-code', harnessSessionId: '9c1e', status: 'working', title: null }])
     expect(() => parseDetail({ ...DETAIL, desired: undefined })).toThrow('nexus show printed no desired')
     expect(() => parseDetail({ ...DETAIL, attach: undefined })).toThrow('nexus show printed no attach')
   })

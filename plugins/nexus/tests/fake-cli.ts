@@ -130,6 +130,8 @@ export type Fake = {
   /** The answer AskUserQuestion gives. */
   answer: string
   asked: string[]
+  /** Each ask's answers, in the order the dialog lists them. */
+  offered: string[][]
   copied: string[]
   /** Every `$.ui.toast` text. */
   toasts: string[]
@@ -137,6 +139,8 @@ export type Fake = {
   isOpen: boolean
   /** What `$.store` holds, from the session's start on: the theme tip is taken as said unless a test says otherwise. */
   store: Record<string, unknown>
+  /** The pane `session open` answers with. */
+  nextPane: string
   /** Runs before each `$.store.set` lands, to hold one while the test does something else. */
   saving?: (key: string, value: unknown) => Promise<void>
 }
@@ -171,7 +175,7 @@ function parseProjectAdd(args: readonly string[]): { values: Record<string, stri
 export function fake(change: Partial<Fake> = {}): Fake {
   // A copy, as the mod writes the store a test reads: a fixture shared by tests would carry one's writes into the next.
   const store = structuredClone(change.store ?? { themeNotice: true })
-  return { runs: [], spawns: [], threads: THREADS, projects: PROJECTS, detail: DETAIL, watch: [{ type: 'reset', thread: ID, entries: ENTRIES }, state('working'), live()], slow: {}, fail: {}, printed: {}, publishes: true, answer: 'Keep', asked: [], copied: [], toasts: [], opens: 0, isOpen: false, ...change, store }
+  return { runs: [], spawns: [], threads: THREADS, projects: PROJECTS, detail: DETAIL, watch: [{ type: 'reset', thread: ID, entries: ENTRIES }, state('working'), live()], slow: {}, fail: {}, printed: {}, publishes: true, answer: 'Keep', asked: [], offered: [], copied: [], toasts: [], opens: 0, isOpen: false, nextPane: 'nexus:2.1', ...change, store }
 }
 
 /** `detail` with the linked preview of `port` published, or gone when `preview` is null. */
@@ -217,9 +221,11 @@ export async function boot(...[$, on, cli]: [...Body, Fake]) {
   on('process.run', async (_, e) => {
     const argv = e.argv.slice(1)
     cli.runs.push(argv)
-    const late = cli.slow[argv[0]!]
+    // `session open` and `session close` are slowed or failed by both words.
+    const verb = argv[0] === 'session' ? `session ${argv[1]}` : argv[0]!
+    const late = cli.slow[verb]
     if (late) await clock.sleep(late)
-    const failure = cli.fail[argv[0]!]
+    const failure = cli.fail[verb]
     if (failure) return { value: { exitCode: failure.exitCode, stdout: '', stderr: `${JSON.stringify({ error: failure.error, kind: 'failed', status: 500 })}\n`, isStdoutTruncated: false, isStderrTruncated: false } }
     if (argv[0] === 'project') {
       // `nexus project add`, read as the CLI's strict parseArgs reads it, its project built from its arguments.
@@ -229,6 +235,12 @@ export async function boot(...[$, on, cli]: [...Body, Fake]) {
       const project = { id, repoUrl, defaultBranch: values.branch ?? 'main', defaultNode: values.node, resources: { cpus: 2, memoryGiB: 4, diskGiB: 10 }, allowedHosts: [], secrets: [], logins: [], preSetup: null }
       cli.projects = [...cli.projects, project]
       return reply(project)
+    }
+    if (verb === 'session open') {
+      // `nexus session open --json [--harness=…] [--title=…] -- <thread>`: the title is the harness's name unless given.
+      const flag = (name: string) => argv.find(arg => arg.startsWith(`--${name}=`))?.slice(name.length + 3)
+      const harness = flag('harness') ?? 'claude-code'
+      return reply({ herdrPane: cli.nextPane, harness, title: flag('title') ?? harness })
     }
     return reply(answers[argv[0]!]?.() ?? null)
   })
@@ -278,8 +290,9 @@ export async function boot(...[$, on, cli]: [...Body, Fake]) {
     return { value: { isCopied: true } } as never
   })
   on('tool.call', { tool: 'AskUserQuestion' }, (_, e) => {
-    const questions = (e as unknown as { questions: { question: string }[] }).questions
+    const questions = (e as unknown as { questions: { question: string; options: { label: string }[] }[] }).questions
     cli.asked.push(questions[0]!.question)
+    cli.offered.push(questions[0]!.options.map(option => option.label))
     return { result: { questions, answers: { [questions[0]!.question]: cli.answer } } } as never
   })
   on('session.start', (_, e) => ({ cwd: e.cwd }))

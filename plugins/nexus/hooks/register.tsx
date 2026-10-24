@@ -4,13 +4,17 @@ import type { EngineInterface, Register, RenderSurface, Timer } from 'claude-cod
 import type {
   NexusCatalog,
   NexusFailure,
+  NexusHarness,
   NexusList,
+  NexusOpenedSession,
   NexusPane,
   NexusPortChange,
   NexusPreview,
   NexusProject,
   NexusProjectDraft,
   NexusRunState,
+  NexusSessionChanges,
+  NexusSessionDraft,
   NexusShown,
   NexusStartDraft,
   NexusStrip,
@@ -24,11 +28,15 @@ import {
   type Action,
   type Reply,
   FULL_ID,
+  HARNESS_LABEL,
   NO_CHANGE,
+  NO_SESSION_CHANGES,
+  SSH_HINT,
   USAGE,
   type WatchEntry,
   type WatchEvent,
   ago,
+  attachCommand,
   applyEvent,
   closedKey,
   groupThreads,
@@ -43,20 +51,24 @@ import {
   parseDetail,
   parseFailure,
   parseNodes,
+  parseOpenedSession,
   parsePreview,
   parseProjects,
+  parseSessionClosed,
   parseStarted,
   parseThreads,
   parseUnpreviewed,
   parseWatchEvent,
   sentence,
+  sessionName,
+  settleSessions,
   stripChips,
   transcript,
 } from './model'
 import { COMPOSE, type Effect, FILTER, type MenuAction, fieldKey, fieldOf, press, putFields, ringMoved } from './keys'
 import { StripView } from './strip'
 import { needsHuman, portFacts, TOOLS } from './tools'
-import { type Draw, ListView, PROJECT_KEYS, type PaneActions, ProjectView, START_KEYS, type Scene, StartView, ThreadView, ringOf } from './view'
+import { type Draw, ListView, PROJECT_KEYS, type PaneActions, ProjectView, SESSION_KEYS, START_KEYS, type Scene, SessionView, StartView, ThreadView, ringOf } from './view'
 
 const PANE = 'nexus'
 const POLL_MS = 5_000
@@ -66,6 +78,11 @@ const STRIP_MS = 10_000
 const TICK_MS = 1_000
 /** A `$.process.run` of the CLI: its own requests give up after 30 s without data, and `start` makes two. */
 const RUN_MS = 70_000
+/**
+ * A `$.process.run` of `session open` or `close`: the CLI tries a paused pylon again once a second for up to 120 s, then
+ * waits up to 120 s more for the agent to start.
+ */
+const SESSION_MS = 260_000
 const READ_CHARS = 6_000
 const REPLY_CHARS = 4_000
 /**
@@ -97,14 +114,17 @@ const paneAtom = atom({ plugin: 'nexus', key: 'pane' } as const, {
   scroll: null,
   detailsTop: 0,
   portCursor: null,
+  sessionCursor: null,
   toggled: {},
   filter: '',
   draft: '',
   start: null,
   project: null,
+  session: null,
   fields: {},
   notice: null,
   portChanges: {},
+  sessionChanges: {},
 })
 const STRIP = { plugin: 'nexus', key: 'strip' } as const
 /** What `$.store` keeps under `strip`, mirrored here so a change draws the strip again. */
@@ -156,12 +176,15 @@ const failed = (message: string): Outcome<never> => ({ ok: false, failure: { kin
 const couldNotRun = (error: unknown) =>
   `could not run ${cli} (${messageOf(error)}); install the Nexus CLI or set its path in the nexus plugin's cli option`
 
-/** One CLI command with `--json` after its name, `project add` being its one name of two words: its parsed stdout, or how it failed. */
-async function nexus($: EngineInterface, args: readonly string[]): Promise<Outcome<unknown>> {
-  const words = args[0] === 'project' ? 2 : 1
+/**
+ * One CLI command with `--json` after its name, `project add`, `session open` and `session close` being its names of
+ * two words: its parsed stdout, or how it failed.
+ */
+async function nexus($: EngineInterface, args: readonly string[], timeoutMs = RUN_MS): Promise<Outcome<unknown>> {
+  const words = args[0] === 'project' || args[0] === 'session' ? 2 : 1
   let ran: Awaited<ReturnType<EngineInterface['process']['run']>>
   try {
-    ran = await $.process.run([cli, ...args.slice(0, words), '--json', ...args.slice(words)], { timeoutMs: RUN_MS })
+    ran = await $.process.run([cli, ...args.slice(0, words), '--json', ...args.slice(words)], { timeoutMs })
   } catch (error) {
     return failed(couldNotRun(error))
   }
@@ -422,6 +445,11 @@ async function poll($: EngineInterface) {
           ? { ...shown, failure: detail.failure }
           : { thread, detail: null, askedSeq, failure: detail.failure },
     )
+    // The opens and closes these details show, or that waited long enough for them, are drawn from the details now.
+    const changes = (await read($, paneAtom)).sessionChanges[thread]
+    if (detail.ok && changes && settleSessions(changes, detail.value.sessions, now) !== changes) {
+      await changeSessions($, thread, was => settleSessions(was, detail.value.sessions, now))
+    }
   } finally {
     current.isBusy = false
   }
@@ -526,8 +554,18 @@ async function startPane($: EngineInterface) {
       stopped: promise,
     }
     void loadCatalog($, { projects: false })
-    // A port's CLI ran under the poller before this one, or the module before a reload: none is under way now.
-    await update($, paneAtom, pane => ({ ...pane, portChanges: {} }))
+    // A port's CLI ran under the poller before this one, or the module before a reload: none is under way now. A
+    // session's open or close outlives the pane, so only those a reload ended go.
+    await update($, paneAtom, pane => ({
+      ...pane,
+      portChanges: {},
+      sessionChanges: Object.fromEntries(
+        Object.entries(pane.sessionChanges).map(([thread, changes]) => [
+          thread,
+          { ...changes, opening: changes.opening.filter(one => sessionOps.has(`open:${one.id}`)), closing: changes.closing.filter(pane => sessionOps.has(`close:${thread}:${pane}`)) },
+        ]),
+      ),
+    }))
   }
   void poll($)
   const { selected, view } = await read($, paneAtom)
@@ -613,10 +651,12 @@ const threadView = (pane: NexusPane, thread: string): Partial<NexusPane> => {
     scroll: isSame ? pane.scroll : null,
     detailsTop: isSame ? pane.detailsTop : 0,
     portCursor: isSame ? pane.portCursor : null,
+    sessionCursor: isSame ? pane.sessionCursor : null,
     listCursor: thread,
     draft: '',
     fields: putFields(pane.fields, { [COMPOSE]: '' }),
     start: null,
+    session: null,
     notice: null,
     toggled: isSame ? pane.toggled : {},
   }
@@ -915,6 +955,136 @@ async function confirmDelete($: EngineInterface, id: string): Promise<Outcome<st
   return answer === 'Delete' ? act($, 'delete', id) : { ok: true, value: `Kept ${id}.` }
 }
 
+/** `failure`, or for a CLI too old to have `command`, the version `doing` needs. */
+const newer = (failure: NexusFailure, command: string, doing: string, version: string): NexusFailure =>
+  failure.message === `unknown command ${command.split(' ')[0]}`
+    ? { kind: failure.kind, message: `${cli} has no ${command} command: ${doing} needs Nexus CLI ${version} or later (nexus --version)` }
+    : failure
+
+/**
+ * `nexus session open`: a Herdr workspace in the pylon with the harness's agent in it, Claude Code unless `harness`
+ * names another, titled with the harness's name unless `title` is given. It wakes a paused pylon first and returns once
+ * the agent is ready or waits for its human. `=` keeps a title that starts with a dash from reading as a flag.
+ */
+async function openSession($: EngineInterface, thread: string, open: { harness?: NexusHarness | undefined; title?: string | undefined }): Promise<Outcome<NexusOpenedSession>> {
+  const flags = [...(open.harness ? [`--harness=${open.harness}`] : []), ...(open.title ? [`--title=${open.title}`] : [])]
+  const got = await nexus($, ['session', 'open', ...flags, '--', thread], SESSION_MS)
+  return got.ok ? parsed(got, parseOpenedSession) : { ok: false, failure: newer(got.failure, 'session open', 'opening a session', '0.5.0') }
+}
+
+/** `nexus session close`: the pane closed, which ends its agent. A pane already closed succeeds. */
+async function closeSession($: EngineInterface, thread: string, pane: string): Promise<Outcome<null>> {
+  const got = await nexus($, ['session', 'close', '--', thread, pane], SESSION_MS)
+  return got.ok ? parsed(got, parseSessionClosed) : { ok: false, failure: newer(got.failure, 'session close', 'closing a session', '0.5.0') }
+}
+
+/**
+ * The opens and closes this module runs, as `open:<n>` and `close:<thread>:<pane>`: a pane started afresh drops the
+ * rows of any other, which a reload ended. They run as `$.process.run`, so closing the pane does not end them.
+ */
+const sessionOps = new Set<string>()
+/** Opens from the pane so far, which number each one's row. */
+let sessionOpens = 0
+
+const changeSessions = ($: EngineInterface, thread: string, change: (was: NexusSessionChanges) => NexusSessionChanges) =>
+  update($, paneAtom, (pane): NexusPane => ({ ...pane, sessionChanges: { ...pane.sessionChanges, [thread]: change(pane.sessionChanges[thread] ?? NO_SESSION_CHANGES) } }))
+
+/** A notice of how a session's open or close went: `here` while the pane shows `thread`, else `elsewhere`, which names it. */
+const sayOf = ($: EngineInterface, thread: string, here: string, elsewhere: string, tone: 'dim' | 'error') =>
+  update($, paneAtom, (pane): NexusPane => ({ ...pane, notice: { text: pane.selected === thread ? here : elsewhere, tone } }))
+
+/** Opens a session from the pane, its row saying so while the CLI waits for the agent, then shown until the node reports it. */
+async function openInPane($: EngineInterface, thread: string, harness: NexusHarness, title: string | null) {
+  sessionOpens += 1
+  const id = sessionOpens
+  sessionOps.add(`open:${id}`)
+  try {
+    await changeSessions($, thread, was => ({ ...was, opening: [...was.opening, { id, harness, title }] }))
+    await setPane($, () => ({ notice: { text: `Opening ${sessionName(harness, title)}. Its agent can take a minute to start.`, tone: 'dim' } }))
+    const opened = await openSession($, thread, { harness, title: title ?? undefined })
+    const at = await $.clock.now()
+    await changeSessions($, thread, was => ({ ...was, opening: was.opening.filter(one => one.id !== id), opened: opened.ok ? [...was.opened, { session: opened.value, at }] : was.opened }))
+    if (!opened.ok) {
+      const why = sentence(opened.failure.message)
+      return await sayOf($, thread, `The session did not open: ${why}`, `The session in ${thread} did not open: ${why}`, 'error')
+    }
+    const { harness: opener, title: named, herdrPane } = opened.value
+    const done = `Opened ${sessionName(opener, named)} in pane ${herdrPane}`
+    await sayOf($, thread, `${done}. ⏎ in Sessions copies nexus attach: run it in a terminal and pick the session's workspace in Herdr.`, `${done} of ${thread}.`, 'dim')
+    void poll($)
+  } finally {
+    sessionOps.delete(`open:${id}`)
+  }
+}
+
+/** A session as a person names it, from the details or an open the pane confirmed; `the session` when neither has it. */
+async function sessionLabel($: EngineInterface, thread: string, pane: string): Promise<string> {
+  const shown = await read($, shownAtom)
+  const listed = shown?.thread === thread ? shown.detail?.sessions.find(one => one.herdrPane === pane) : undefined
+  const opened = (await read($, paneAtom)).sessionChanges[thread]?.opened.find(one => one.session.herdrPane === pane)?.session
+  const known = listed ?? opened
+  return known ? sessionName(known.harness, known.title) : 'the session'
+}
+
+/** Closes a session from the pane once the person says so. Keep comes first, so the dialog's default keeps it. */
+async function closeInPane($: EngineInterface, thread: string, pane: string) {
+  const name = await sessionLabel($, thread, pane)
+  const answer = await $.ui.ask(`Close ${name} in pane ${pane}? Its agent ends.`, ['Keep', 'Close']).catch(() => 'Keep')
+  // The dialog leaves the keys at the prompt (live test, 2.1.310): the pane, if still open, asks them back for the row
+  // x was pressed on.
+  if ((await $.ui.panes()).some(one => one.id === PANE)) {
+    await $.ui.open(OPEN)
+    const shown = await read($, paneAtom)
+    await (shown.sessionCursor ? focusOn($, shown.sessionCursor) : focusRing($, shown))
+  }
+  if (answer !== 'Close') return setPane($, () => ({ notice: { text: 'Kept the session.', tone: 'dim' } }))
+  const op = `close:${thread}:${pane}`
+  if (sessionOps.has(op)) return setPane($, () => ({ notice: { text: `Pane ${pane} is already closing.`, tone: 'dim' } }))
+  sessionOps.add(op)
+  try {
+    await changeSessions($, thread, was => ({ ...was, closing: [...was.closing, pane] }))
+    await setPane($, () => ({ notice: { text: `Closing pane ${pane}…`, tone: 'dim' } }))
+    const closed = await closeSession($, thread, pane)
+    const at = await $.clock.now()
+    await changeSessions($, thread, was => ({
+      ...was,
+      closing: was.closing.filter(one => one !== pane),
+      ...(closed.ok ? { closed: { ...was.closed, [pane]: at }, opened: was.opened.filter(one => one.session.herdrPane !== pane) } : {}),
+    }))
+    if (!closed.ok) {
+      const why = sentence(closed.failure.message)
+      return await sayOf($, thread, `Pane ${pane} was not closed: ${why}`, `Pane ${pane} of ${thread} was not closed: ${why}`, 'error')
+    }
+    await sayOf($, thread, `Closed pane ${pane}.`, `Closed pane ${pane} of ${thread}.`, 'dim')
+    void poll($)
+  } finally {
+    sessionOps.delete(op)
+  }
+}
+
+/**
+ * The pane of the session `/nexus session close` without a pane closes: the person picks it, Keep them all first, so
+ * the dialog's default and a dismissed dialog keep them. Else what to say instead.
+ */
+async function askSession($: EngineInterface, thread: string): Promise<Outcome<{ pane: string } | { said: string }>> {
+  const detail = parsed(await nexus($, ['show', thread]), parseDetail)
+  if (!detail.ok) return detail
+  const { sessions } = detail.value
+  if (sessions.length === 0) return { ok: true, value: { said: `${thread} has no sessions.` } }
+  // The dialog takes four answers at most, Keep them all among them.
+  if (sessions.length > 3) {
+    return { ok: true, value: { said: `${thread} has ${sessions.length} sessions, more than the dialog lists. /nexus session close ${thread} <pane> closes one of ${sessions.map(one => one.herdrPane).join(', ')}.` } }
+  }
+  const labels = sessions.map(one => `${sessionName(one.harness, one.title)} in pane ${one.herdrPane}, ${one.status}`)
+  const answer = await $.ui.ask(`Close which session of ${thread}? Its agent ends.`, ['Keep them all', ...labels]).catch(() => 'Keep them all')
+  const pane = sessions[labels.indexOf(answer)]?.herdrPane
+  return { ok: true, value: pane ? { pane } : { said: `Kept the sessions of ${thread}.` } }
+}
+
+/** How to attach a terminal on this Mac to the thread's sessions: Claude Code cannot hand its own terminal over. */
+const attachHow = (thread: string) =>
+  `Claude Code cannot give its terminal to the attach, so run this in a terminal or a Herdr tab:\n\n  ${attachCommand(thread)}\n\nEach session is a workspace in the pylon's Herdr: pick one there, and detach from Herdr to come back. ${SSH_HINT}`
+
 /** A command's reply. The transcript heads it with the plugin's name, so a failure is its message alone. */
 const say = (outcome: Outcome<string>) =>
   outcome.ok ? outcome.value : sentence(outcome.failure.message.replace(/^./, first => first.toUpperCase()))
@@ -989,6 +1159,31 @@ async function runCommand($: EngineInterface, args: string): Promise<string> {
       if (!id.ok) return say(id)
       if (command.action === 'delete') return say(await confirmDelete($, id.value))
       return say(await act($, command.action, id.value))
+    }
+    case 'session-open': {
+      const id = await resolveThread($, command.thread)
+      if (!id.ok) return say(id)
+      $.ui.toast(`Opening ${sessionName(command.harness ?? 'claude-code', command.title)} in ${id.value}. Its agent can take a minute to start.`)
+      const opened = await openSession($, id.value, command)
+      if (!opened.ok) return say(opened)
+      void poll($)
+      return `Opened ${sessionName(opened.value.harness, opened.value.title)} in pane ${opened.value.herdrPane} of ${id.value}. /nexus session attach ${id.value} gives the command that attaches a terminal to it.`
+    }
+    case 'session-close': {
+      const id = await resolveThread($, command.thread)
+      if (!id.ok) return say(id)
+      const asked = command.pane ? { ok: true as const, value: { pane: command.pane } } : await askSession($, id.value)
+      if (!asked.ok) return say(asked)
+      if ('said' in asked.value) return asked.value.said
+      const { pane } = asked.value
+      const closed = await closeSession($, id.value, pane)
+      if (!closed.ok) return say(closed)
+      void poll($)
+      return `Closed pane ${pane} of ${id.value}.`
+    }
+    case 'attach': {
+      const id = await resolveThread($, command.thread)
+      return id.ok ? attachHow(id.value) : say(id)
     }
     case 'unpublish': {
       const id = await targetOf($, command.thread)
@@ -1236,13 +1431,22 @@ const emptyStart = (project = '', title = ''): NexusStartDraft => ({ title, proj
 /** The start form's texts by field, as `putFields` takes them. */
 const startTexts = (start: NexusStartDraft) => ({ [START_KEYS.title]: start.title, [START_KEYS.branch]: start.branch, [START_KEYS.message]: start.message })
 
+/** The open a session form's title, as `putFields` takes it. */
+const sessionTexts = (draft: NexusSessionDraft) => ({ [SESSION_KEYS.title]: draft.title })
+
 /** The new project form's texts by field, as `putFields` takes them. */
 const projectTexts = (draft: NexusProjectDraft) => ({ [PROJECT_KEYS.id]: draft.id, [PROJECT_KEYS.repoUrl]: draft.repoUrl, [PROJECT_KEYS.branch]: draft.branch })
 
 /** The pane with each field put again with the text it holds for it: a closed pane's fields forget what was typed. */
 const refilled = (pane: NexusPane): NexusPane => ({
   ...pane,
-  fields: putFields(pane.fields, { [COMPOSE]: pane.draft, [FILTER]: pane.filter, ...(pane.start ? startTexts(pane.start) : {}), ...(pane.project ? projectTexts(pane.project) : {}) }),
+  fields: putFields(pane.fields, {
+    [COMPOSE]: pane.draft,
+    [FILTER]: pane.filter,
+    ...(pane.start ? startTexts(pane.start) : {}),
+    ...(pane.project ? projectTexts(pane.project) : {}),
+    ...(pane.session ? sessionTexts(pane.session) : {}),
+  }),
 })
 
 /**
@@ -1341,6 +1545,27 @@ async function submitProject($: EngineInterface, draft: NexusProjectDraft | null
   if (left !== undefined) await listShown($, left, committed)
 }
 
+/** Opens the form that opens a session in the pylon of the thread shown, Claude Code chosen and no title. */
+async function openSessionForm($: EngineInterface) {
+  const draft: NexusSessionDraft = { harness: 'claude-code', title: '' }
+  await setPane($, pane => (pane.selected ? { view: 'session', mode: 'normal', overlay: null, session: draft, fields: putFields(pane.fields, sessionTexts(draft)) } : {}))
+}
+
+/**
+ * Opens the session the form describes: the form gives way to the Sessions tab at once, where the session shows as
+ * opening while the CLI wakes the pylon and starts the agent, as pi-nexus does.
+ */
+async function submitSession($: EngineInterface, draft: NexusSessionDraft | null) {
+  let thread: string | null = null
+  await update($, paneAtom, (pane): NexusPane => {
+    thread = pane.view === 'session' ? pane.selected : null
+    return thread ? { ...pane, view: 'thread', tab: 'sessions', mode: 'normal', session: null } : pane
+  })
+  if (!thread || !draft) return
+  await focusRing($, await read($, paneAtom))
+  await openInPane($, thread, draft.harness, draft.title.trim() || null)
+}
+
 /** The pane on the list, the cursor on the thread it left. */
 const listView = (was: NexusPane): NexusPane => ({
   ...was,
@@ -1353,10 +1578,12 @@ const listView = (was: NexusPane): NexusPane => ({
   draft: '',
   start: null,
   project: null,
+  session: null,
   toggled: {},
   scroll: null,
   detailsTop: 0,
   portCursor: null,
+  sessionCursor: null,
   listCursor: was.selected ?? was.listCursor,
 })
 
@@ -1412,6 +1639,10 @@ function paneActions($: EngineInterface, surface: RenderSurface): PaneActions {
     }
     // The new project form goes back to the picker it was opened from, over the list or the thread.
     if (view === 'project') return setPane($, () => ({ view: selected ? 'thread' : 'list', mode: 'normal', project: null, overlay: { kind: 'projects', cursor: 'scope-new' } }))
+    if (view === 'session' && selected) {
+      await setPane($, () => ({ view: 'thread', mode: 'normal', session: null }))
+      return focusRing($, await read($, paneAtom))
+    }
     await showList($)
   }
   const refresh = async () => {
@@ -1434,11 +1665,26 @@ function paneActions($: EngineInterface, surface: RenderSurface): PaneActions {
       }
       case 'rewatch':
         return refresh()
+      case 'open-session':
+        return openSessionForm($)
+      case 'attach': {
+        const { selected } = await read($, paneAtom)
+        return selected ? attach(selected) : undefined
+      }
       case 'delete':
         return onShown(id => confirmDelete($, id))
       default:
         return onShown(id => act($, action, id))
     }
+  }
+  /** Copies `nexus attach`, since Claude Code cannot give its own terminal to it, and says where to run it. */
+  const attach = async (thread: string) => {
+    const command = attachCommand(thread)
+    const copied = await $.ui.copy({ text: command, surface })
+    const how = "run it in a terminal or a Herdr tab, pick the session's workspace in Herdr, and detach from Herdr to come back."
+    await setPane($, () => ({
+      notice: copied.isCopied ? { text: `Copied ${command}: ${how}`, tone: 'dim' } : { text: `Not copied (${copied.reason}), so type ${command}: ${how}`, tone: 'error' },
+    }))
   }
   const showTab = async (tab: NexusTab) => {
     await focusOn($, `tab-${tab}`)
@@ -1478,6 +1724,12 @@ function paneActions($: EngineInterface, surface: RenderSurface): PaneActions {
         return chooseScope($, effect.project)
       case 'new-project':
         return openProjectForm($)
+      case 'new-session':
+        return openSessionForm($)
+      case 'close-session':
+        return closeInPane($, effect.thread, effect.pane)
+      case 'attach':
+        return attach(effect.thread)
       case 'refresh':
         return refresh()
       case 'close':
@@ -1572,6 +1824,14 @@ function paneActions($: EngineInterface, surface: RenderSurface): PaneActions {
         await submitProject($, sent)
         if (change) await inTurn(() => putBack($, PROJECT_KEYS, change, pane => pane.project))
       }),
+    sessionDraft: (change, at) =>
+      run(() => inTurn(() => update($, paneAtom, pane => (pane.session && (at === undefined || isDrawn(pane, at)) ? { ...pane, session: { ...pane.session, ...change } } : pane)))),
+    // The form closes on Enter, so no field is put back: what opens is the form as Enter left it.
+    sessionSubmit: change =>
+      run(async () => {
+        const { session: sent } = await inTurn(() => update($, paneAtom, pane => (pane.session ? { ...pane, session: { ...pane.session, ...change } } : pane)))
+        await submitSession($, sent)
+      }),
   }
 }
 
@@ -1583,7 +1843,7 @@ export const register: Register = (on, options) => {
 
   on('session.start', async ($, e, next) => {
     await Promise.all([
-      $.command.register({ name: 'nexus', description: 'Drive Nexus threads: the pane, new, send, open, unpublish, archive, abort, retry, delete, strip, project', argumentHint: '[help]', immediate: true }),
+      $.command.register({ name: 'nexus', description: 'Drive Nexus threads: the pane, new, send, open, unpublish, archive, abort, retry, delete, strip, project, session', argumentHint: '[help]', immediate: true }),
       ...Object.values(TOOLS).map(spec => $.tool.register(spec)),
       loadStrip($),
       loadScope($),
@@ -1690,9 +1950,11 @@ export const register: Register = (on, options) => {
         ? StartView(draw, scene, actions)
         : pane.view === 'project'
           ? ProjectView(draw, scene, actions)
-          : !pane.selected || pane.view === 'list'
-            ? ListView(draw, scene, actions)
-            : ThreadView(draw, scene, actions)
+          : pane.view === 'session'
+            ? SessionView(draw, scene, actions)
+            : !pane.selected || pane.view === 'list'
+              ? ListView(draw, scene, actions)
+              : ThreadView(draw, scene, actions)
     rehome($, tree, pane, e.props.isFocused)
     return tree
   })

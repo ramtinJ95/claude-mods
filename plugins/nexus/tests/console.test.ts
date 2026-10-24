@@ -855,7 +855,7 @@ test('m opens the Actions menu: j and k move its cursor, o runs the entry, q clo
   expect((await ui.find({ type: 'Input', key: await field(ui, 'compose') }))?.props).toMatchObject({ placeholder: 'Queue a follow-up…', submitLabel: 'queue' })
   await ui.input({ key: await field(ui, 'compose'), text: '' })
   await keys(ui, 'm')
-  expect(await menu(ui)).toEqual(['abort', 'archive', 'copy-attach', 'rewatch', 'delete'])
+  expect(await menu(ui)).toEqual(['abort', 'archive', 'copy-attach', 'open-session', 'attach', 'rewatch', 'delete'])
   expect(await cursorOn(ui)).toBe('menu-abort')
   await keys(ui, 'jj')
   expect(await cursorOn(ui)).toBe('menu-copy-attach')
@@ -1014,7 +1014,7 @@ test("opening a thread records one visit, and its show poll stands in for the li
   expect(cli.runs.filter(argv => argv[0] === 'wake')).toHaveLength(1)
 })
 
-test('l walks the tabs: Details shows the pylon, outputs, sessions and the attach command y copies; h walks back to the list', async ($, on) => {
+test('l walks the tabs: Details shows the pylon, outputs and the attach command y copies; h walks back to the list', async ($, on) => {
   const cli = fake()
   const { nexus, mount } = await boot($, on, cli)
   await nexus(`open ${ID}`)
@@ -1025,7 +1025,8 @@ test('l walks the tabs: Details shows the pylon, outputs, sessions and the attac
   // The preview output is the preview Ports lists, so the outputs leave it out.
   expect(await shows(ui, /^OUTPUTS 1 ─/, 'Box')).toBe(true)
   expect(await shows(ui, /^branch\s+fix\/login-plus$/, 'Box')).toBe(true)
-  expect(await shows(ui, /^Claude Code◉ workingnexus:1\.2session 9c1e$/, 'Box')).toBe(true)
+  // The sessions are the Sessions tab's.
+  expect(await shows(ui, /^SESSIONS/, 'Box')).toBe(false)
   expect(await ui.find({ type: 'Link' })).toBeUndefined()
   await keys(ui, 'y')
   expect(cli.copied).toEqual(['herdr --session nexus-7f3a'])
@@ -1304,7 +1305,8 @@ test('the start form offers the projects and nodes, starts with every field it w
   const { nexus, mount } = await boot($, on, cli)
   await nexus('')
   const ui = await mount()
-  await keys(ui, 'n')
+  // In a thread n opens a session; the list's n starts a thread.
+  await keys(ui, 'hn')
   const project = await ui.find({ type: 'Select', key: 'start-project' })
   expect(project?.props).toMatchObject({ value: 'web', options: [{ value: 'web', label: 'web  git@github.com:me/web.git' }, { value: 'api', label: 'api  git@github.com:me/api.git' }] })
   expect((await ui.find({ type: 'Select', key: 'start-node' }))?.props.options).toEqual([
@@ -1407,7 +1409,7 @@ test('a start the control plane refuses stays on the form with its reason', asyn
   const { nexus, mount } = await boot($, on, cli)
   await nexus('')
   const ui = await mount()
-  await keys(ui, 'n')
+  await keys(ui, 'hn')
   await ui.press({ key: 'start-submit' })
   expect(await shows(ui, 'Give the thread a title or a first message.')).toBe(true)
   const fields = typing(ui)
@@ -1427,7 +1429,7 @@ test('Enter starts the text it delivered, and keys typed after it are the next d
   const { nexus, mount } = await boot($, on, cli)
   await nexus('')
   const ui = await mount()
-  await keys(ui, 'n')
+  await keys(ui, 'hn')
   const fields = typing(ui)
   await fields.type('start-title', 'Try it')
   // The engine empties the field as soon as the submit's hooks answer, so the next keys land in it before the CLI runs.

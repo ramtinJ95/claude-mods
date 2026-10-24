@@ -109,12 +109,39 @@ export type NexusWatch = {
   ended: string | null
 }
 
+/** A Herdr pane in the pylon, as its node last reported it. */
 export type NexusSession = {
+  /** The pane, which `session close` takes. */
   herdrPane: string
-  harness: 'claude-code' | 'pi' | 'shell'
+  harness: NexusHarness
   harnessSessionId: string | null
   status: 'working' | 'idle' | 'blocked' | 'done' | 'unknown'
+  /** Its Herdr workspace's label; null from a probe or control plane older than CLI 0.5.0. */
+  title: string | null
 }
+
+/** The agents `session open` starts in a pylon. */
+export type NexusHarness = 'claude-code' | 'pi' | 'shell'
+
+/** What `session open` prints: the session it opened, with the title the CLI gave it. */
+export type NexusOpenedSession = { herdrPane: string; harness: NexusHarness; title: string }
+
+/**
+ * What the person did to a thread's sessions from the pane: the opens and closes under way, and those confirmed that
+ * the details have not shown yet, each with when it was confirmed. The node reads its sessions again once the CLI has
+ * answered, so a `show` asked for after the confirmation can still list them as they were.
+ */
+export type NexusSessionChanges = {
+  /** Each open under way, by the number the pane gave it. */
+  opening: { id: number; harness: NexusHarness; title: string | null }[]
+  opened: { session: NexusOpenedSession; at: number }[]
+  closing: string[]
+  /** When each pane's close was confirmed, by pane. */
+  closed: Record<string, number>
+}
+
+/** What the open a session form holds: the harness, and a title that is the harness's name when empty. */
+export type NexusSessionDraft = { harness: NexusHarness; title: string }
 
 /**
  * The watch's latest `live` event for the thread open in the pane. It has an atom of its own: a streaming answer
@@ -191,10 +218,10 @@ export type NexusProjectDraft = {
   request: number
 }
 
-export type NexusView = 'list' | 'thread' | 'start' | 'project'
+export type NexusView = 'list' | 'thread' | 'start' | 'project' | 'session'
 
 /** The thread view's tabs, in the order h and l walk them. */
-export type NexusTab = 'conversation' | 'details' | 'ports'
+export type NexusTab = 'conversation' | 'details' | 'ports' | 'sessions'
 
 /**
  * Where typed letters go: to the hotkeys (`normal`), the composer (`insert`) or the list's filter (`filter`). The
@@ -257,6 +284,8 @@ export type NexusPane = {
   detailsTop: number
   /** The Ports tab's row under the cursor: `preview-<service>` or `port-<port>`. */
   portCursor: string | null
+  /** The Sessions tab's row under the cursor: `session-<pane>`. */
+  sessionCursor: string | null
   /** The folds, tool rows and closed-thread groups the person opened or closed, by key; the rest follow the defaults. */
   toggled: Record<string, boolean>
   filter: string
@@ -264,6 +293,7 @@ export type NexusPane = {
   draft: string
   start: NexusStartDraft | null
   project: NexusProjectDraft | null
+  session: NexusSessionDraft | null
   /** What the pane last put in each text field, by the field's name (`putFields`). */
   fields: Record<string, NexusField>
   /** The outcome of the last press, until the next one. */
@@ -273,6 +303,8 @@ export type NexusPane = {
    * the CLI runs on; cleared when the pane's processes start afresh, as no older one is under way then.
    */
   portChanges: Record<string, Record<string, NexusPortChange>>
+  /** The sessions the person opened or closed, by thread, kept when the pane leaves a thread as `portChanges` are. */
+  sessionChanges: Record<string, NexusSessionChanges>
 }
 
 /** What the strip above the prompt reads besides the list: whether it shows, and when each thread was last viewed. */
