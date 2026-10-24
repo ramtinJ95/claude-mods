@@ -1030,13 +1030,9 @@ async function sessionLabel($: EngineInterface, thread: string, pane: string): P
 async function closeInPane($: EngineInterface, thread: string, pane: string) {
   const name = await sessionLabel($, thread, pane)
   const answer = await $.ui.ask(`Close ${name} in pane ${pane}? Its agent ends.`, ['Keep', 'Close']).catch(() => 'Keep')
-  // The dialog leaves the keys at the prompt (live test, 2.1.310): the pane, if still open, asks them back for the row
-  // x was pressed on.
-  if ((await $.ui.panes()).some(one => one.id === PANE)) {
-    await $.ui.open(OPEN)
-    const shown = await read($, paneAtom)
-    await (shown.sessionCursor ? focusOn($, shown.sessionCursor) : focusRing($, shown))
-  }
+  // The dialog leaves the keys at the prompt (live test, 2.1.310): the pane asks them back, onto its tab. Putting them
+  // on the row as well gave them to the composer, in normal mode, when a quick close took the row away.
+  if ((await $.ui.panes()).some(one => one.id === PANE)) await $.ui.open(OPEN)
   if (answer !== 'Close') return setPane($, () => ({ notice: { text: 'Kept the session.', tone: 'dim' } }))
   const op = `close:${thread}:${pane}`
   if (sessionOps.has(op)) return setPane($, () => ({ notice: { text: `Pane ${pane} is already closing.`, tone: 'dim' } }))
