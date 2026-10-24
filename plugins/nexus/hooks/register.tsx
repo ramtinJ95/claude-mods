@@ -477,6 +477,17 @@ async function checkScope($: EngineInterface, projects: readonly NexusProject[],
  * `nexus project add`: the project added, its list read again. A CLI before 0.4.0 says only that it does not know the
  * command.
  */
+/**
+ * Shows the project just added, unless another was chosen while the CLI added it, from `asked`: that choice is the
+ * newer one. Says which the pane shows.
+ */
+async function showAdded($: EngineInterface, asked: string | null, id: string) {
+  const shown = await update($, scopeAtom, now => (now === asked ? id : now))
+  if (shown !== id) return `Nexus still shows ${shown === null ? 'every project' : `the project ${shown}`}, chosen while it was added.`
+  await $.store.set('project', id)
+  return 'Nexus shows its threads.'
+}
+
 async function addProject($: EngineInterface, add: { id: string; repoUrl: string; node: string; branch: string }): Promise<Outcome<NexusProject>> {
   // After `--` the CLI's parseArgs reads the ID and URL as given, though one starts with dashes.
   const got = await nexus($, ['project', 'add', `--node=${add.node}`, `--branch=${add.branch}`, '--', add.id, add.repoUrl])
@@ -935,11 +946,11 @@ async function runCommand($: EngineInterface, args: string): Promise<string> {
       return say(await scopeCommand($, command.project))
     case 'add-project': {
       const { verb: _, ...add } = command
+      const asked = await read($, scopeAtom)
       const added = await addProject($, { ...add, branch: add.branch ?? 'main' })
       // The transcript heads a reply with the plugin's name: a failure reads `nexus: <the CLI's message>`.
       if (!added.ok) return added.failure.message
-      await setScope($, added.value.id)
-      return `Added the project ${added.value.id} (${added.value.repoUrl}) on ${added.value.defaultNode}. Nexus shows its threads.`
+      return `Added the project ${added.value.id} (${added.value.repoUrl}) on ${added.value.defaultNode}. ${await showAdded($, asked, added.value.id)}`
     }
     case 'open': {
       const id = await resolveThread($, command.thread)
@@ -1297,19 +1308,20 @@ async function submitProject($: EngineInterface, draft: NexusProjectDraft | null
   adds += 1
   const request = adds
   await setProjectDraft($, { isAdding: true, error: null, request })
+  const asked = await read($, scopeAtom)
   const added = await addProject($, add)
-  if (added.ok) await setScope($, added.value.id)
+  const where = added.ok ? await showAdded($, asked, added.value.id) : ''
   let left: string | null | undefined
   const committed = await update($, paneAtom, (pane): NexusPane => {
     left = undefined
     if (pane.view !== 'project' || pane.project?.request !== request) {
-      const said = added.ok ? `Added the project ${added.value.id}. Nexus shows its threads.` : `The project was not added: ${added.failure.message}`
+      const said = added.ok ? `Added the project ${added.value.id}. ${where}` : `The project was not added: ${added.failure.message}`
       return { ...pane, notice: { text: said, tone: added.ok ? 'dim' : 'error' } }
     }
     if (!added.ok) return { ...pane, project: { ...pane.project, isAdding: false, error: added.failure.message } }
     left = pane.selected
     const { id, repoUrl, defaultNode } = added.value
-    return { ...listView(pane), notice: { text: `Added the project ${id} (${repoUrl}) on ${defaultNode}. Nexus shows its threads.`, tone: 'dim' } }
+    return { ...listView(pane), notice: { text: `Added the project ${id} (${repoUrl}) on ${defaultNode}. ${where}`, tone: 'dim' } }
   })
   if (left !== undefined) await listShown($, left, committed)
 }
