@@ -671,6 +671,9 @@ async function putBack<Field extends string>(
   if (name) await focusOn($, fieldKey(pane.fields, name))
 }
 
+/** Whether the field drawn as `key` is still drawn so: a put draws it anew, and keys typed into the old one go with it. */
+const isDrawn = (pane: NexusPane, key: string) => fieldKey(pane.fields, fieldOf(key)) === key
+
 /** Asks for the ring on `key`; a refusal (not drawn yet, or the pane lacks the keys) leaves it where it is. */
 const focusOn = ($: EngineInterface, key: string) =>
   $.ui.focus({ requestId: PANE, key }).then(
@@ -1129,8 +1132,7 @@ async function openStart($: EngineInterface, project?: string, title?: string) {
 }
 
 /** Starts the thread the form describes and shows it; a failure stays on the form. */
-async function submitStart($: EngineInterface) {
-  const { start: draft } = await read($, paneAtom)
+async function submitStart($: EngineInterface, draft: NexusStartDraft | null) {
   if (!draft || draft.isStarting) return
   const title = draft.title.trim()
   const message = draft.message.trim()
@@ -1288,7 +1290,7 @@ function paneActions($: EngineInterface, surface: RenderSurface): PaneActions {
       }),
     // Each change of the filter opens the closed groups it matches afresh, as the dashboard's does, so a group the
     // person folded or opened before follows the new filter.
-    filter: text => run(() => update($, paneAtom, pane => filtered(pane, text))),
+    filter: (text, at) => run(() => update($, paneAtom, pane => (isDrawn(pane, at) ? filtered(pane, text) : pane))),
     filterDone: (text, first) =>
       run(async () => {
         // Enter's text is the filter, though its last change may not have landed yet; the first match drawn is then
@@ -1314,7 +1316,8 @@ function paneActions($: EngineInterface, surface: RenderSurface): PaneActions {
         await onShown(id => send($, id, text.trim()))
       }),
     back: () => run(back),
-    startDraft: change => run(() => setStart($, { ...change, error: null })),
+    startDraft: (change, at) =>
+      run(() => update($, paneAtom, pane => (pane.start && (at === undefined || isDrawn(pane, at)) ? { ...pane, start: { ...pane.start, ...change, error: null } } : pane))),
     startProject: project =>
       run(() =>
         update($, paneAtom, pane =>
@@ -1323,11 +1326,11 @@ function paneActions($: EngineInterface, surface: RenderSurface): PaneActions {
       ),
     startSubmit: change =>
       run(async () => {
-        if (change) {
-          await setStart($, change)
-          await putBack($, START_KEYS, change, pane => pane.start)
-        }
-        await submitStart($)
+        // What starts is the form as Enter left it: the engine empties the field at once, and typing there after Enter
+        // is the next draft's.
+        const { start: sent } = await setStart($, change ?? {})
+        if (change) await putBack($, START_KEYS, change, pane => pane.start)
+        await submitStart($, sent)
       }),
   }
 }

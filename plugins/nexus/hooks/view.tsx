@@ -111,13 +111,15 @@ export type PaneActions = {
   /** Opens or closes a fold, a tool row or a group's closed threads, as drawn now. */
   toggle: (key: string, isOpen: boolean) => void
   tab: (tab: NexusTab) => void
-  filter: (text: string) => void
+  /** A change of the filter, typed into the field drawn as `at`. */
+  filter: (text: string, at: string) => void
   /** Enter in the filter: back to normal mode, the cursor on the first thread it keeps. */
   filterDone: (text: string, first: string | null) => void
   draft: (text: string) => void
   submit: (text: string) => void
   back: () => void
-  startDraft: (change: Partial<NexusStartDraft>) => void
+  /** A change of the start form; `at` is the field it was typed into, as drawn. */
+  startDraft: (change: Partial<NexusStartDraft>, at?: string) => void
   /** Picks the form's project, which clears the node and branch chosen for the one before. */
   startProject: (project: string) => void
   /** Starts the thread, the field Enter was pressed in carrying its text: it may not have reported it yet. */
@@ -512,7 +514,7 @@ export function ListView(draw: Draw, scene: Scene, actions: PaneActions) {
     ),
     isFiltering ? (
       <Box key="filter-box" marginTop={1} borderStyle="round" borderColor="promptBorder" paddingX={1}>
-        <Input key={fieldKey(pane.fields, FILTER)} autoFocus label="⌕" value={pane.fields[FILTER]?.text} placeholder="filter threads by title" submitLabel="done" onInput={actions.filter} onSubmit={text => actions.filterDone(text, order.find(one => !one.id.startsWith('closed-'))?.id ?? null)} />
+        <Input key={fieldKey(pane.fields, FILTER)} autoFocus label="⌕" value={pane.fields[FILTER]?.text} placeholder="filter threads by title" submitLabel="done" onInput={text => actions.filter(text, fieldKey(pane.fields, FILTER))} onSubmit={text => actions.filterDone(text, order.find(one => !one.id.startsWith('closed-'))?.id ?? null)} />
       </Box>
     ) : (
       pane.filter && <Text key="filtered" color="subtle">{`⌕ ${pane.filter}   f edits it, an empty filter shows all`}</Text>
@@ -1506,7 +1508,7 @@ export function StartView(draw: Draw, scene: Scene, actions: PaneActions) {
             value={scene.pane.fields[START_KEYS.title]?.text}
             placeholder="What should this thread do?"
             submitLabel="start"
-            onInput={title => actions.startDraft({ title })}
+            onInput={title => actions.startDraft({ title }, fieldKey(scene.pane.fields, START_KEYS.title))}
             onSubmit={title => actions.startSubmit({ title })}
           />
           <Select
@@ -1532,7 +1534,7 @@ export function StartView(draw: Draw, scene: Scene, actions: PaneActions) {
             value={scene.pane.fields[START_KEYS.branch]?.text}
             placeholder={chosen?.defaultBranch ?? ''}
             submitLabel="start"
-            onInput={value => actions.startDraft({ branch: value })}
+            onInput={value => actions.startDraft({ branch: value }, fieldKey(scene.pane.fields, START_KEYS.branch))}
             onSubmit={value => actions.startSubmit({ branch: value })}
           />
           <Input
@@ -1542,7 +1544,7 @@ export function StartView(draw: Draw, scene: Scene, actions: PaneActions) {
             value={scene.pane.fields[START_KEYS.message]?.text}
             placeholder="The first message for the agent"
             submitLabel="start"
-            onInput={message => actions.startDraft({ message })}
+            onInput={message => actions.startDraft({ message }, fieldKey(scene.pane.fields, START_KEYS.message))}
             onSubmit={message => actions.startSubmit({ message })}
           />
           <Text color="subtle">{`Boots a pylon on ${node} and checks out ${branch}.`}</Text>
