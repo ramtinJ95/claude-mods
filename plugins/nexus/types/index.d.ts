@@ -145,8 +145,11 @@ export type NexusOpenedSession = { herdrPane: string; harness: NexusHarness; tit
 export type NexusSessionChanges = {
   /** Each open under way, by the number the pane gave it. */
   opening: { id: number; harness: NexusHarness; title: string | null }[]
-  /** `before`: the IDs the details listed when the open was confirmed, or null when they were not at hand. */
-  opened: { session: NexusOpenedSession; at: number; before: string[] | null }[]
+  /**
+   * `before`: the IDs and harness session IDs of the sessions the details listed when the open was confirmed, or null
+   * when they were not at hand. A wake moves a session's pane, and so its ID, but keeps its harness session ID.
+   */
+  opened: { session: NexusOpenedSession; at: number; before: { ids: string[]; harnessSessionIds: string[] } | null }[]
   /** The IDs of the sessions whose close is under way. */
   closing: string[]
   /** Each close confirmed, by session ID: when, and the session's own ID, which a wake that moves its pane keeps. */

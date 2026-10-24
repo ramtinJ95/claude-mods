@@ -1,6 +1,6 @@
 import { describe, expect, test } from 'claude-code/testing'
 
-import type { NexusRow, NexusRunState, NexusThread, NexusWatch } from '../types'
+import type { NexusRow, NexusRunState, NexusSession, NexusSessionChanges, NexusThread, NexusWatch } from '../types'
 import {
   type WatchEntry,
   type WatchEvent,
@@ -386,17 +386,40 @@ describe('paused and failed sessions', () => {
     expect(settleSessions(changes, [], T0 + 1_000).closed).toEqual({})
   })
 
-  test('an open confirmed shows until the details list it in its pane, or as a session of its harness and title they did not list before, in another pane after a wake', () => {
-    const old = sessionsOf([{ ...PANE, herdrPane: 'w0:p1', id: 'w0:p1', state: 'running', title: 'shell', harness: 'shell', harnessSessionId: null }])
-    const opened = { session: { herdrPane: 'w3:p1', harness: 'shell' as const, title: 'shell' }, at: T0, before: ['w0:p1'] }
+  test('an open confirmed shows until the details list it in its pane, or in another pane after a wake as a session of its harness and title with a harness session ID not listed before', () => {
+    const claude = (pane: string, harnessSessionId: string | null) => ({ ...PANE, herdrPane: pane, id: pane, state: 'running', harnessSessionId })
+    // A, a Claude Code "review" listed when B, another, was opened in w3:p1.
+    const [a] = sessionsOf([claude('w1:p1', 'aaaa')])
+    const opened: NexusSessionChanges['opened'][number] = { session: { herdrPane: 'w3:p1', harness: 'claude-code', title: 'review' }, at: T0, before: { ids: ['w1:p1'], harnessSessionIds: ['aaaa'] } }
     const changes = { opening: [], opened: [opened], closing: [], closed: {} }
-    // The shell listed before the open is another one, so the open still shows.
-    expect(shownSessions(old, changes, T0 + 1_000).map(one => [one.id, one.status])).toEqual([['w0:p1', 'working'], ['w3:p1', 'opened']])
-    const woken = [...old, ...sessionsOf([{ ...PANE, herdrPane: 'w4:p1', id: 'w4:p1', state: 'running', title: 'shell', harness: 'shell', harnessSessionId: null, status: 'idle' }])]
-    expect(shownSessions(woken, changes, T0 + 1_000).map(one => one.id)).toEqual(['w0:p1', 'w4:p1'])
-    expect(settleSessions(changes, woken, T0 + 1_000).opened).toEqual([])
-    // Without the IDs listed before, only the pane tells.
-    expect(shownSessions(woken, { ...changes, opened: [{ ...opened, before: null }] }, T0 + 1_000).map(one => one.id)).toEqual(['w0:p1', 'w4:p1', 'w3:p1'])
+    const ids = (sessions: NexusSession[], with_ = changes) => shownSessions(sessions, with_, T0 + 1_000).map(one => [one.id, one.status])
+    expect(ids([a!])).toEqual([['w1:p1', 'working'], ['w3:p1', 'opened']])
+    // A wake moves A to w2:p1 before the node reports B: A keeps its harness session ID, so B still shows as opened.
+    const movedA = sessionsOf([claude('w2:p1', 'aaaa')])
+    expect(ids(movedA)).toEqual([['w2:p1', 'working'], ['w3:p1', 'opened']])
+    expect(settleSessions(changes, movedA, T0 + 1_000)).toBe(changes)
+    // B reported in another pane with a harness session ID of its own settles it.
+    const both = [...movedA, ...sessionsOf([claude('w4:p1', 'bbbb')])]
+    expect(ids(both)).toEqual([['w2:p1', 'working'], ['w4:p1', 'working']])
+    expect(settleSessions(changes, both, T0 + 1_000).opened).toEqual([])
+    // One with no harness session ID could be A, moved, so only its pane tells; the row stays until it times out.
+    expect(ids([...movedA, ...sessionsOf([claude('w4:p1', null)])])).toEqual([['w2:p1', 'working'], ['w4:p1', 'working'], ['w3:p1', 'opened']])
+    // Without what was listed before, only the pane tells.
+    expect(ids(both, { ...changes, opened: [{ ...opened, before: null }] })).toEqual([['w2:p1', 'working'], ['w4:p1', 'working'], ['w3:p1', 'opened']])
+  })
+
+  test('two opens of one harness and title never settle against one session', () => {
+    const before = { ids: [], harnessSessionIds: [] }
+    const first = { session: { herdrPane: 'w3:p1', harness: 'claude-code' as const, title: 'review' }, at: T0, before }
+    const second = { session: { herdrPane: 'w5:p1', harness: 'claude-code' as const, title: 'review' }, at: T0, before }
+    const changes = { opening: [], opened: [first, second], closing: [], closed: {} }
+    // A wake moved both before the node reported either, and the details list one of them so far.
+    const one = sessionsOf([{ ...PANE, herdrPane: 'w6:p1', id: 'w6:p1', state: 'running', harnessSessionId: 'cccc' }])
+    expect(shownSessions(one, changes, T0 + 1_000).map(row => [row.id, row.status])).toEqual([['w6:p1', 'working'], ['w5:p1', 'opened']])
+    expect(settleSessions(changes, one, T0 + 1_000).opened).toEqual([second])
+    // A session in an open's own pane goes to that open, not to one matched by title.
+    const own = sessionsOf([{ ...PANE, herdrPane: 'w5:p1', id: 'w5:p1', state: 'running', harnessSessionId: 'dddd' }])
+    expect(settleSessions(changes, own, T0 + 1_000).opened).toEqual([first])
   })
 
   test('nexus --version reads as numbers, and an older version compares before a newer one', () => {

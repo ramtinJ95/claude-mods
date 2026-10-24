@@ -318,7 +318,8 @@ test('x on a paused session says why it cannot close it, asking nothing and runn
   expect(await shows(ui, 'Claude Code "claude" is paused: it resumes on wake, and can be closed once it runs.')).toBe(true)
   expect(cli.asked).toEqual([])
   expect(cli.runs.some(argv => argv[0] === 'session')).toBe(false)
-  await keys(ui, 'o')
+  // Enter on the row presses it, as the ring's Button.
+  await ui.press({ key: 'session-nexus:1.2' })
   expect(cli.copied).toEqual([`nexus attach ${ID}`])
 })
 

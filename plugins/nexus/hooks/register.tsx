@@ -1036,9 +1036,10 @@ async function openInPane($: EngineInterface, thread: string, harness: NexusHarn
     await setPane($, () => ({ notice: { text: `Opening ${sessionName(harness, title)}. Its agent can take a minute to start.`, tone: 'dim' } }))
     const opened = await openSession($, thread, { harness, title: title ?? undefined })
     const at = await $.clock.now()
-    // A wake can move the session to another pane before the node reports it: the IDs listed now tell it from those before.
+    // A wake can move the session to another pane before the node reports it: what is listed now tells it from those before.
     const shown = await read($, shownAtom)
-    const before = shown?.thread === thread && shown.detail ? shown.detail.sessions.map(one => one.id) : null
+    const listed = shown?.thread === thread && shown.detail ? shown.detail.sessions : null
+    const before = listed && { ids: listed.map(one => one.id), harnessSessionIds: listed.flatMap(one => (one.harnessSessionId === null ? [] : [one.harnessSessionId])) }
     await changeSessions($, thread, was => ({ ...was, opening: was.opening.filter(one => one.id !== id), opened: opened.ok ? [...was.opened, { session: opened.value, at, before }] : was.opened }))
     if (!opened.ok) {
       const why = sentence(opened.failure.message)

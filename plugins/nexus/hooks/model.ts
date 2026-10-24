@@ -683,12 +683,37 @@ type Opened = NexusSessionChanges['opened'][number]
 type Closed = NexusSessionChanges['closed'][string]
 
 /**
- * Whether the details list `session` as the one an open confirmed: in its pane, or, since a wake can move a session to
- * another pane, as a session of its harness and title that the details did not list when the open was confirmed.
+ * The opens the details list, each against a session of its own. A pane names one session, so an open listed in its
+ * pane is matched first. A wake can move a session to another pane, so an open is also matched by a session of its
+ * harness and title whose harness session ID the details did not list when the open was confirmed (`before`), which an
+ * existing session that moved keeps. A session with no harness session ID could be one that moved, so it matches only
+ * by pane, and an open nothing matches keeps its row until `SESSION_SETTLE_MS`.
  */
-const isOpenedAs = (opened: Opened, session: NexusSession) =>
-  session.herdrPane === opened.session.herdrPane ||
-  (opened.before !== null && !opened.before.includes(session.id) && session.harness === opened.session.harness && session.title === opened.session.title)
+function listedOpens(opens: readonly Opened[], sessions: readonly NexusSession[]): Set<Opened> {
+  const taken = new Set<NexusSession>()
+  const listed = new Set<Opened>()
+  const claim = (one: Opened, matches: (session: NexusSession) => boolean) => {
+    const session = sessions.find(candidate => !taken.has(candidate) && matches(candidate))
+    if (!session) return
+    taken.add(session)
+    listed.add(one)
+  }
+  for (const one of opens) claim(one, session => session.herdrPane === one.session.herdrPane)
+  for (const one of opens) {
+    const { before } = one
+    if (listed.has(one) || !before) continue
+    claim(
+      one,
+      session =>
+        session.harnessSessionId !== null &&
+        !before.harnessSessionIds.includes(session.harnessSessionId) &&
+        !before.ids.includes(session.id) &&
+        session.harness === one.session.harness &&
+        session.title === one.session.title,
+    )
+  }
+  return listed
+}
 
 /** Whether the details list `session` as the one closed as `id`: by its ID, or by its harness's session ID, which a wake that moves its pane keeps. */
 const isClosedAs = (id: string, closed: Closed, session: NexusSession) =>
@@ -702,15 +727,17 @@ export function shownSessions(sessions: readonly NexusSession[], changes: NexusS
   const isFresh = (at: number) => now - at < SESSION_SETTLE_MS
   const closes = Object.entries(changes.closed).filter(([, closed]) => isFresh(closed.at))
   const listed = sessions.filter(session => !closes.some(([id, closed]) => isClosedAs(id, closed, session)))
+  const listedOpen = listedOpens(changes.opened, sessions)
   const opened = changes.opened
-    .filter(one => isFresh(one.at) && !closes.some(([id]) => id === one.session.herdrPane) && !sessions.some(session => isOpenedAs(one, session)))
+    .filter(one => isFresh(one.at) && !closes.some(([id]) => id === one.session.herdrPane) && !listedOpen.has(one))
     .map(({ session }): ShownSession => ({ ...session, id: session.herdrPane, state: 'running', message: null, status: 'opened', harnessSessionId: null }))
   return [...listed, ...opened]
 }
 
 /** `changes` without the confirmations that `sessions`, just read, show, or that have waited `SESSION_SETTLE_MS`; the same object when none went. */
 export function settleSessions(changes: NexusSessionChanges, sessions: readonly NexusSession[], now: number): NexusSessionChanges {
-  const opened = changes.opened.filter(one => !sessions.some(session => isOpenedAs(one, session)) && now - one.at < SESSION_SETTLE_MS)
+  const listedOpen = listedOpens(changes.opened, sessions)
+  const opened = changes.opened.filter(one => !listedOpen.has(one) && now - one.at < SESSION_SETTLE_MS)
   const closed = Object.fromEntries(
     Object.entries(changes.closed).filter(([id, one]) => sessions.some(session => isClosedAs(id, one, session)) && now - one.at < SESSION_SETTLE_MS),
   )
