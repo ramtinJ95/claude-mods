@@ -1294,11 +1294,12 @@ function paneActions($: EngineInterface, surface: RenderSurface): PaneActions {
     filterDone: (text, first) =>
       run(async () => {
         // Enter's text is the filter, though its last change may not have landed yet; the first match drawn is then
-        // another filter's. Enter emptied the field, so f would edit nothing: it is put again with that text.
+        // another filter's. An empty filter matches every thread, so the cursor stays on its own. Enter emptied the
+        // field, so f would edit nothing: it is put again with that text.
         const pane = await update($, paneAtom, (was): NexusPane => ({
           ...filtered(was, text),
           mode: 'normal',
-          listCursor: (text === was.filter ? first : null) ?? was.listCursor,
+          listCursor: (text !== '' && text === was.filter ? first : null) ?? was.listCursor,
           listTop: 0,
           fields: putFields(was.fields, { [FILTER]: text }),
         }))

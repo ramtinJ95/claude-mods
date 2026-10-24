@@ -145,6 +145,24 @@ test('f filters by title in filter mode, opens a closed group it matches, and En
   expect(await fields.shows('filter')).toBe('old idea')
 })
 
+test('Enter in a filter emptied again opens nothing and leaves the cursor where it was', async ($, on) => {
+  const cli = fake()
+  const { nexus, mount } = await boot($, on, cli)
+  await nexus('')
+  const ui = await mount()
+  await keys(ui, 'hj')
+  const before = await cursorOn(ui)
+  expect(before).not.toBe(ID)
+  await keys(ui, 'f')
+  const fields = typing(ui)
+  await fields.type('filter', 'old')
+  await fields.type('filter', '')
+  await fields.submit('filter')
+  expect(await mode(ui)).toBe('NORMAL')
+  expect(await cursorOn(ui)).toBe(before)
+  expect(await shows(ui, /^◆ Nexus\s/)).toBe(true)
+})
+
 test('Esc from the filter, which hands the keys to the prompt, clears it and takes them back', async ($, on) => {
   const cli = fake()
   const { clock, nexus, mount } = await boot($, on, cli)

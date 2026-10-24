@@ -113,7 +113,7 @@ export type PaneActions = {
   tab: (tab: NexusTab) => void
   /** A change of the filter, typed into the field drawn as `at`. */
   filter: (text: string, at: string) => void
-  /** Enter in the filter: back to normal mode, the cursor on the first thread it keeps. */
+  /** Enter in the filter: back to normal mode, the cursor on the first thread it keeps, or where it was when it is empty. */
   filterDone: (text: string, first: string | null) => void
   draft: (text: string) => void
   submit: (text: string) => void
