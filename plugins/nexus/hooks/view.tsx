@@ -27,6 +27,7 @@ import type {
   NexusNode,
   NexusPane,
   NexusPort,
+  NexusPortChange,
   NexusShown,
   NexusStartDraft,
   NexusThread,
@@ -55,6 +56,9 @@ import {
   exitCode,
   foldSummary,
   groupThreads,
+  linkedPort,
+  NO_CHANGE,
+  portChange,
   previewLook,
   runOf,
   sentence,
@@ -110,6 +114,10 @@ export type PaneActions = {
   details: () => void
   /** Publishes a port of the thread shown as a preview. */
   openPort: (port: number) => void
+  /** Switches the details' digits between publishing ports and picking a preview to unpublish. */
+  pickPreview: () => void
+  /** Unpublishes the preview of a port of the thread shown. */
+  closePort: (port: number) => void
   newThread: () => void
   startAgain: () => void
   startDraft: (change: Partial<NexusStartDraft>) => void
@@ -815,9 +823,12 @@ function Composer(draw: Draw, scene: Scene, actions: PaneActions, pylon: { faile
 
 function detailsKeys(scene: Scene, actions: PaneActions, threadKeys: readonly Key[], detail: NexusDetail | null): Key[] {
   const keep = new Set(['a', 'u', 'd', 'p', 's', 'q'])
+  const isPicking = scene.pane.isPickingPreview
+  const canPick = detail !== null && previewsOf(scene, detail).closable.length > 0
   return [
     { hotkey: 'b', label: 'conversation', onPress: actions.details },
     ...(detail ? [{ hotkey: 'c', label: 'copy attach command', onPress: () => actions.copy(detail.attach, scene.surface) }] : []),
+    ...(canPick || isPicking ? [{ hotkey: 'x', label: isPicking ? 'cancel unpublish' : 'unpublish a preview', onPress: actions.pickPreview }] : []),
     ...threadKeys.filter(key => keep.has(key.hotkey)),
   ]
 }
@@ -826,11 +837,39 @@ function detailsKeys(scene: Scene, actions: PaneActions, threadKeys: readonly Ke
 const UNREACHABLE_HINT = "A server bound only to ::1 can't be previewed, so bind it to 0.0.0.0 or 127.0.0.1."
 
 /**
+ * The previews and the ports with none, as the details list them with what the person confirmed since: a port just
+ * unpublished is under Ports, one just published under Previews. `closable` holds the ports whose preview `x` can
+ * unpublish, in order: a linked port's, which the CLI closes, of a thread that can run, with no operation under way.
+ */
+function previewsOf(scene: Scene, detail: NexusDetail) {
+  const changes = scene.pane.portChanges[detail.thread.id] ?? {}
+  const changeOf = (port: number) => portChange(changes, port, scene.shown?.askedSeq ?? 0)
+  const confirmed = (port: number | null) => (port === null ? null : changeOf(port).confirmed)
+  const listed = detail.previews.flatMap(preview => {
+    const known = confirmed(linkedPort(preview))
+    return known ? (known.preview ? [known.preview] : []) : [preview]
+  })
+  const published = Object.keys(changes).flatMap(port => {
+    const preview = confirmed(Number(port))?.preview
+    return preview && !listed.some(one => one.service === preview.service) ? [preview] : []
+  })
+  const previews = [...listed, ...published]
+  const unpublished =
+    detail.ports?.filter(one => {
+      const known = confirmed(one.port)
+      return (known ? known.preview : one.preview) === null
+    }) ?? null
+  const canRun = detail.thread.status === 'active' || detail.thread.status === 'idle'
+  const closable = canRun ? previews.flatMap(preview => linkedPort(preview) ?? []).filter(port => !changeOf(port).pending) : []
+  return { previews, unpublished, closable, changeOf }
+}
+
+/**
  * The dashboard's inspector: the pylon, its previews, the ports that listen with none, the thread's outputs and its
  * sessions. Each port is listed once: under Previews once it has one, under Ports until then.
  */
 function DetailsBody(draw: Draw, scene: Scene, actions: PaneActions) {
-  const { Box, Text, Link } = draw
+  const { Box, Text, Button, Link } = draw
   const { detail } = threadOf(scene)
   if (!detail) return <Text color="subtle">{scene.shown?.failure ? '' : 'Loading the details…'}</Text>
   const { thread, pylon } = detail
@@ -856,7 +895,8 @@ function DetailsBody(draw: Draw, scene: Scene, actions: PaneActions) {
     </Box>
   )
   const portOf = new Map((detail.ports ?? []).flatMap(one => (one.preview ? [[one.preview.service, one.port] as const] : [])))
-  const unpublished = detail.ports?.filter(one => one.preview === null) ?? null
+  const { previews, unpublished, closable, changeOf } = previewsOf(scene, detail)
+  const isPicking = scene.pane.isPickingPreview
   // A preview output stays only for a preview the control plane no longer lists, as the dashboard's outputs do.
   const outputs = detail.outputs.filter(output => output.kind !== 'preview' || !detail.previews.some(preview => preview.service === output.ref))
   const observed = pylon.observedAt === null ? 'never' : `${since(Date.parse(pylon.observedAt), scene.now)}${offline ? ' (stale)' : ''}`
@@ -871,11 +911,22 @@ function DetailsBody(draw: Draw, scene: Scene, actions: PaneActions) {
       {kv('Agent', thread.agentTurnRunning ? 'turn running' : since(thread.lastAgentActivityAt, scene.now), 'agent')}
       <Text color="subtle">{pylon.id}</Text>
       {pylon.failed && <Text color="error">The planner gave up: {pylon.failed}</Text>}
-      {heading('Previews', detail.previews.length)}
-      {detail.previews.length === 0 && <Text color="subtle">No previews.</Text>}
-      {detail.previews.map(preview => {
-        const look = previewLook(detail, preview)
+      {heading('Previews', previews.length)}
+      {previews.length === 0 && <Text color="subtle">No previews.</Text>}
+      {isPicking && <Text color="subtle">A preview's digit unpublishes it. Publishing the port again may give it a new URL.</Text>}
+      {previews.map(preview => {
         const port = portOf.get(preview.service)
+        const linked = linkedPort(preview)
+        const change = linked === null ? NO_CHANGE : changeOf(linked)
+        const pick = linked === null ? -1 : closable.indexOf(linked)
+        const look = change.pending
+          ? {
+              linked: false,
+              label: change.pending === 'close' ? 'closing…' : 'opening…',
+              tone: 'busy' as Tone,
+              hint: pylon.actualState === 'paused' ? 'Waking the pylon first, which can take two minutes.' : null,
+            }
+          : previewLook(detail, preview)
         return (
           <Box key={`preview-${preview.service}`} flexDirection="column">
             <Box flexDirection="row" columnGap={1}>
@@ -884,8 +935,12 @@ function DetailsBody(draw: Draw, scene: Scene, actions: PaneActions) {
               {port !== undefined && preview.service !== `port-${port}` && <Text color="subtle">{`port ${port}`}</Text>}
               <Text color="subtle">{look.label}</Text>
               {look.linked ? <Link href={preview.url} /> : <Text color="subtle">{preview.url}</Text>}
+              {isPicking && linked !== null && pick >= 0 && (
+                <Button key={`close-${linked}`} plain hotkey={pick < 9 ? String(pick + 1) : undefined} label="unpublish" onPress={() => actions.closePort(linked)} />
+              )}
             </Box>
             {look.hint && <Text color="subtle">{`  ${look.hint}`}</Text>}
+            {change.failure && <Text color="error">{`  ${change.failure.message}`}</Text>}
           </Box>
         )
       })}
@@ -893,7 +948,10 @@ function DetailsBody(draw: Draw, scene: Scene, actions: PaneActions) {
       {unpublished === null ? (
         <Text color="subtle">The pylon's ports could not be read.</Text>
       ) : unpublished.length > 0 ? (
-        unpublished.map(port => PortRow(draw, scene, actions, port, unpublished.filter(one => one.service === null).indexOf(port)))
+        unpublished.map(port => {
+          const index = unpublished.filter(one => one.service === null).indexOf(port)
+          return PortRow(draw, actions, port, changeOf(port.port), isPicking || index >= 9 ? undefined : String(index + 1))
+        })
       ) : pylon.actualState !== 'running' ? (
         <Text color="subtle">Ports show while the pylon runs.</Text>
       ) : (
@@ -927,12 +985,12 @@ function DetailsBody(draw: Draw, scene: Scene, actions: PaneActions) {
 
 /**
  * A port that listens with no preview. One no service owns opens on its digit, as the list opens a thread, or on
- * Enter; it says so while the CLI waits for its URL, then links it until the next details list it under Previews,
- * and a failure says why and opens again. A service without a preview cannot be previewed, which the CLI refuses,
+ * Enter; it says so while the CLI waits for its URL, then Previews lists it with its link, and a failure says why
+ * and opens again. A service without a preview cannot be previewed, which the CLI refuses,
  * so its port only names it.
  */
-function PortRow(draw: Draw, scene: Scene, actions: PaneActions, port: NexusPort, index: number) {
-  const { Box, Text, Button, Link } = draw
+function PortRow(draw: Draw, actions: PaneActions, port: NexusPort, change: NexusPortChange, hotkey: string | undefined) {
+  const { Box, Text, Button } = draw
   const key = `port-${port.port}`
   if (port.service !== null) {
     return (
@@ -943,28 +1001,20 @@ function PortRow(draw: Draw, scene: Scene, actions: PaneActions, port: NexusPort
       </Box>
     )
   }
-  const opening = scene.pane.openings[String(port.port)]
-  if (opening?.phase === 'open') {
-    return (
-      <Box key={key} flexDirection="row" columnGap={1}>
-        {Dot(draw, 'ok')}
-        <Text bold>{String(port.port)}</Text>
-        <Link href={opening.preview.url} />
-      </Box>
-    )
-  }
   const [tone, note]: [Tone, string] =
-    opening?.phase === 'opening'
+    change.pending === 'open'
       ? ['busy', 'opening: publishing it and waiting for the node to serve its URL…']
-      : opening?.phase === 'failed'
-        ? ['bad', 'did not open; press again to retry']
-        : ['muted', 'no preview yet; press to open one']
+      : change.pending === 'close'
+        ? ['busy', 'closing: unpublishing its preview…']
+        : change.failure?.action === 'open'
+          ? ['bad', 'did not open; press again to retry']
+          : ['muted', 'no preview yet; press to open one']
   return (
     <Box key={key} flexDirection="column">
-      <Button key={key} plain hotkey={index < 9 ? String(index + 1) : undefined} onPress={() => actions.openPort(port.port)}>
+      <Button key={key} plain hotkey={hotkey} onPress={() => actions.openPort(port.port)}>
         {Dot(draw, tone)} <Text bold>{String(port.port)}</Text> <Text color="subtle">{note}</Text>
       </Button>
-      {opening?.phase === 'failed' && <Text color="error">{`  ${opening.message}`}</Text>}
+      {change.failure && <Text color="error">{`  ${change.failure.message}`}</Text>}
     </Box>
   )
 }

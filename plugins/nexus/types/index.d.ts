@@ -138,7 +138,13 @@ export type NexusDetail = {
 }
 
 /** The `show` poll of the thread open in the pane. */
-export type NexusShown = { thread: string; detail: NexusDetail | null; failure: NexusFailure | null }
+export type NexusShown = {
+  thread: string
+  detail: NexusDetail | null
+  /** The poll's place in `sequence`, taken as it asked: a port change confirmed before it, the details show. */
+  askedSeq: number
+  failure: NexusFailure | null
+}
 
 export type NexusProject = { id: string; repoUrl: string; defaultBranch: string; defaultNode: string }
 export type NexusNode = { name: string; tailnetHost: string; state: 'online' | 'offline' }
@@ -168,8 +174,18 @@ export type NexusStartDraft = {
 
 export type NexusView = 'list' | 'thread' | 'details' | 'start'
 
-/** A port the person asked to open: `nexus preview --wait` under way, the preview it printed, or why it failed. */
-export type NexusOpening = { phase: 'opening' } | { phase: 'open'; preview: NexusPreview } | { phase: 'failed'; message: string }
+/**
+ * A port the person published or unpublished from the pane. The three are apart, so an operation that starts or
+ * fails never loses what the last one that succeeded did.
+ */
+export type NexusPortChange = {
+  /** What the last operation that succeeded left the port with, its preview or none, and its place in `sequence`. */
+  confirmed: { preview: NexusPreview | null; seq: number } | null
+  /** `nexus preview --wait` or `nexus unpreview` under way. */
+  pending: 'open' | 'close' | null
+  /** Why the last operation failed, until the next starts. */
+  failure: { action: 'open' | 'close'; message: string } | null
+}
 
 export type NexusPane = {
   view: NexusView
@@ -185,8 +201,13 @@ export type NexusPane = {
   start: NexusStartDraft | null
   /** The outcome of the last press, until the next one. */
   notice: { text: string; tone: 'error' | 'dim' } | null
-  /** The ports of the thread shown that the person opened, by port; cleared when another thread opens. */
-  openings: Record<string, NexusOpening>
+  /**
+   * The ports the person published or unpublished, by thread and then port. Kept when the pane leaves a thread, since
+   * the CLI runs on; cleared when the pane's processes start afresh, as no older one is under way then.
+   */
+  portChanges: Record<string, Record<string, NexusPortChange>>
+  /** `x` in the details: the digits pick a preview to unpublish instead of a port to publish. */
+  isPickingPreview: boolean
 }
 
 declare module 'claude-code' {

@@ -5,8 +5,8 @@ import type {
   NexusCatalog,
   NexusFailure,
   NexusList,
-  NexusOpening,
   NexusPane,
+  NexusPortChange,
   NexusPreview,
   NexusRunState,
   NexusShown,
@@ -20,6 +20,7 @@ import {
   type Action,
   type Reply,
   FULL_ID,
+  NO_CHANGE,
   USAGE,
   type WatchEntry,
   type WatchEvent,
@@ -78,7 +79,8 @@ const paneAtom = atom({ plugin: 'nexus', key: 'pane' } as const, {
   draft: '',
   start: null,
   notice: null,
-  openings: {},
+  portChanges: {},
+  isPickingPreview: false,
 })
 
 /** The CLI to run, from the `cli` option. */
@@ -95,6 +97,11 @@ let watcher: { thread: string; stop: () => void } | undefined
 let visit: string | undefined
 /** Start submissions so far, which number each form's `request`. */
 let starts = 0
+/**
+ * Orders each port change's confirmation and each `show` asked for, exactly where a clock could give two the same
+ * millisecond: a `show` asked for after a confirmation lists what it confirmed, or what changed since.
+ */
+let sequence = 0
 
 type Outcome<T> = { ok: true; value: T } | { ok: false; failure: NexusFailure }
 
@@ -337,6 +344,8 @@ async function poll($: EngineInterface) {
     const { view, selected } = await read($, paneAtom)
     if (view === 'start') return
     const thread = view === 'list' ? null : selected
+    sequence += 1
+    const askedSeq = sequence
     const got = await childJson($, thread ? ['show', thread] : ['threads', '--all'], current.stopped)
     const now = await $.clock.now()
     if (!got || poller !== current) return
@@ -350,7 +359,11 @@ async function poll($: EngineInterface) {
     if ((await read($, paneAtom)).selected !== thread) return
     if (detail.ok) void recordVisit($, detail.value.thread)
     await update($, shownAtom, (shown): NexusShown =>
-      detail.ok ? { thread, detail: detail.value, failure: null } : { thread, detail: shown?.thread === thread ? shown.detail : null, failure: detail.failure },
+      detail.ok
+        ? { thread, detail: detail.value, askedSeq, failure: null }
+        : shown?.thread === thread
+          ? { ...shown, failure: detail.failure }
+          : { thread, detail: null, askedSeq, failure: detail.failure },
     )
   } finally {
     current.isBusy = false
@@ -388,8 +401,8 @@ async function startPane($: EngineInterface) {
       stopped: promise,
     }
     void loadCatalog($, { projects: false })
-    // A port's wait ran under the poller before this one, or the module before a reload: none is under way now.
-    await update($, paneAtom, pane => ({ ...pane, openings: {} }))
+    // A port's CLI ran under the poller before this one, or the module before a reload: none is under way now.
+    await update($, paneAtom, pane => ({ ...pane, portChanges: {} }))
   }
   void poll($)
   const { selected, view } = await read($, paneAtom)
@@ -428,7 +441,7 @@ async function setPane($: EngineInterface, change: (pane: NexusPane) => Partial<
   await update($, paneAtom, pane => ({ ...pane, notice: null, ...change(pane) }))
 }
 
-/** The pane showing `thread`, keeping what the person opened and closed in it, and the ports opened, when it was shown already. */
+/** The pane showing `thread`, keeping what the person opened and closed in it when it was shown already. */
 const threadView = (pane: NexusPane, thread: string): Partial<NexusPane> => ({
   view: 'thread',
   selected: thread,
@@ -437,7 +450,6 @@ const threadView = (pane: NexusPane, thread: string): Partial<NexusPane> => ({
   start: null,
   notice: null,
   toggled: pane.selected === thread ? pane.toggled : {},
-  openings: pane.selected === thread ? pane.openings : {},
 })
 
 /** Shows a thread: its watch, and its details polled, the first of which records the visit as the dashboard's page does. */
@@ -506,27 +518,47 @@ async function previewPort($: EngineInterface, thread: string, port: number, sto
   return got && parsed(got, json => parsePreview(json, 'preview'))
 }
 
+/** `nexus unpreview <thread> <port>`: the port's linked preview closed, waking a paused pylon first. Undefined once stopped. */
+async function unpreviewPort($: EngineInterface, thread: string, port: number, stop: Promise<void>): Promise<Outcome<null> | undefined> {
+  const got = await childJson($, ['unpreview', thread, String(port)], stop)
+  if (!got || got.ok) return got && { ok: true, value: null }
+  // A CLI before 0.3.0 has no unpreview, and says only that it does not know the command.
+  if (got.failure.message === 'unknown command unpreview') {
+    return { ok: false, failure: { kind: got.failure.kind, message: `${cli} has no unpreview command: unpublishing a preview needs Nexus CLI 0.3.0 or later (nexus --version)` } }
+  }
+  return got
+}
+
 /**
- * Opens a port of the thread shown as a preview, saying so while the CLI waits for the node to serve it, then its
- * link or why it failed. Closing the pane kills the wait; the port is published or refused all the same.
+ * Publishes or unpublishes a port of the thread shown, saying so while the CLI runs, then what it did until the
+ * details show it, or why it failed. A port with an operation under way takes no other: the pane offers none.
+ * Closing the pane kills the CLI; the port changes or is refused all the same.
  */
-async function openPort($: EngineInterface, port: number) {
+async function changePort($: EngineInterface, port: number, action: 'open' | 'close') {
   const current = poller
-  const { selected, openings } = await read($, paneAtom)
+  const { selected } = await read($, paneAtom)
+  if (!current || !selected) return
   const key = String(port)
-  if (!current || !selected || openings[key]?.phase === 'opening') return
-  const mark = (opening: NexusOpening | null) =>
+  const write = (change: (was: NexusPortChange) => NexusPortChange) =>
     update($, paneAtom, (pane): NexusPane => {
-      if (pane.selected !== selected) return pane
-      const { [key]: _, ...rest } = pane.openings
-      return { ...pane, openings: opening ? { ...rest, [key]: opening } : rest }
+      const ports = pane.portChanges[selected] ?? {}
+      return { ...pane, portChanges: { ...pane.portChanges, [selected]: { ...ports, [key]: change(ports[key] ?? NO_CHANGE) } } }
     })
-  await mark({ phase: 'opening' })
-  const got = await previewPort($, selected, port, current.stopped)
-  if (!got) return mark(null)
-  await mark(got.ok ? { phase: 'open', preview: got.value } : { phase: 'failed', message: sentence(got.failure.message) })
-  // The port now has its preview, which the details list under Previews.
-  if (got.ok) void poll($)
+  // Whether the port is free and this operation takes it are one update, so two presses never both start.
+  let isStarted = false
+  await write(was => {
+    isStarted = !was.pending
+    return isStarted ? { ...was, pending: action, failure: null } : was
+  })
+  if (!isStarted) return
+  const got = action === 'open' ? await previewPort($, selected, port, current.stopped) : await unpreviewPort($, selected, port, current.stopped)
+  if (!got) return write(was => ({ ...was, pending: null }))
+  if (!got.ok) return write(was => ({ ...was, pending: null, failure: { action, message: sentence(got.failure.message) } }))
+  sequence += 1
+  const seq = sequence
+  await write(() => ({ confirmed: { preview: got.value, seq }, pending: null, failure: null }))
+  // The details list the port afresh: under Previews once opened, under Ports once closed.
+  void poll($)
 }
 
 async function act($: EngineInterface, action: Action, id: string): Promise<Outcome<string>> {
@@ -606,6 +638,14 @@ async function runCommand($: EngineInterface, args: string): Promise<string> {
       if (!id.ok) return say(id)
       if (command.action === 'delete') return say(await confirmDelete($, id.value))
       return say(await act($, command.action, id.value))
+    }
+    case 'unpublish': {
+      const id = await targetOf($, command.thread)
+      if (!id.ok) return say(id)
+      const closed = await unpreviewPort($, id.value, command.port, new Promise(() => {}))
+      if (closed && !closed.ok) return say(closed)
+      void poll($)
+      return `Unpublished port ${command.port} of ${id.value}. Publishing it again may give it a new URL.`
     }
   }
 }
@@ -787,6 +827,17 @@ async function runTool($: EngineInterface, tool: keyof typeof TOOLS, input: Reco
       if (!got) return { deny: 'nexus: cancelled while waiting for the preview; the port may be published already' }
       return answer(got.ok ? { ok: true, value: { thread: id.value, port: input.port, url: got.value.url, ready: got.value.ready } } : got)
     }
+    case 'unpublish': {
+      const id = await toolThread($, input)
+      if (!id.ok) return answer(id)
+      if (typeof input.port !== 'number') return { deny: 'port is required' }
+      if (signal.aborted) return { deny: 'nexus: cancelled before the preview was closed' }
+      const got = await unpreviewPort($, id.value, input.port, new Promise(resolve => signal.addEventListener('abort', () => resolve())))
+      if (!got) return { deny: 'nexus: cancelled while closing the preview; it may be closed already' }
+      if (!got.ok) return answer(got)
+      void poll($)
+      return answer({ ok: true, value: { thread: id.value, port: input.port, unpublished: true } })
+    }
     case 'archive': {
       const id = await toolThread($, input)
       if (!id.ok) return answer(id)
@@ -864,7 +915,7 @@ function paneActions($: EngineInterface): PaneActions {
         const { view, selected } = await read($, paneAtom)
         if (view === 'details' || (view === 'start' && selected)) return setPane($, () => ({ view: 'thread', field: 'none', start: null }))
         watcher?.stop()
-        await setPane($, () => ({ view: 'list', selected: null, field: 'none', draft: '', start: null, toggled: {}, openings: {} }))
+        await setPane($, () => ({ view: 'list', selected: null, field: 'none', draft: '', start: null, toggled: {} }))
         await Promise.all([$.state.set(WATCH, null), $.state.set(LIVE, null), $.state.set(SHOWN, null)])
         void poll($)
       }),
@@ -915,10 +966,16 @@ function paneActions($: EngineInterface): PaneActions {
       }),
     details: () =>
       run(async () => {
-        await setPane($, pane => ({ view: pane.view === 'details' ? 'thread' : 'details' }))
+        await setPane($, pane => ({ view: pane.view === 'details' ? 'thread' : 'details', isPickingPreview: false }))
         await Promise.all([poll($), loadCatalog($, { projects: false })])
       }),
-    openPort: port => run(() => openPort($, port)),
+    openPort: port => run(() => changePort($, port, 'open')),
+    pickPreview: () => run(() => setPane($, pane => ({ isPickingPreview: !pane.isPickingPreview }))),
+    closePort: port =>
+      run(async () => {
+        await setPane($, () => ({ isPickingPreview: false }))
+        await changePort($, port, 'close')
+      }),
     newThread: () => run(() => openStart($)),
     startAgain: () =>
       run(async () => {
@@ -947,7 +1004,7 @@ export const register: Register = (on, options) => {
 
   on('session.start', async ($, e, next) => {
     await Promise.all([
-      $.command.register({ name: 'nexus', description: 'Drive Nexus threads: the pane, new, send, open, archive, abort, retry, delete', argumentHint: '[help]', immediate: true }),
+      $.command.register({ name: 'nexus', description: 'Drive Nexus threads: the pane, new, send, open, unpublish, archive, abort, retry, delete', argumentHint: '[help]', immediate: true }),
       ...Object.values(TOOLS).map(spec => $.tool.register(spec)),
     ])
     // A reload ended the pane's processes while the pane stayed open.
@@ -969,6 +1026,7 @@ export const register: Register = (on, options) => {
   on('tool.call', { tool: 'mcp__nexus__read' }, ($, e, next) => callTool($, 'read', input(e), next.signal)).catch(failedTool)
   on('tool.call', { tool: 'mcp__nexus__wait' }, ($, e, next) => callTool($, 'wait', input(e), next.signal)).catch(failedTool)
   on('tool.call', { tool: 'mcp__nexus__preview' }, ($, e, next) => callTool($, 'preview', input(e), next.signal)).catch(failedTool)
+  on('tool.call', { tool: 'mcp__nexus__unpublish' }, ($, e, next) => callTool($, 'unpublish', input(e), next.signal)).catch(failedTool)
   on('tool.call', { tool: 'mcp__nexus__archive' }, ($, e, next) => callTool($, 'archive', input(e), next.signal)).catch(failedTool)
 
   on('ui.render', { component: 'Pane', requestId: PANE }, async ($, e) => {

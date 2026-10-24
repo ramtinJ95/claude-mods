@@ -5,6 +5,12 @@ import type { ToolSpec } from 'claude-code'
 import type { NexusPort, NexusRunState } from '../types'
 
 const thread = { type: 'string', description: 'Thread ID, or a unique prefix of one' }
+const threadPort = {
+  type: 'object',
+  additionalProperties: false,
+  properties: { thread, port: { type: 'integer', minimum: 1, maximum: 65535 } },
+  required: ['thread', 'port'],
+} as const
 
 export const TOOLS = {
   threads: {
@@ -46,13 +52,14 @@ export const TOOLS = {
   preview: {
     name: 'preview',
     description:
-      "Publish a port the thread's pylon listens on as a preview, open to the home tailnet for the thread's life, and return its URL once it is served (up to 2 min).",
-    inputSchema: {
-      type: 'object',
-      additionalProperties: false,
-      properties: { thread, port: { type: 'integer', minimum: 1, maximum: 65535 } },
-      required: ['thread', 'port'],
-    },
+      "Publish a port the thread's pylon listens on as a preview, open to the home tailnet until unpublished, and return its URL once it is served (up to 2 min).",
+    inputSchema: threadPort,
+  },
+  unpublish: {
+    name: 'unpublish',
+    description:
+      "Close the preview a port of a Nexus thread was published as. A declared service's preview cannot be closed. Publishing the port again may give it a new URL. Wakes a paused pylon first (up to 2 min).",
+    inputSchema: threadPort,
   },
   archive: {
     name: 'archive',

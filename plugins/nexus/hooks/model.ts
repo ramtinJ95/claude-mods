@@ -9,6 +9,7 @@ import type {
   NexusLive,
   NexusNode,
   NexusPort,
+  NexusPortChange,
   NexusPreview,
   NexusProject,
   NexusRow,
@@ -102,6 +103,20 @@ export function parsePorts(raw: unknown, command: string): NexusPort[] | null {
     if (!isRecord(one) || typeof one.port !== 'number') throw contractError(command, 'a port without its number')
     return { port: one.port, service: strOrNull(one.service), preview: one.preview === null ? null : parsePreview(one.preview, command) }
   })
+}
+
+/** The port a preview links, from its service `port-<port>`; null for a declared or ad hoc service's preview, which `unpreview` refuses. */
+export function linkedPort(preview: NexusPreview): number | null {
+  const match = /^port-(\d+)$/.exec(preview.service)
+  return match ? Number(match[1]) : null
+}
+
+export const NO_CHANGE: NexusPortChange = { confirmed: null, pending: null, failure: null }
+
+/** What the person did to `port`, its `confirmed` kept only while the details shown (asked as `askedSeq`) were asked before it. */
+export function portChange(changes: Record<string, NexusPortChange>, port: number, askedSeq: number): NexusPortChange {
+  const change = changes[String(port)] ?? NO_CHANGE
+  return change.confirmed && change.confirmed.seq < askedSeq ? { ...change, confirmed: null } : change
 }
 
 const HARNESS = new Set(['claude-code', 'pi', 'shell'])
@@ -693,6 +708,7 @@ export type NexusCommand =
   | { verb: 'new'; project: string; title?: string; message?: string }
   | { verb: 'send'; thread: string; text: string }
   | { verb: 'action'; action: Action; thread?: string }
+  | { verb: 'unpublish'; port: number; thread?: string }
   | { verb: 'invalid'; reason: string }
 
 export const USAGE = [
@@ -701,6 +717,7 @@ export const USAGE = [
   '/nexus open <id>                show a thread in the pane',
   '/nexus new <project> ["title"] <message>',
   '/nexus send <id> <message>      queued behind a running turn',
+  '/nexus unpublish <port> [id]    close the preview of a port',
   '/nexus archive|unarchive|abort|retry|retry-pylon|delete [id]',
   'An ID may be a unique prefix (4f2a or th-4f2a). Without one, an action takes the thread open in the pane.',
 ].join('\n')
@@ -739,6 +756,12 @@ export function parseCommand(args: string): NexusCommand {
       if (quoted && !title) return invalid('The title in quotes is empty.')
       if (!title && !message) return invalid('/nexus new takes a message, a "title" or both.')
       return { verb: 'new', project, ...(title ? { title } : {}), ...(message ? { message } : {}) }
+    }
+    case 'unpublish': {
+      const [port, after] = split(rest)
+      const [thread, extra] = split(after)
+      if (!/^\d+$/.test(port) || extra) return invalid('/nexus unpublish takes a port and at most one thread ID.')
+      return { verb: 'unpublish', port: Number(port), ...(thread ? { thread } : {}) }
     }
     default: {
       if (!Object.hasOwn(ACTIONS, verb)) return invalid(`/nexus has no ${verb}.`)
