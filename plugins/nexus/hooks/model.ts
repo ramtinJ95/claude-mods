@@ -593,6 +593,33 @@ export const SESSION_TONE: Record<ShownSession['status'], Tone> = { working: 'wo
 
 /** The command that attaches a terminal on this Mac to the thread's pylon. */
 export const attachCommand = (thread: string) => `nexus attach ${thread}`
+/** `word` as one word to a POSIX shell or zsh: bare when nothing in it is special, else single-quoted. */
+export const shellQuote = (word: string) => (/^[\w@%+=:,./-]+$/.test(word) ? word : `'${word.replaceAll("'", `'\\''`)}'`)
+
+/** The pane of the tab `herdr tab create` printed, or null for output that names none. */
+export function parseHerdrTab(stdout: string): string | null {
+  try {
+    const json: unknown = JSON.parse(stdout)
+    const pane = isRecord(json) && isRecord(json.result) && isRecord(json.result.root_pane) ? json.result.root_pane.pane_id : undefined
+    return typeof pane === 'string' && pane ? pane : null
+  } catch {
+    return null
+  }
+}
+
+/** Why a herdr command failed: the message of the error it printed, else its output, else its exit code. */
+export function herdrError(exitCode: number, stdout: string, stderr: string): string {
+  for (const text of [stderr, stdout]) {
+    try {
+      const json: unknown = JSON.parse(text)
+      if (isRecord(json) && isRecord(json.error) && typeof json.error.message === 'string') return json.error.message
+    } catch {
+      // Not herdr's JSON: its usage text or a shell's message.
+    }
+  }
+  return stderr.trim() || stdout.trim() || `herdr exited with ${exitCode}`
+}
+
 /** How to reach a pylon's node when ssh cannot as it is, which the CLI's own failure repeats. */
 export const SSH_HINT = `Attaching needs Nexus CLI 0.5.0 and ssh to the pylon's node. When ssh needs another user or an alias for the node, set "ssh": {"<node>": "<user@host or alias>"} in ~/.config/nexus/cli.json, or NEXUS_ATTACH, as the CLI's docs/cli.md describes.`
 

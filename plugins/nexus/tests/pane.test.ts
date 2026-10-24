@@ -4,6 +4,7 @@ import { expect, mock, test, type TestBody } from 'claude-code/testing'
 async function pane(...[$, on]: Parameters<TestBody>) {
   const clock = mock.clock(on)
   mock.store(on, { themeNotice: true })
+  mock.env(on, {})
   const seen = { opens: 0, polls: 0, answered: 0, ended: 0 }
   let isOpen = false
   /** Set, a hook beneath the mod's keeps the pane open, as one answering without `next` does. */

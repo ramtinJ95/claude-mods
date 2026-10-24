@@ -2,7 +2,7 @@ import { expect, test } from 'claude-code/testing'
 
 import { SSH_HINT } from '../hooks/model'
 import { TOOLS } from '../hooks/tools'
-import { DETAIL, ID, THEME_KEYS, boot, fake, field, typing } from './fake-cli'
+import { DETAIL, ID, THEME_KEYS, THREAD, boot, fake, field, typing } from './fake-cli'
 
 type Ui = Awaited<ReturnType<Awaited<ReturnType<typeof boot>>['mount']>>
 
@@ -154,6 +154,66 @@ test('Enter and y copy nexus attach and say where to run it, since Claude Code c
   expect((await ui.findAll({ type: 'Button' })).flatMap(one => (one.key?.startsWith('menu-') ? [one.text.trim()] : []))).toEqual(
     expect.arrayContaining(['Open a session: Claude Code, pi or a shell', 'Attach: copy nexus attach, to run in a terminal']),
   )
+})
+
+/** Claude Code as Herdr runs it, in workspace w9. */
+const HERDR = { HERDR_ENV: '1', HERDR_WORKSPACE_ID: 'w9' }
+const TAB_OPENED = `Opened the Herdr tab "nexus attach ${THREAD.title}" in this workspace, attaching to the pylon's Herdr: pick a session's workspace there. To come back, detach from the pylon's Herdr, then close that tab or switch back to this one.`
+
+test(
+  "inside Herdr, Enter and the menu's Attach run nexus attach in a new tab of the workspace, the CLI and ID quoted for its shell; y still copies",
+  { options: { cli: "/Users/me/My Tools/it's/nexus" } },
+  async ($, on) => {
+    const cli = fake({ detail: { ...DETAIL, sessions: [CLAUDE] }, env: HERDR })
+    const { nexus, mount } = await boot($, on, cli)
+    await nexus(`open ${ID}`)
+    const ui = await mount()
+    await toSessions(ui)
+    expect(await shows(ui, '⏎ attaches in a new Herdr tab, y copies nexus attach, x closes the session')).toBe(true)
+    await keys(ui, 'o')
+    const attaching = [
+      ['tab', 'create', '--workspace', 'w9', '--label', `nexus attach ${THREAD.title}`, '--focus'],
+      ['pane', 'run', 'w9:p7', `'/Users/me/My Tools/it'\\''s/nexus' attach ${ID}`],
+    ]
+    expect(cli.herdr).toEqual(attaching)
+    expect(await shows(ui, TAB_OPENED)).toBe(true)
+    expect(cli.copied).toEqual([])
+    await keys(ui, 'y')
+    expect(cli.copied).toEqual([`nexus attach ${ID}`])
+    expect(cli.herdr).toHaveLength(2)
+    await keys(ui, 'm')
+    await ui.press({ key: 'menu-attach' })
+    expect(cli.herdr).toEqual([...attaching, ...attaching])
+    expect((await nexus(`session attach ${ID}`)).text).toBe(TAB_OPENED)
+    expect(cli.herdr).toHaveLength(6)
+  },
+)
+
+test('a herdr that fails leaves the attach to the copied command, and says why', async ($, on) => {
+  const cli = fake({ detail: { ...DETAIL, sessions: [CLAUDE] }, herdrFail: { 'tab create': 'workspace w9 not found' }, env: HERDR })
+  const { nexus, mount } = await boot($, on, cli)
+  await nexus(`open ${ID}`)
+  const ui = await mount()
+  await toSessions(ui)
+  await keys(ui, 'o')
+  expect(cli.copied).toEqual([`nexus attach ${ID}`])
+  expect(
+    await shows(ui, `The Herdr tab did not open: herdr tab create failed: workspace w9 not found. Copied nexus attach ${ID}: run it in a terminal or a Herdr tab, pick the session's workspace in Herdr, and detach from Herdr to come back.`),
+  ).toBe(true)
+  cli.herdrFail = { 'pane run': 'pane w9:p7 not found' }
+  expect((await nexus(`session attach ${ID}`)).text).toMatch(/^The Herdr tab did not open: herdr pane run failed: pane w9:p7 not found\. Claude Code cannot give its terminal/)
+})
+
+test('outside Herdr, or with no workspace to open the tab in, nothing runs herdr', async ($, on) => {
+  const cli = fake({ detail: { ...DETAIL, sessions: [CLAUDE] }, env: { HERDR_WORKSPACE_ID: 'w9' } })
+  const { nexus, mount } = await boot($, on, cli)
+  await nexus(`open ${ID}`)
+  const ui = await mount()
+  await toSessions(ui)
+  await keys(ui, 'o')
+  expect((await nexus(`session attach ${ID}`)).text).toContain(`run this in a terminal or a Herdr tab:\n\n  nexus attach ${ID}\n\n`)
+  expect(cli.herdr).toEqual([])
+  expect(cli.copied).toEqual([`nexus attach ${ID}`])
 })
 
 test('a CLI before 0.5.0 says which version opening and closing a session need', async ($, on) => {

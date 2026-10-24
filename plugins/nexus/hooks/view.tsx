@@ -115,6 +115,8 @@ export type Scene = {
   placement: 'dock' | 'inline'
   isFocused: boolean
   surface: RenderSurface
+  /** Claude Code runs inside Herdr, where Enter's attach opens a tab rather than copying the command. */
+  inHerdr: boolean
 }
 
 export type PaneActions = {
@@ -712,7 +714,7 @@ function menuOf(scene: Scene): { action: MenuAction; label: string }[] {
     ...(status === 'active' || status === 'idle' ? [{ action: 'archive' as const, label: 'Archive' }] : []),
     ...(status === 'archived' ? [{ action: 'unarchive' as const, label: 'Unarchive' }] : []),
     ...(detail ? [{ action: 'copy-attach' as const, label: 'Copy the attach command' }] : []),
-    ...(status === 'active' || status === 'idle' ? [{ action: 'open-session' as const, label: 'Open a session: Claude Code, pi or a shell' }, { action: 'attach' as const, label: 'Attach: copy nexus attach, to run in a terminal' }] : []),
+    ...(status === 'active' || status === 'idle' ? [{ action: 'open-session' as const, label: 'Open a session: Claude Code, pi or a shell' }, { action: 'attach' as const, label: scene.inHerdr ? 'Attach in a new Herdr tab' : 'Attach: copy nexus attach, to run in a terminal' }] : []),
     { action: 'rewatch' as const, label: 'Watch again' },
     ...(status !== 'deleted' ? [{ action: 'delete' as const, label: 'Delete…  (asks first, Keep is the default)' }] : []),
   ]
@@ -752,7 +754,7 @@ export function ThreadView(draw: Draw, scene: Scene, actions: PaneActions) {
             ? [['j/k', 'scroll'], ['y', 'copy attach'], ['h/l', 'tabs'], ['m', 'actions'], ['s', 'keys']]
             : pane.tab === 'ports'
               ? [['j/k', 'move'], ['⏎', 'publish · copy'], ['x', 'unpublish'], ['y', 'copy URL'], ['h/l', 'tabs'], ['s', 'keys']]
-              : [['j/k', 'move'], ['⏎/y', 'copy attach'], ['x', 'close'], ['n', 'open'], ['h/l', 'tabs'], ['s', 'keys']]
+              : [['j/k', 'move'], ...(scene.inHerdr ? ([['⏎', 'attach'], ['y', 'copy attach']] as [string, string][]) : [['⏎/y', 'copy attach'] as [string, string]]), ['x', 'close'], ['n', 'open'], ['h/l', 'tabs'], ['s', 'keys']]
   // A composer the thread's change took away leaves the letters to the keys.
   const footer = [runLine, composer, Notice(draw, pane), ModeLine(draw, scene, hints, isInserting ? 'insert' : 'normal')]
   const area = Math.max(3, scene.rows - rowsOf(header, scene.width) - rowsOf(footer, scene.width))
@@ -1604,7 +1606,8 @@ function SessionsBody(draw: Draw, scene: Scene, actions: PaneActions, area: numb
     drawn.push(node)
     y += height
   }
-  const attach: Effect = { kind: 'attach', thread: detail.thread.id }
+  const attach: Effect = { kind: 'attach', thread: detail.thread.id, isCopy: false }
+  const copy: Effect = { kind: 'attach', thread: detail.thread.id, isCopy: true }
   place(SectionRule(draw, scene, 'Sessions', String(sessions.length), 'sessions'))
   if (sessions.length === 0 && changes.opening.length === 0) place(<Text key="no-sessions" color="subtle">No sessions. n opens one: Claude Code, pi or a shell.</Text>)
   for (const session of sessions) {
@@ -1625,14 +1628,14 @@ function SessionsBody(draw: Draw, scene: Scene, actions: PaneActions, area: numb
         </Button>
         {isCursor && !isClosing && (
           <Box paddingLeft={4}>
-            <Text color="subtle">⏎ or y copies nexus attach, x closes the session</Text>
+            <Text color="subtle">{scene.inHerdr ? '⏎ attaches in a new Herdr tab, y copies nexus attach, x closes the session' : '⏎ or y copies nexus attach, x closes the session'}</Text>
           </Box>
         )}
       </Box>,
       {
         key,
         enter: attach,
-        y: attach,
+        y: copy,
         x: isClosing ? { kind: 'say', text: `Pane ${session.herdrPane} is already closing.` } : { kind: 'close-session', thread: detail.thread.id, pane: session.herdrPane },
       },
     )
@@ -1655,7 +1658,9 @@ function SessionsBody(draw: Draw, scene: Scene, actions: PaneActions, area: numb
   place(<Text key="attach-command">{`  ${attachCommand(detail.thread.id)}`}</Text>)
   place(
     <Text key="attach-how" color="subtle">
-      ⏎ and y copy it: run it in a terminal or a Herdr tab. Each session is a workspace in the pylon's Herdr, so pick one there, and detach from Herdr to come back.
+      {scene.inHerdr
+        ? "⏎ runs it in a new tab of this Herdr workspace, and y copies it. Each session is a workspace in the pylon's Herdr, so pick one there, and detach from the pylon's Herdr to come back."
+        : "⏎ and y copy it: run it in a terminal or a Herdr tab. Each session is a workspace in the pylon's Herdr, so pick one there, and detach from Herdr to come back."}
     </Text>,
   )
   place(

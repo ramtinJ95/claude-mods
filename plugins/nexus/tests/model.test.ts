@@ -14,6 +14,7 @@ import {
   foldReply,
   foldSummary,
   groupThreads,
+  herdrError,
   isSettled,
   keepTail,
   leftOut,
@@ -21,9 +22,11 @@ import {
   parseCommand,
   parseDetail,
   parseFailure,
+  parseHerdrTab,
   parseThreads,
   parseWatchEvent,
   previewLook,
+  shellQuote,
   since,
   threadState,
 } from '../hooks/model'
@@ -322,5 +325,27 @@ describe('the console', () => {
     expect(previewLook(detail, api!)).toMatchObject({ linked: false, label: 'starting' })
     expect(previewLook({ ...detail, pylon: { ...detail.pylon, actualState: 'paused' } }, api!)).toMatchObject({ linked: true, hint: 'Opening it wakes the pylon.' })
     expect(previewLook({ ...detail, thread: { ...detail.thread, status: 'archived' } }, web!)).toMatchObject({ linked: false, hint: 'Unarchive the thread to open it.' })
+  })
+})
+
+describe('attaching in a Herdr tab', () => {
+  test('shellQuote leaves a plain word bare and single-quotes anything else, a quote inside closed and escaped', () => {
+    expect(shellQuote('nexus')).toBe('nexus')
+    expect(shellQuote('/usr/local/bin/nexus')).toBe('/usr/local/bin/nexus')
+    expect(shellQuote('th-4f2a00000001')).toBe('th-4f2a00000001')
+    expect(shellQuote('/Users/me/My Tools/nexus')).toBe("'/Users/me/My Tools/nexus'")
+    expect(shellQuote("/opt/it's/nexus")).toBe("'/opt/it'\\''s/nexus'")
+    expect(shellQuote("a b'c")).toBe("'a b'\\''c'")
+    expect(shellQuote('$(rm -rf ~); `x`')).toBe("'$(rm -rf ~); `x`'")
+    expect(shellQuote('')).toBe("''")
+  })
+
+  test("herdr's tab and its errors: the root pane, else null; the error's message, else what it printed, else its exit code", () => {
+    expect(parseHerdrTab('{"id":"cli:tab:create","result":{"tab":{"tab_id":"w7:t1"},"root_pane":{"pane_id":"w7:p2"}}}')).toBe('w7:p2')
+    expect(parseHerdrTab('{"result":{}}')).toBe(null)
+    expect(parseHerdrTab('not json')).toBe(null)
+    expect(herdrError(1, '', '{"error":{"code":"workspace_not_found","message":"workspace w9 not found"},"id":"cli:tab:create"}\n')).toBe('workspace w9 not found')
+    expect(herdrError(2, '', 'error: unexpected argument --nope\n')).toBe('error: unexpected argument --nope')
+    expect(herdrError(1, '', '')).toBe('herdr exited with 1')
   })
 })

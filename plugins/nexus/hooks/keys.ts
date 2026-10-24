@@ -79,7 +79,7 @@ export const HELP: readonly { title: string; keys: readonly [keys: string, what:
     ],
   },
   { title: 'Ports', keys: [['enter', 'publish a port, or copy a preview’s URL'], ['x', 'unpublish the linked preview under the cursor']] },
-  { title: 'Sessions', keys: [['enter y', 'copy nexus attach, to run in a terminal'], ['x', 'close the session under the cursor, after asking'], ['n', 'open a session']] },
+  { title: 'Sessions', keys: [['enter', 'attach in a new Herdr tab, inside Herdr; else copy nexus attach'], ['y', 'copy nexus attach, to run in a terminal'], ['x', 'close the session under the cursor, after asking'], ['n', 'open a session']] },
 ]
 
 /** What a single press asks for that only the hooks module can do. */
@@ -107,8 +107,8 @@ export type Effect =
   | { kind: 'new-session' }
   /** Asks, then closes the session in `pane` of `thread`. */
   | { kind: 'close-session'; thread: string; pane: string }
-  /** The command that attaches a terminal to `thread`'s sessions. */
-  | { kind: 'attach'; thread: string }
+  /** `nexus attach` for `thread`'s sessions: run in a new Herdr tab inside Herdr, else copied; `isCopy` always copies. */
+  | { kind: 'attach'; thread: string; isCopy: boolean }
   | { kind: 'refresh' }
   | { kind: 'close' }
 
@@ -388,7 +388,7 @@ export function press(before: NexusPane, pressed: Command, nav: Nav): Step {
         const key = moveOver(nav.items, current?.key ?? null, command, nav.area)
         return done({ sessionCursor: key ?? null }, key ? [{ kind: 'focus', key }] : [])
       }
-      if (command === 'open' || command === 'yank') return done({}, [{ kind: 'attach', thread: nav.thread }])
+      if (command === 'open' || command === 'yank') return done({}, [{ kind: 'attach', thread: nav.thread, isCopy: command === 'yank' }])
       if (command === 'unpublish') return current?.x ? apply(current.x) : done({}, [{ kind: 'say', text: 'No session to close. n opens one.' }])
       return done()
     }

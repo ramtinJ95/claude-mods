@@ -40,6 +40,7 @@ import {
   applyEvent,
   closedKey,
   groupThreads,
+  herdrError,
   isSettled,
   foldReply,
   inScope,
@@ -50,6 +51,7 @@ import {
   parseAdded,
   parseDetail,
   parseFailure,
+  parseHerdrTab,
   parseNodes,
   parseOpenedSession,
   parsePreview,
@@ -62,6 +64,7 @@ import {
   sentence,
   sessionName,
   settleSessions,
+  shellQuote,
   stripChips,
   transcript,
 } from './model'
@@ -83,6 +86,8 @@ const RUN_MS = 70_000
  * waits up to 120 s more for the agent to start.
  */
 const SESSION_MS = 260_000
+/** A `$.process.run` of herdr: a tab made, a command typed into it. */
+const HERDR_MS = 10_000
 const READ_CHARS = 6_000
 const REPLY_CHARS = 4_000
 /**
@@ -137,6 +142,8 @@ const stripCursorAtom = atom(STRIP_CURSOR, null)
 
 /** The CLI to run, from the `cli` option. */
 let cli = 'nexus'
+/** The Herdr workspace Claude Code runs in, read at session start: Enter's attach opens a tab there. Null outside Herdr. */
+let herdrWorkspace: string | null = null
 /**
  * The pane's two processes at most: one poll at a time, of `threads` for the list or `show` for the thread shown,
  * and one watch of that thread. The ticker only reads the watch's state, to move the run clock while it works.
@@ -1010,7 +1017,8 @@ async function openInPane($: EngineInterface, thread: string, harness: NexusHarn
     }
     const { harness: opener, title: named, herdrPane } = opened.value
     const done = `Opened ${sessionName(opener, named)} in pane ${herdrPane}`
-    await sayOf($, thread, `${done}. ⏎ in Sessions copies nexus attach: run it in a terminal and pick the session's workspace in Herdr.`, `${done} of ${thread}.`, 'dim')
+    const how = herdrWorkspace ? 'attaches to it in a new Herdr tab' : "copies nexus attach: run it in a terminal and pick the session's workspace in Herdr"
+    await sayOf($, thread, `${done}. ⏎ in Sessions ${how}.`, `${done} of ${thread}.`, 'dim')
     void poll($)
   } finally {
     sessionOps.delete(`open:${id}`)
@@ -1080,6 +1088,44 @@ async function askSession($: EngineInterface, thread: string): Promise<Outcome<{
 /** How to attach a terminal on this Mac to the thread's sessions: Claude Code cannot hand its own terminal over. */
 const attachHow = (thread: string) =>
   `Claude Code cannot give its terminal to the attach, so run this in a terminal or a Herdr tab:\n\n  ${attachCommand(thread)}\n\nEach session is a workspace in the pylon's Herdr: pick one there, and detach from Herdr to come back. ${SSH_HINT}`
+
+/**
+ * `nexus attach` in a new tab of the Herdr workspace Claude Code runs in, put in front: Claude Code cannot hand its
+ * own terminal over, and a Herdr tab can. The tab's shell runs it, so the detach leaves the tab at its shell, with any
+ * error of ssh's still there to read. Resolves the tab's label.
+ */
+async function attachInHerdr($: EngineInterface, workspace: string, thread: string): Promise<Outcome<string>> {
+  // The ID is typed into a shell: only one of the CLI's own form goes there.
+  if (!FULL_ID.test(thread)) return failed(`${thread} is not a thread ID`)
+  const label = `nexus attach ${(await lookUpTitle($, thread)) ?? thread}`
+  const created = await herdr($, ['tab', 'create', '--workspace', workspace, '--label', label, '--focus'])
+  if (!created.ok) return created
+  const pane = parseHerdrTab(created.value)
+  if (!pane) return failed('herdr tab create printed no pane')
+  const ran = await herdr($, ['pane', 'run', pane, `${shellQuote(cli)} attach ${shellQuote(thread)}`])
+  return ran.ok ? { ok: true, value: label } : ran
+}
+
+/** One herdr command: its stdout, or why it failed. */
+async function herdr($: EngineInterface, args: string[]): Promise<Outcome<string>> {
+  const name = `herdr ${args.slice(0, 2).join(' ')}`
+  try {
+    const ran = await $.process.run(['herdr', ...args], { timeoutMs: HERDR_MS })
+    return ran.exitCode === 0 ? { ok: true, value: ran.stdout } : failed(`${name} failed: ${herdrError(ran.exitCode, ran.stdout, ran.stderr)}`)
+  } catch (error) {
+    return failed(`${name} did not run: ${messageOf(error)}`)
+  }
+}
+
+/** Herdr sets both for what runs in its panes. */
+async function readHerdr($: EngineInterface) {
+  const [isHerdr, workspace] = await Promise.all([$.env.get('HERDR_ENV'), $.env.get('HERDR_WORKSPACE_ID')])
+  herdrWorkspace = isHerdr === '1' && workspace ? workspace : null
+}
+
+/** Where the attach runs, and the way back from it. */
+const tabOpened = (label: string) =>
+  `Opened the Herdr tab "${label}" in this workspace, attaching to the pylon's Herdr: pick a session's workspace there. To come back, detach from the pylon's Herdr, then close that tab or switch back to this one.`
 
 /** A command's reply. The transcript heads it with the plugin's name, so a failure is its message alone. */
 const say = (outcome: Outcome<string>) =>
@@ -1163,7 +1209,7 @@ async function runCommand($: EngineInterface, args: string): Promise<string> {
       const opened = await openSession($, id.value, command)
       if (!opened.ok) return say(opened)
       void poll($)
-      return `Opened ${sessionName(opened.value.harness, opened.value.title)} in pane ${opened.value.herdrPane} of ${id.value}. /nexus session attach ${id.value} gives the command that attaches a terminal to it.`
+      return `Opened ${sessionName(opened.value.harness, opened.value.title)} in pane ${opened.value.herdrPane} of ${id.value}. /nexus session attach ${id.value} ${herdrWorkspace ? 'attaches to it in a new Herdr tab' : 'gives the command that attaches a terminal to it'}.`
     }
     case 'session-close': {
       const id = await resolveThread($, command.thread)
@@ -1179,7 +1225,10 @@ async function runCommand($: EngineInterface, args: string): Promise<string> {
     }
     case 'attach': {
       const id = await resolveThread($, command.thread)
-      return id.ok ? attachHow(id.value) : say(id)
+      if (!id.ok) return say(id)
+      if (!herdrWorkspace) return attachHow(id.value)
+      const opened = await attachInHerdr($, herdrWorkspace, id.value)
+      return opened.ok ? tabOpened(opened.value) : `The Herdr tab did not open: ${sentence(opened.failure.message)} ${attachHow(id.value)}`
     }
     case 'unpublish': {
       const id = await targetOf($, command.thread)
@@ -1665,7 +1714,7 @@ function paneActions($: EngineInterface, surface: RenderSurface): PaneActions {
         return openSessionForm($)
       case 'attach': {
         const { selected } = await read($, paneAtom)
-        return selected ? attach(selected) : undefined
+        return selected ? attach(selected, false) : undefined
       }
       case 'delete':
         return onShown(id => confirmDelete($, id))
@@ -1673,13 +1722,16 @@ function paneActions($: EngineInterface, surface: RenderSurface): PaneActions {
         return onShown(id => act($, action, id))
     }
   }
-  /** Copies `nexus attach`, since Claude Code cannot give its own terminal to it, and says where to run it. */
-  const attach = async (thread: string) => {
+  /** Attaches in a Herdr tab inside Herdr, unless `isCopy`; else copies `nexus attach` and says where to run it. */
+  const attach = async (thread: string, isCopy: boolean) => {
+    const opened = !isCopy && herdrWorkspace ? await attachInHerdr($, herdrWorkspace, thread) : null
+    if (opened?.ok) return setPane($, () => ({ notice: { text: tabOpened(opened.value), tone: 'dim' } }))
+    const why = opened ? `The Herdr tab did not open: ${sentence(opened.failure.message)} ` : ''
     const command = attachCommand(thread)
     const copied = await $.ui.copy({ text: command, surface })
     const how = "run it in a terminal or a Herdr tab, pick the session's workspace in Herdr, and detach from Herdr to come back."
     await setPane($, () => ({
-      notice: copied.isCopied ? { text: `Copied ${command}: ${how}`, tone: 'dim' } : { text: `Not copied (${copied.reason}), so type ${command}: ${how}`, tone: 'error' },
+      notice: copied.isCopied ? { text: `${why}Copied ${command}: ${how}`, tone: opened ? 'error' : 'dim' } : { text: `${why}Not copied (${copied.reason}), so type ${command}: ${how}`, tone: 'error' },
     }))
   }
   const showTab = async (tab: NexusTab) => {
@@ -1725,7 +1777,7 @@ function paneActions($: EngineInterface, surface: RenderSurface): PaneActions {
       case 'close-session':
         return closeInPane($, effect.thread, effect.pane)
       case 'attach':
-        return attach(effect.thread)
+        return attach(effect.thread, effect.isCopy)
       case 'refresh':
         return refresh()
       case 'close':
@@ -1843,6 +1895,7 @@ export const register: Register = (on, options) => {
       ...Object.values(TOOLS).map(spec => $.tool.register(spec)),
       loadStrip($),
       loadScope($),
+      readHerdr($),
     ])
     stripper?.cancel()
     stripper = $.clock.every(STRIP_MS, () => void pollStrip($))
@@ -1939,6 +1992,7 @@ export const register: Register = (on, options) => {
       placement: e.props.placement,
       isFocused: e.props.isFocused,
       surface: e.surface,
+      inHerdr: herdrWorkspace !== null,
     }
     const actions = paneActions($, e.surface)
     const tree =

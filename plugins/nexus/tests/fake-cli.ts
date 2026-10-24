@@ -141,6 +141,12 @@ export type Fake = {
   store: Record<string, unknown>
   /** The pane `session open` answers with. */
   nextPane: string
+  /** Every herdr argv, `herdr` dropped. */
+  herdr: string[][]
+  /** A herdr command, by its two words, that fails with this message. */
+  herdrFail: Record<string, string>
+  /** The environment the mod reads: Herdr's variables when a test runs it inside Herdr. */
+  env: Record<string, string>
   /** Runs before each `$.store.set` lands, to hold one while the test does something else. */
   saving?: (key: string, value: unknown) => Promise<void>
 }
@@ -175,7 +181,7 @@ function parseProjectAdd(args: readonly string[]): { values: Record<string, stri
 export function fake(change: Partial<Fake> = {}): Fake {
   // A copy, as the mod writes the store a test reads: a fixture shared by tests would carry one's writes into the next.
   const store = structuredClone(change.store ?? { themeNotice: true })
-  return { runs: [], spawns: [], threads: THREADS, projects: PROJECTS, detail: DETAIL, watch: [{ type: 'reset', thread: ID, entries: ENTRIES }, state('working'), live()], slow: {}, fail: {}, printed: {}, publishes: true, answer: 'Keep', asked: [], offered: [], copied: [], toasts: [], opens: 0, isOpen: false, nextPane: 'nexus:2.1', ...change, store }
+  return { runs: [], spawns: [], threads: THREADS, projects: PROJECTS, detail: DETAIL, watch: [{ type: 'reset', thread: ID, entries: ENTRIES }, state('working'), live()], slow: {}, fail: {}, printed: {}, publishes: true, answer: 'Keep', asked: [], offered: [], copied: [], toasts: [], opens: 0, isOpen: false, nextPane: 'nexus:2.1', herdr: [], herdrFail: {}, env: {}, ...change, store }
 }
 
 /** `detail` with the linked preview of `port` published, or gone when `preview` is null. */
@@ -194,6 +200,7 @@ const reply = (json: unknown) => ({ value: { exitCode: 0, stdout: JSON.stringify
 /** Boots the mod over `cli`: its session, the engine's answers, and a clock that starts at T0 and moves only when told. */
 export async function boot(...[$, on, cli]: [...Body, Fake]) {
   const clock = mock.clock(on, { now: T0 })
+  mock.env(on, cli.env)
   // The store as the mod leaves it, which a test reads back.
   on('store.get', (_, e) => ({ value: cli.store[e.key] }))
   on('store.set', async (_, e) => {
@@ -220,6 +227,13 @@ export async function boot(...[$, on, cli]: [...Body, Fake]) {
   }
   on('process.run', async (_, e) => {
     const argv = e.argv.slice(1)
+    if (e.argv[0] === 'herdr') {
+      // herdr prints its answer as JSON on stdout, and an error as JSON on stderr.
+      cli.herdr.push(argv)
+      const error = cli.herdrFail[`${argv[0]} ${argv[1]}`]
+      if (error) return { value: { exitCode: 1, stdout: '', stderr: `${JSON.stringify({ error: { code: 'failed', message: error }, id: 'cli:request' })}\n`, isStdoutTruncated: false, isStderrTruncated: false } }
+      return reply(argv[0] === 'tab' ? { id: 'cli:tab:create', result: { tab: { tab_id: 'w9:t3' }, root_pane: { pane_id: 'w9:p7' } } } : { id: 'cli:pane:run', result: { type: 'ok' } })
+    }
     cli.runs.push(argv)
     // `session open` and `session close` are slowed or failed by both words.
     const verb = argv[0] === 'session' ? `session ${argv[1]}` : argv[0]!
