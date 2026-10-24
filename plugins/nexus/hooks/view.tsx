@@ -841,8 +841,14 @@ function ProjectsBody(draw: Draw, scene: Scene, actions: PaneActions, area: numb
     { key: 'scope-new', name: '+ New project…', repo: '', isCurrent: false, enter: { kind: 'new-project' } },
   ]
   const note = projectsFailure ? `The projects did not load: ${sentence(projectsFailure.message)}` : projects ? null : 'Reading the projects…'
-  // The title, and the note under All projects while there is one.
-  const above = (at: number) => 1 + (note && at > 0 ? 1 : 0)
+  const noteNode = note && (
+    <Box key="projects-note" paddingLeft={2}>
+      <Text color={projectsFailure ? 'error' : 'subtle'}>{note}</Text>
+    </Box>
+  )
+  // The title, and the note under All projects while there is one, as many rows as it wraps to.
+  const noteRows = noteNode ? rowsOf(noteNode, scene.width) : 0
+  const above = (at: number) => 1 + (at > 0 ? noteRows : 0)
   const items: NavItem[] = rows.map((row, at) => ({ key: row.key, top: at + above(at), height: 1, enter: row.enter }))
   const chosen = scene.pane.overlay?.kind === 'projects' ? scene.pane.overlay.cursor : null
   const cursor = Math.max(0, rows.findIndex(row => row.key === chosen), chosen ? -1 : rows.findIndex(row => row.isCurrent))
@@ -874,9 +880,7 @@ function ProjectsBody(draw: Draw, scene: Scene, actions: PaneActions, area: numb
               </Text>
               {detail ? <Text color="subtle">{`${' '.repeat(column - cells(name))}${detail}`}</Text> : ''}
             </Button>,
-            at === 0 && note ? (
-              <Text key="projects-note" color={projectsFailure ? 'error' : 'subtle'}>{`  ${note}`}</Text>
-            ) : null,
+            at === 0 ? noteNode : null,
           ]
         })}
       </Box>

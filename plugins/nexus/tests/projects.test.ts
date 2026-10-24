@@ -321,3 +321,15 @@ test('an add that ends after another project was chosen leaves that choice and s
   expect(await title(ui)).toMatch(/^◆ Nexus threads · api/)
   expect(await shows(ui, 'Added the project docs. Nexus still shows the project api, chosen while it was added.')).toBe(true)
 })
+
+test("the picker scrolls New project… into view below a load error that wraps", async ($, on) => {
+  const cli = fake({ fail: { projects: { exitCode: 1, error: 'connect ECONNREFUSED 100.64.0.1:7470 (the control plane is down)' } } })
+  const { nexus, mount } = await boot($, on, cli)
+  await nexus('')
+  const ui = await mount(24, 10)
+  await keys(ui, 'hpj')
+  expect(await picker(ui)).toEqual(['All projec…  current', '❯ + New project…'])
+  // At 24 columns the error takes five rows, not one: the picker moves up past them, and its title counts the rows.
+  expect((await ui.find({ type: 'Box', key: 'projects' }))?.props.marginTop).toBeLessThan(0)
+  expect(await shows(ui, /^Projects {2}\(2\/2\)$/)).toBe(true)
+})
