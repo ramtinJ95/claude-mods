@@ -1549,13 +1549,13 @@ function paneActions($: EngineInterface, surface: RenderSurface): PaneActions {
         if (change) await inTurn(() => putBack($, START_KEYS, change, pane => pane.start))
       }),
     projectDraft: (change, at) =>
-      run(() => update($, paneAtom, pane => (pane.project && (at === undefined || isDrawn(pane, at)) ? { ...pane, project: { ...pane.project, ...change, error: null } } : pane))),
+      run(() => inTurn(() => update($, paneAtom, pane => (pane.project && (at === undefined || isDrawn(pane, at)) ? { ...pane, project: { ...pane.project, ...change, error: null } } : pane)))),
     projectSubmit: change =>
       run(async () => {
-        // As the start form's: what is added is the form as Enter left it.
-        const { project: sent } = await setProjectDraft($, change ?? {})
-        if (change) await putBack($, PROJECT_KEYS, change, pane => pane.project)
+        // As the start form's: what is added is the form as Enter left it, and a form still open gets Enter's text back.
+        const { project: sent } = await inTurn(() => setProjectDraft($, change ?? {}))
         await submitProject($, sent)
+        if (change) await inTurn(() => putBack($, PROJECT_KEYS, change, pane => pane.project))
       }),
   }
 }
