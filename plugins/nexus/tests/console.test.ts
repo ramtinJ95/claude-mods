@@ -959,7 +959,7 @@ test('Ports lists the previews linked by their own URL and the ports with none, 
   await toPorts(ui)
   expect((await ui.findAll({ type: 'Link' })).map(link => [link.props.href, link.text])).toEqual([[WEB_PREVIEW.url, WEB_PREVIEW.url]])
   expect((await ui.find({ type: 'Button', key: 'preview-web' }))?.text).toBe('❯ ● web :3000  ready ')
-  expect(await shows(ui, /^ {4}⏎ or y copies the URL$/)).toBe(true)
+  expect(await shows(ui, /^⏎ or y copies the URL$/)).toBe(true)
   expect(await shows(ui, /^ {2}◐ api {2}starting https:\/\/rj-firebat\.example\.ts\.net:10202\/$/, 'Box')).toBe(true)
   // Each port once: 3000 has its preview above, so Ports lists the other two.
   expect(await shows(ui, /^PORTS 2 ─/, 'Box')).toBe(true)
@@ -1038,7 +1038,7 @@ test("x unpublishes the linked preview under the cursor: closing… while the CL
   await toPorts(ui)
   expect(await shows(ui, /^PREVIEWS 3 ─/, 'Box')).toBe(true)
   await cursorTo(ui, 'preview-port-5173')
-  expect(await shows(ui, /^ {4}⏎ or y copies the URL · x unpublishes it \(a new publish may get a new URL\)$/)).toBe(true)
+  expect(await shows(ui, /^⏎ or y copies the URL · x unpublishes it \(a new publish may get a new URL\)$/)).toBe(true)
   await keys(ui, 'x')
   expect(cli.spawns).toContainEqual(['unpreview', '--json', ID, '5173'])
   expect((await ui.find({ type: 'Button', key: 'preview-port-5173' }))?.text).toMatch(/closing… $/)

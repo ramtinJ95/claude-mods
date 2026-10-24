@@ -1400,9 +1400,11 @@ function PortsBody(draw: Draw, scene: Scene, actions: PaneActions, area: number,
           </Button>
           {look.linked ? <Link href={preview.url} /> : <Text color="subtle">{preview.url}</Text>}
         </Box>
-        {isCursor && <Text color="subtle">{`    ⏎ or y copies the URL${isClosable ? ' · x unpublishes it (a new publish may get a new URL)' : ''}`}</Text>}
-        {look.hint && <Text color="subtle">{`    ${look.hint}`}</Text>}
-        {change.failure && <Text color="error">{`    ${change.failure.message}`}</Text>}
+        <Box flexDirection="column" paddingLeft={4}>
+          {isCursor && <Text color="subtle">{`⏎ or y copies the URL${isClosable ? ' · x unpublishes it (a new publish may get a new URL)' : ''}`}</Text>}
+          {look.hint && <Text color="subtle">{look.hint}</Text>}
+          {change.failure && <Text color="error">{change.failure.message}</Text>}
+        </Box>
       </Box>,
       {
         key,
@@ -1461,7 +1463,11 @@ function PortRow(draw: Draw, actions: PaneActions, thread: string, port: NexusPo
         {Pointer(draw, isCursor)}
         {Dot(draw, tone)} <Text bold>{String(port.port)}</Text> <Text color="subtle">{note}</Text>
       </Button>
-      {change.failure && <Text color="error">{`    ${change.failure.message}`}</Text>}
+      {change.failure && (
+        <Box paddingLeft={4}>
+          <Text color="error">{change.failure.message}</Text>
+        </Box>
+      )}
     </Box>,
     { key, enter: { kind: 'publish', thread, port: port.port }, x: { kind: 'say', text: `Port ${port.port} has no preview to unpublish.` } },
   ]
