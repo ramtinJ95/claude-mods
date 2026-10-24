@@ -125,6 +125,15 @@ export const TABS: readonly NexusTab[] = ['conversation', 'details', 'ports']
 export const COMPOSE = 'compose'
 export const FILTER = 'filter'
 
+/**
+ * `fields` with `text` put in the field `key`. The engine takes a field's `value` over the typing only when it changed
+ * since the last drawing, so an empty put alternates `''` and `null`: emptying a field emptied before still empties it.
+ */
+export const putField = (fields: Readonly<Record<string, string | null>>, key: string, text: string): Record<string, string | null> => ({
+  ...fields,
+  [key]: text === '' && fields[key] === '' ? null : text,
+})
+
 type Step = { pane: NexusPane; effects: Effect[] }
 
 const clamp = (value: number, low: number, high: number) => Math.max(low, Math.min(high, value))
@@ -346,5 +355,6 @@ export function ringMoved(pane: NexusPane, element: string): NexusPane {
   if (element.startsWith('menu-') && pane.overlay?.kind === 'menu') return { ...base, overlay: { kind: 'menu', cursor: element } }
   if (element.startsWith('preview-') || element.startsWith('port-')) return { ...base, portCursor: element }
   if (pane.view === 'list') return { ...base, listCursor: element }
+  if (pane.view === 'start' && pane.start) return { ...base, start: { ...pane.start, focused: element } }
   return base
 }

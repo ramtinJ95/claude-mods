@@ -358,7 +358,7 @@ test('i writes in insert mode: the composer sends while the run is idle, and an 
   expect(await ui.find({ type: 'Input', key: 'compose' })).toBeDefined()
 })
 
-test('the composer and the start form grow a row for each the draft wraps to, a quarter of the pane at most, and shrink back to one', async ($, on) => {
+test('the composer and the start form grow a row for each the draft wraps to, a quarter of the pane at most, two while they have the keys', async ($, on) => {
   const cli = fake()
   cli.watch = [{ type: 'reset', thread: ID, entries: ENTRIES.slice(0, -1) }, state('idle'), live()]
   const { nexus, mount } = await boot($, on, cli)
@@ -367,21 +367,25 @@ test('the composer and the start form grow a row for each the draft wraps to, a 
   const rows = async (key: string) => (await ui.find({ type: 'Input', key }))?.props.rows
   const words = (count: number) => Array(count).fill('word').join(' ')
   expect(await rows('compose')).toBe(1)
+  // Two rows in insert mode, so \⏎ types a newline rather than submitting.
   await keys(ui, 'i')
-  // 57 cells after `❯: `, less the hint: 50 on one row, 31 once it names shift+⏎ for a newline, six words a row.
-  await ui.input({ key: 'compose', text: words(10), kind: 'change' })
-  expect(await rows('compose')).toBe(1)
+  expect(await rows('compose')).toBe(2)
+  // 57 cells after `❯: `, less the hint: 31 once it names shift+⏎ for a newline, six words a row.
   await ui.input({ key: 'compose', text: words(11), kind: 'change' })
   expect(await rows('compose')).toBe(2)
   await ui.input({ key: 'compose', text: words(20), kind: 'change' })
   expect(await rows('compose')).toBe(4)
-  await ui.input({ key: 'compose', text: 'one\ntwo', kind: 'change' })
-  expect(await rows('compose')).toBe(2)
+  await ui.input({ key: 'compose', text: 'one\ntwo\nthree', kind: 'change' })
+  expect(await rows('compose')).toBe(3)
   await ui.input({ key: 'compose', text: words(80), kind: 'change' })
   expect(await rows('compose')).toBe(6)
+  // The field keeps the typing: it is drawn with what the pane last put there, so a burst of keys is never undone.
+  expect((await ui.find({ type: 'Input', key: 'compose' }))?.props.value).toBe('')
   await ui.input({ key: 'compose', text: '', kind: 'change' })
-  expect(await rows('compose')).toBe(1)
+  expect(await rows('compose')).toBe(2)
   await ui.input({ key: 'compose', text: '' })
+  expect(await mode(ui)).toBe('NORMAL')
+  expect(await rows('compose')).toBe(1)
 
   await keys(ui, 'h')
   await keys(ui, 'n')
@@ -398,6 +402,26 @@ test('the composer and the start form grow a row for each the draft wraps to, a 
   const short = await mount(60, 12)
   await short.input({ key: 'start-message', text: words(80), kind: 'change' })
   expect((await short.find({ type: 'Input', key: 'start-message' }))?.props.rows).toBe(3)
+})
+
+test('a field is drawn with the text the pane puts in it: emptied on a thread opened, a form opened, a project picked', async ($, on) => {
+  const cli = fake()
+  const { nexus, mount } = await boot($, on, cli)
+  await nexus(`open ${ID}`)
+  const ui = await mount()
+  const value = async (key: string) => (await ui.find({ type: 'Input', key }))?.props.value
+  await keys(ui, 'i')
+  await ui.input({ key: 'compose', text: 'half a thought', kind: 'change' })
+  const drawn = await value('compose')
+  await nexus(`open ${THREADS[2]!.id}`)
+  // Put twice, the empty field is drawn as '' and then as nothing, so the engine takes the second as a change too.
+  expect(await value('compose')).not.toBe(drawn)
+  await keys(ui, 'h')
+  await keys(ui, 'n')
+  await ui.input({ key: 'start-branch', text: 'dev', kind: 'change' })
+  expect(await value('start-branch')).toBe('')
+  await ui.select({ key: 'start-project', value: 'api' })
+  expect(await value('start-branch')).toBeUndefined()
 })
 
 test('Esc from the composer, which hands the keys to the prompt, is back to normal mode with the keys taken back', async ($, on) => {
@@ -1155,7 +1179,7 @@ test('a start whose switch to the thread loses a race to a new form follows noth
   on('state.set', async (_, e, next) => {
     if (isRaced || e.key !== 'pane' || e.ifVersion === undefined || e.value.view !== 'thread' || e.value.selected !== 'th-123456789abc' || !e.previous?.start) return next(e)
     isRaced = true
-    const landed = await next({ ...e, value: { ...e.previous, start: { ...e.previous.start, title: 'Other', isStarting: false, request: -1 } } })
+    const landed = await next({ ...e, value: { ...e.previous, start: { ...e.previous.start, title: 'Other', isStarting: false, request: -1 }, fields: { ...e.previous.fields, 'start-title': 'Other' } } })
     return landed.value ? { value: { isSet: false, version: landed.value.version } } : landed
   })
   const { clock, nexus, mount } = await boot($, on, cli)

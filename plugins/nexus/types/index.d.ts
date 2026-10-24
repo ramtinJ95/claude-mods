@@ -170,6 +170,8 @@ export type NexusStartDraft = {
   isStarting: boolean
   /** The submission this form waits on, 0 before its first: a start that ends checks it is still the form's. */
   request: number
+  /** The element the person moved the ring to, which the message's rows follow. */
+  focused: string | null
 }
 
 export type NexusView = 'list' | 'thread' | 'start'
@@ -226,9 +228,14 @@ export type NexusPane = {
   /** The folds, tool rows and closed-thread groups the person opened or closed, by key; the rest follow the defaults. */
   toggled: Record<string, boolean>
   filter: string
-  /** The message typed so far, kept so a redraw does not lose it. */
+  /** The composer's text as the person typed it, for the rows it takes. */
   draft: string
   start: NexusStartDraft | null
+  /**
+   * What each text field is drawn with, by key: the text the pane last put there, never the typing (`putField`).
+   * The field keeps what is typed until it is drawn with another.
+   */
+  fields: Record<string, string | null>
   /** The outcome of the last press, until the next one. */
   notice: { text: string; tone: 'error' | 'dim' } | null
   /**

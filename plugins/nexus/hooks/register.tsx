@@ -47,10 +47,10 @@ import {
   stripChips,
   transcript,
 } from './model'
-import { COMPOSE, type Effect, FILTER, type MenuAction, press, ringMoved } from './keys'
+import { COMPOSE, type Effect, FILTER, type MenuAction, press, putField, ringMoved } from './keys'
 import { StripView } from './strip'
 import { needsHuman, portFacts, TOOLS } from './tools'
-import { type Draw, ListView, type PaneActions, type Scene, StartView, ThreadView, ringOf } from './view'
+import { type Draw, ListView, type PaneActions, START_KEYS, type Scene, StartView, ThreadView, ringOf } from './view'
 
 const PANE = 'nexus'
 const POLL_MS = 5_000
@@ -94,6 +94,7 @@ const paneAtom = atom({ plugin: 'nexus', key: 'pane' } as const, {
   filter: '',
   draft: '',
   start: null,
+  fields: {},
   notice: null,
   portChanges: {},
 })
@@ -524,6 +525,7 @@ const threadView = (pane: NexusPane, thread: string): Partial<NexusPane> => {
     portCursor: isSame ? pane.portCursor : null,
     listCursor: thread,
     draft: '',
+    fields: putField(pane.fields, COMPOSE, ''),
     start: null,
     notice: null,
     toggled: isSame ? pane.toggled : {},
@@ -599,7 +601,7 @@ async function openFromStrip($: EngineInterface, id: string) {
 async function recover($: EngineInterface) {
   recovering = undefined
   const pane = await update($, paneAtom, (was): NexusPane =>
-    was.mode === 'normal' && !was.overlay ? was : { ...was, mode: 'normal', overlay: null, pending: null, ...(was.mode === 'filter' ? { filter: '' } : {}) },
+    was.mode === 'normal' && !was.overlay ? was : { ...was, mode: 'normal', overlay: null, pending: null, ...(was.mode === 'filter' ? { filter: '', fields: putField(was.fields, FILTER, '') } : {}) },
   )
   // A pane closed since stays closed; asking for the keys it holds already changes nothing.
   if (!(await $.ui.panes()).some(one => one.id === PANE)) return
@@ -1062,11 +1064,16 @@ function failedTool() {
   return { deny: 'nexus: the tool failed before it answered; try again.' }
 }
 
-const emptyStart = (project = '', title = ''): NexusStartDraft => ({ title, project, node: '', branch: '', message: '', error: null, isStarting: false, request: 0 })
+const emptyStart = (project = '', title = ''): NexusStartDraft => ({ title, project, node: '', branch: '', message: '', error: null, isStarting: false, request: 0, focused: null })
 
 /** Opens the start form, its project and title given for Start again, and reads the projects and nodes it offers. */
 async function openStart($: EngineInterface, project?: string, title?: string) {
-  await setPane($, () => ({ view: 'start', mode: 'normal', overlay: null, start: emptyStart(project, title) }))
+  await setPane($, pane => {
+    const start = emptyStart(project, title)
+    const texts = { [START_KEYS.title]: start.title, [START_KEYS.branch]: start.branch, [START_KEYS.message]: start.message }
+    const fields = Object.entries(texts).reduce((all, [key, text]) => putField(all, key, text), pane.fields)
+    return { view: 'start', mode: 'normal', overlay: null, start, fields }
+  })
   await loadCatalog($, { projects: true })
   const { projects } = await read($, catalogAtom)
   await update($, paneAtom, pane => {
@@ -1260,6 +1267,12 @@ function paneActions($: EngineInterface, surface: RenderSurface): PaneActions {
       }),
     back: () => run(back),
     startDraft: change => run(() => setStart($, { ...change, error: null })),
+    startProject: project =>
+      run(() =>
+        update($, paneAtom, pane =>
+          pane.start ? { ...pane, start: { ...pane.start, project, node: '', branch: '', error: null }, fields: putField(pane.fields, START_KEYS.branch, '') } : pane,
+        ),
+      ),
     startSubmit: change =>
       run(async () => {
         if (change) await setStart($, change)

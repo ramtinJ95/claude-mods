@@ -19,6 +19,7 @@ const PANE: NexusPane = {
   filter: '',
   draft: '',
   start: null,
+  fields: {},
   notice: null,
   portChanges: {},
 }
@@ -178,5 +179,7 @@ describe('the list and ports', () => {
     expect(ringMoved({ ...PANE, tab: 'ports' }, 'port-5173')).toMatchObject({ portCursor: 'port-5173' })
     expect(ringMoved({ ...PANE, view: 'list' }, 'th-2')).toMatchObject({ listCursor: 'th-2' })
     expect(ringMoved({ ...PANE, overlay: { kind: 'menu', cursor: null } }, 'menu-delete').overlay).toEqual({ kind: 'menu', cursor: 'menu-delete' })
+    const form = { title: '', project: 'web', node: '', branch: '', message: '', error: null, isStarting: false, request: 0, focused: null }
+    expect(ringMoved({ ...PANE, view: 'start', start: form }, 'start-message').start).toMatchObject({ focused: 'start-message' })
   })
 })
