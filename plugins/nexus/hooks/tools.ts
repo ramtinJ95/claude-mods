@@ -68,11 +68,12 @@ export const TOOLS = {
   },
 } as const satisfies Record<string, ToolSpec>
 
-/** A listening port as the model reads it: its service and its preview's URL, when it has them. */
+/** A listening port as the model reads it: its service and its preview's URL, when it has them, and why that failed. pi-nexus gives the same keys in the same order. */
 export const portFacts = (port: NexusPort) => ({
   port: port.port,
   ...(port.service ? { service: port.service } : {}),
   ...(port.preview ? { url: port.preview.url, ready: port.preview.ready } : {}),
+  ...(port.preview?.failed ? { failed: port.preview.failed } : {}),
 })
 
 /** What only a person can do for a thread, so the model says so rather than waiting again. pi-nexus words it the same. */

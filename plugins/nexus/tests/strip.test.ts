@@ -97,3 +97,13 @@ test("a strip poll that ends after the pane's newer one writes nothing", async (
   await clock.advance(3_000)
   expect(await ui.find({ type: 'Button', key: NEW.id })).toBeDefined()
 })
+
+test("a project's name in a narrow strip shortens the first chip's title rather than hide every chip", async ($, on) => {
+  const cli = fake({ threads: [...THREADS, FAILED, REPLIED], store: { ...STORE, project: 'web' } })
+  const { clock, strip } = await boot($, on, cli)
+  await clock.settle()
+  const ui = await strip(44)
+  expect(await ui.find({ type: 'Text', text: '◆ Nexus · web' })).toBeDefined()
+  expect(await chips(ui)).toEqual([[FAILED.id, '✕ Broken s…  needs you']])
+  expect(await ui.find({ type: 'Text', text: '+2' })).toBeDefined()
+})

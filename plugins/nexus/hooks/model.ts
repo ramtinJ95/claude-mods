@@ -93,7 +93,7 @@ export function parseStarted(json: unknown): NexusThread {
 export function parsePreview(raw: unknown, command: string): NexusPreview {
   if (!isRecord(raw) || typeof raw.service !== 'string') throw contractError(command, 'a preview without its service')
   if (typeof raw.url !== 'string') throw contractError(command, `a preview (${raw.service}) without its url`)
-  return { service: raw.service, httpsPort: num(raw.httpsPort), ready: raw.ready === true, url: raw.url }
+  return { service: raw.service, httpsPort: num(raw.httpsPort), ready: raw.ready === true, failed: strOrNull(raw.failed), url: raw.url }
 }
 
 /** `unpreview` prints a literal null; anything else is a CLI this mod does not know, so the close is not taken as done. */
@@ -172,14 +172,25 @@ export function parseDetail(json: unknown): NexusDetail {
   }
 }
 
+const projectOf = (id: string, raw: Record<string, unknown>): NexusProject => ({ id, repoUrl: str(raw.repoUrl), defaultBranch: str(raw.defaultBranch), defaultNode: str(raw.defaultNode) })
+
 export function parseProjects(json: unknown): NexusProject[] {
   if (!Array.isArray(json)) throw new Error('nexus projects did not print a list')
-  return json.flatMap(raw =>
-    isRecord(raw) && typeof raw.id === 'string'
-      ? [{ id: raw.id, repoUrl: str(raw.repoUrl), defaultBranch: str(raw.defaultBranch), defaultNode: str(raw.defaultNode) }]
-      : [],
-  )
+  return json.flatMap(raw => (isRecord(raw) && typeof raw.id === 'string' ? [projectOf(raw.id, raw)] : []))
 }
+
+/** `nexus project add`'s answer: the project it added. */
+export function parseAdded(json: unknown): NexusProject {
+  if (!isRecord(json) || typeof json.id !== 'string') throw new Error('nexus project add did not print the project it added')
+  return projectOf(json.id, json)
+}
+
+/** The threads of `project`, or every thread for null: the scope the list, the strip and `/nexus` show. */
+export const inScope = <T extends { project: string }>(threads: readonly T[], project: string | null): T[] =>
+  project === null ? [...threads] : threads.filter(thread => thread.project === project)
+
+/** The scope as the list's title and the strip name it. */
+export const scopeLabel = (project: string | null) => project ?? 'All projects'
 
 export function parseNodes(json: unknown): NexusNode[] {
   if (!Array.isArray(json)) throw new Error('nexus nodes did not print a list')
@@ -550,6 +561,8 @@ export function clock(ms: number): string {
 export function previewLook(detail: Pick<NexusDetail, 'thread' | 'pylon'>, preview: NexusPreview) {
   if (detail.thread.status === 'archived') return { linked: false, label: 'paused', tone: 'idle' as Tone, hint: 'Unarchive the thread to open it.' }
   if (detail.pylon.actualState === 'paused') return { linked: true, label: 'paused', tone: 'idle' as Tone, hint: 'Opening it wakes the pylon.' }
+  // A failed service's URL answers 502 until the service runs again, so it is no link; the reason is the node's.
+  if (preview.failed) return { linked: false, label: 'failed', tone: 'bad' as Tone, hint: preview.failed }
   return preview.ready ? { linked: true, label: 'ready', tone: 'ok' as Tone, hint: null } : { linked: false, label: 'starting', tone: 'busy' as Tone, hint: null }
 }
 
@@ -721,6 +734,9 @@ export type NexusCommand =
   | { verb: 'action'; action: Action; thread?: string }
   | { verb: 'unpublish'; port: number; thread?: string }
   | { verb: 'strip'; isOn: boolean }
+  /** `project` undefined asks which project is shown, null shows every project. */
+  | { verb: 'scope'; project?: string | null }
+  | { verb: 'add-project'; id: string; repoUrl: string; node: string; branch?: string }
   | { verb: 'invalid'; reason: string }
 
 export const USAGE = [
@@ -731,6 +747,8 @@ export const USAGE = [
   '/nexus send <id> <message>      queued behind a running turn',
   '/nexus unpublish <port> [id]    close the preview of a port',
   '/nexus strip on|off             show or hide the threads above the prompt',
+  "/nexus project [id|all]         which project's threads show, or the one shown",
+  '/nexus project add <id> <repo-url> --node <node> [--branch <branch>]',
   '/nexus archive|unarchive|abort|retry|retry-pylon|delete [id]',
   'An ID may be a unique prefix (4f2a or th-4f2a). Without one, an action takes the thread open in the pane.',
 ].join('\n')
@@ -778,6 +796,12 @@ export function parseCommand(args: string): NexusCommand {
     }
     case 'strip':
       return rest === 'on' || rest === 'off' ? { verb: 'strip', isOn: rest === 'on' } : invalid('/nexus strip takes on or off.')
+    case 'project': {
+      const [first, after] = split(rest)
+      if (first === 'add') return addProject(after.split(/\s+/).filter(Boolean), invalid)
+      if (after) return invalid('/nexus project takes one project ID, all, or add.')
+      return first ? { verb: 'scope', project: first === 'all' ? null : first } : { verb: 'scope' }
+    }
     default: {
       if (!Object.hasOwn(ACTIONS, verb)) return invalid(`/nexus has no ${verb}.`)
       const [thread, extra] = split(rest)
@@ -785,6 +809,28 @@ export function parseCommand(args: string): NexusCommand {
       return { verb: 'action', action: verb as Action, ...(thread ? { thread } : {}) }
     }
   }
+}
+
+/** `/nexus project add`'s arguments: an ID and a repo URL, and --node and --branch, as `--flag value` or `--flag=value`. */
+function addProject(args: readonly string[], invalid: (reason: string) => NexusCommand): NexusCommand {
+  const positional: string[] = []
+  const flags: { node?: string; branch?: string } = {}
+  for (let at = 0; at < args.length; at++) {
+    const arg = args[at]!
+    if (!arg.startsWith('--')) {
+      positional.push(arg)
+      continue
+    }
+    const [flag, inline] = arg.slice(2).split(/=(.*)/s) as [string, string | undefined]
+    if (flag !== 'node' && flag !== 'branch') return invalid(`/nexus project add takes only --node and --branch, not --${flag}.`)
+    const value = inline ?? args[++at]
+    if (!value) return invalid(`/nexus project add needs a ${flag} after --${flag}.`)
+    flags[flag] = value
+  }
+  if (positional.length !== 2) return invalid('/nexus project add takes a project ID and a repo URL.')
+  if (!flags.node) return invalid('/nexus project add needs --node <node>; nexus nodes lists them.')
+  const [id, repoUrl] = positional as [string, string]
+  return { verb: 'add-project', id, repoUrl, node: flags.node, ...(flags.branch ? { branch: flags.branch } : {}) }
 }
 
 /** A thread the strip shows, by what it asks of the person: most urgent first. */

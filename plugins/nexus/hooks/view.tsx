@@ -29,6 +29,7 @@ import type {
   NexusPort,
   NexusPortChange,
   NexusPreview,
+  NexusProjectDraft,
   NexusShown,
   NexusStartDraft,
   NexusTab,
@@ -58,12 +59,14 @@ import {
   exitCode,
   foldSummary,
   groupThreads,
+  inScope,
   listOrder,
   linkedPort,
   NO_CHANGE,
   portChange,
   previewLook,
   runOf,
+  scopeLabel,
   sentence,
   since,
   span,
@@ -94,6 +97,8 @@ export type Scene = {
   shown: NexusShown | null
   catalog: NexusCatalog
   pane: NexusPane
+  /** The project whose threads the list shows, null for every project. */
+  scope: string | null
   now: number
   width: number
   /** The rows the pane's body has; the views fill them, so the title bar and the composer stay put. */
@@ -125,6 +130,10 @@ export type PaneActions = {
   startProject: (project: string) => void
   /** Starts the thread, the field Enter was pressed in carrying its text: it may not have reported it yet. */
   startSubmit: (change?: Partial<Pick<NexusStartDraft, 'title' | 'branch' | 'message'>>) => void
+  /** A change of the new project form; `at` is the field it was typed into, as drawn. */
+  projectDraft: (change: Partial<NexusProjectDraft>, at?: string) => void
+  /** Adds the project, the field Enter was pressed in carrying its text, as for the start form. */
+  projectSubmit: (change?: Partial<Pick<NexusProjectDraft, 'id' | 'repoUrl' | 'branch'>>) => void
 }
 
 
@@ -175,15 +184,22 @@ function Pill({ Text }: Draw, label: string, tone: Tone) {
   )
 }
 
-/** The pane's title bar: a band across the dock with where the person is and what is going on. */
-function TitleBar(draw: Draw, scene: Scene, left: RenderChildren, right: string) {
+/**
+ * The pane's title bar: a band across the dock with where the person is and what is going on. In a narrow pane the
+ * side that `yields` is cut, on one row: the left's detail by default, a form's hint on the right.
+ */
+function TitleBar(draw: Draw, scene: Scene, left: RenderChildren, right: string, yields: 'left' | 'right' = 'left') {
   const { Box, Text } = draw
   return (
     <Box key="title" flexDirection="row" width={scene.width} backgroundColor={BAR} paddingX={1} justifyContent="space-between">
-      <Box flexShrink={1}>
+      <Box flexShrink={yields === 'left' ? 1 : 0}>
         <Text wrap="truncate-end">{left}</Text>
       </Box>
-      <Text color="subtle">{right}</Text>
+      <Box flexShrink={yields === 'right' ? 1 : 0} paddingLeft={2}>
+        <Text color="subtle" wrap="truncate-end">
+          {right}
+        </Text>
+      </Box>
     </Box>
   )
 }
@@ -424,7 +440,7 @@ export function rowsOf(node: unknown, width: number): number {
 function TitleOfList(draw: Draw, scene: Scene) {
   const { Text } = draw
   const { list, catalog } = scene
-  const threads = list.threads ?? []
+  const threads = inScope(list.threads ?? [], scene.scope)
   const open = threads.filter(thread => thread.status === 'active' || thread.status === 'idle').length
   const working = threads.filter(thread => thread.agentTurnRunning).length
   const online = catalog.nodes?.filter(node => node.state === 'online').length
@@ -433,8 +449,9 @@ function TitleOfList(draw: Draw, scene: Scene) {
     scene,
     <Text>
       <Text bold color="claude">
-        ◆ Nexus
+        ◆ Nexus threads
       </Text>
+      <Text color="subtle">{` · ${scopeLabel(scene.scope)}`}</Text>
       {list.threads ? (
         <Text color="subtle">{`   ${working} working · ${open} open`}</Text>
       ) : list.failure ? (
@@ -450,7 +467,7 @@ function TitleOfList(draw: Draw, scene: Scene) {
 export function ListView(draw: Draw, scene: Scene, actions: PaneActions) {
   const { Box, Text, Button, Input } = draw
   const { list, pane } = scene
-  const threads = list.threads ?? []
+  const threads = inScope(list.threads ?? [], scene.scope)
   const groups = groupThreads(threads, pane.filter, pane.toggled)
   const now = list.polledAt ?? scene.now
   const isFiltering = pane.mode === 'filter'
@@ -522,22 +539,27 @@ export function ListView(draw: Draw, scene: Scene, actions: PaneActions) {
     ),
     list.threads && groups.length === 0 && (
       <Text key="empty" color="subtle">
-        {pane.filter ? 'No thread title holds that.' : 'No threads yet. n starts one.'}
+        {pane.filter ? 'No thread title holds that.' : scene.scope ? `No threads in ${scene.scope} yet. n starts one, p shows another project.` : 'No threads yet. n starts one.'}
       </Text>
     ),
   ]
   const isHelp = pane.overlay?.kind === 'help'
+  const isPicking = pane.overlay?.kind === 'projects'
   const hints: [string, string][] = isFiltering
     ? [['⏎', 'done'], ['esc', 'clear']]
     : isHelp
       ? [['j/k', 'scroll'], ['q', 'close the help']]
-      : [['j/k', 'move'], ['l', 'open'], ['f', 'filter'], ['n', 'new'], ['s', 'keys'], ['q', 'close']]
+      : isPicking
+        ? PICKER_HINTS
+        : [['j/k', 'move'], ['l', 'open'], ['f', 'filter'], ['n', 'new'], ['p', 'projects'], ['s', 'keys'], ['q', 'close']]
   const footer = [Notice(draw, pane), ModeLine(draw, scene, hints)]
   const area = Math.max(3, scene.rows - rowsOf(header, scene.width) - rowsOf(footer, scene.width))
   const top = keepInView(Math.min(pane.listTop, Math.max(0, y - area)), items.find(item => item.key === cursor), area)
   const body: Body = isHelp
     ? HelpBody(draw, scene, actions, area)
-    : {
+    : isPicking
+      ? ProjectsBody(draw, scene, actions, area)
+      : {
         nav: { context: 'list', items, area },
         node: (
           <Box flexDirection="column" flexShrink={0} marginTop={-top}>
@@ -700,7 +722,9 @@ export function ThreadView(draw: Draw, scene: Scene, actions: PaneActions) {
     ? [['j/k', 'scroll'], ['q', 'close the help']]
     : pane.overlay?.kind === 'menu'
       ? [['j/k', 'move'], ['⏎', 'run'], ['q', 'close']]
-      : isInserting
+      : pane.overlay?.kind === 'projects'
+        ? PICKER_HINTS
+        : isInserting
         ? [['⏎', state && state.run !== 'idle' ? 'queue' : 'send'], ['esc', 'normal mode'], ['empty ⏎', 'normal mode']]
         : pane.tab === 'conversation'
           ? [['j/k', 'block'], ['d/u', 'page'], ...(scrolled ? [['ge', 'follow'] as [string, string]] : []), ['o', 'open'], ['h/l', 'tabs'], ...(canInsert ? [['i', 'write'] as [string, string]] : []), ['m', 'actions'], ['s', 'keys']]
@@ -715,7 +739,9 @@ export function ThreadView(draw: Draw, scene: Scene, actions: PaneActions) {
       ? HelpBody(draw, scene, actions, area)
       : pane.overlay?.kind === 'menu'
         ? MenuBody(draw, scene, actions, area)
-        : pane.tab === 'conversation'
+        : pane.overlay?.kind === 'projects'
+          ? ProjectsBody(draw, scene, actions, area)
+          : pane.tab === 'conversation'
           ? Conversation(draw, scene, actions, area, DRAWN_LIMIT - drawnChars([header, footer]), canInsert)
           : pane.tab === 'details'
             ? DetailsBody(draw, scene, area, canInsert)
@@ -795,6 +821,68 @@ function MenuBody(draw: Draw, scene: Scene, actions: PaneActions, area: number):
             <Text color={entry.action === 'delete' || entry.action === 'abort' ? 'error' : index === cursor ? 'suggestion' : 'text'}>{entry.label}</Text>
           </Button>
         ))}
+      </Box>
+    ),
+  }
+}
+
+const PICKER_HINTS: [string, string][] = [['j/k', 'move'], ['⏎', 'choose'], ['q', 'cancel']]
+
+/**
+ * The project picker: every project, each project with its repo, and a new one. The project shown is marked current,
+ * and the cursor starts on it.
+ */
+function ProjectsBody(draw: Draw, scene: Scene, actions: PaneActions, area: number): Body {
+  const { Box, Text, Button } = draw
+  const { projects, projectsFailure } = scene.catalog
+  const rows: { key: string; name: string; repo: string; isCurrent: boolean; enter: Effect }[] = [
+    { key: 'scope-all', name: 'All projects', repo: '', isCurrent: scene.scope === null, enter: { kind: 'scope', project: null } },
+    ...(projects ?? []).map(project => ({ key: `scope-project-${project.id}`, name: project.id, repo: project.repoUrl, isCurrent: scene.scope === project.id, enter: { kind: 'scope', project: project.id } as Effect })),
+    { key: 'scope-new', name: '+ New project…', repo: '', isCurrent: false, enter: { kind: 'new-project' } },
+  ]
+  const note = projectsFailure ? `The projects did not load: ${sentence(projectsFailure.message)}` : projects ? null : 'Reading the projects…'
+  const noteNode = note && (
+    <Box key="projects-note" paddingLeft={2}>
+      <Text color={projectsFailure ? 'error' : 'subtle'}>{note}</Text>
+    </Box>
+  )
+  // The title, and the note under All projects while there is one, as many rows as it wraps to.
+  const noteRows = noteNode ? rowsOf(noteNode, scene.width) : 0
+  const above = (at: number) => 1 + (at > 0 ? noteRows : 0)
+  const items: NavItem[] = rows.map((row, at) => ({ key: row.key, top: at + above(at), height: 1, enter: row.enter }))
+  const chosen = scene.pane.overlay?.kind === 'projects' ? scene.pane.overlay.cursor : null
+  const cursor = Math.max(0, rows.findIndex(row => row.key === chosen), chosen ? -1 : rows.findIndex(row => row.isCurrent))
+  const top = Math.max(0, items[cursor]!.top + 1 - area)
+  // Past the pointer, the IDs take at most half the row; the rest is the repo, which gives way to the current mark.
+  const line = scene.width - 2
+  const column = Math.min(Math.max(...rows.map(row => cells(row.name))), Math.floor(line / 2)) + 2
+  const total = rows.length
+  return {
+    nav: { context: 'projects', items, area, drawn: rows[cursor]!.key },
+    node: (
+      <Box key="projects" flexDirection="column" flexShrink={0} marginTop={-top}>
+        <Text bold color="claude">
+          Projects{top > 0 ? <Text color="subtle">{`  (${cursor + 1}/${total})`}</Text> : ''}
+        </Text>
+        {rows.map((row, at) => {
+          const isCursor = at === cursor
+          const mark = row.isCurrent ? 'current' : ''
+          const room = line - column
+          const repoRoom = room - (mark ? cells(mark) + 2 : 0)
+          // A repo cut shorter than a host's name says nothing, so it goes.
+          const detail = clip([repoRoom >= 8 ? clip(row.repo, repoRoom) : '', mark].filter(Boolean).join('  '), Math.max(0, room))
+          const name = clip(row.name, detail ? column - 2 : line)
+          return [
+            <Button key={row.key} plain autoFocus={isCursor ? true : undefined} onPress={() => actions.effect(row.enter)}>
+              {Pointer(draw, isCursor)}
+              <Text color={isCursor ? 'suggestion' : row.key === 'scope-new' ? 'subtle' : 'text'} bold={isCursor}>
+                {name}
+              </Text>
+              {detail ? <Text color="subtle">{`${' '.repeat(column - cells(name))}${detail}`}</Text> : ''}
+            </Button>,
+            at === 0 ? noteNode : null,
+          ]
+        })}
       </Box>
     ),
   }
@@ -1403,7 +1491,7 @@ function PortsBody(draw: Draw, scene: Scene, actions: PaneActions, area: number,
         </Box>
         <Box flexDirection="column" paddingLeft={4}>
           {isCursor && <Text color="subtle">{`⏎ or y copies the URL${isClosable ? ' · x unpublishes it (a new publish may get a new URL)' : ''}`}</Text>}
-          {look.hint && <Text color="subtle">{look.hint}</Text>}
+          {look.hint && <Text color={look.tone === 'bad' ? 'error' : 'subtle'}>{look.hint}</Text>}
           {change.failure && <Text color="error">{change.failure.message}</Text>}
         </Box>
       </Box>,
@@ -1502,9 +1590,10 @@ export function StartView(draw: Draw, scene: Scene, actions: PaneActions) {
           <Text bold>Start a thread</Text>
         </Text>,
         'tab moves between the fields',
+        'right',
       )}
       {projectsFailure && <Text color="error">The projects did not load: {sentence(projectsFailure.message)}</Text>}
-      {projects && projects.length === 0 && <Text color="subtle">No projects yet. Add one with POST /v1/projects.</Text>}
+      {projects && projects.length === 0 && <Text color="subtle">No projects yet. Back, then p and New project… adds one.</Text>}
       {!projects && !projectsFailure && <Text color="subtle">Loading the projects…</Text>}
       {projects && projects.length > 0 && (
         <Box flexDirection="column" marginTop={1} rowGap={0}>
@@ -1564,6 +1653,91 @@ export function StartView(draw: Draw, scene: Scene, actions: PaneActions) {
         </Box>
       )}
       {(!projects || projects.length === 0) && <Button key="start-cancel" label="Back" onPress={actions.back} />}
+      </Box>,
+    ],
+  )
+}
+
+export const PROJECT_KEYS = { id: 'project-id', repoUrl: 'project-url', node: 'project-node', branch: 'project-branch' } as const
+
+/** The form that adds a project, as `nexus project add` takes it: an ID, a repo URL, a node and a branch. */
+export function ProjectView(draw: Draw, scene: Scene, actions: PaneActions) {
+  const { Box, Text, Button, Input, Select } = draw
+  const draft = scene.pane.project
+  const { nodes, nodesFailure } = scene.catalog
+  if (!draft) return <Text color="subtle">The new project form is closed.</Text>
+  const field = (name: keyof typeof PROJECT_KEYS) => ({ key: fieldKey(scene.pane.fields, PROJECT_KEYS[name]), value: scene.pane.fields[PROJECT_KEYS[name]]?.text })
+  const id = field('id')
+  const repoUrl = field('repoUrl')
+  const branch = field('branch')
+  return Frame(
+    draw,
+    scene,
+    [
+      <Box key="project" flexDirection="column" flexGrow={1}>
+        {TitleBar(
+          draw,
+          scene,
+          <Text>
+            <Text bold color="claude">
+              ◆ Nexus
+            </Text>
+            <Text color="subtle"> › </Text>
+            <Text bold>Add a project</Text>
+          </Text>,
+          'tab moves between the fields',
+          'right',
+        )}
+        <Box flexDirection="column" marginTop={1} rowGap={0}>
+          <Input
+            key={id.key}
+            autoFocus
+            label="ID      "
+            value={id.value}
+            placeholder="lowercase letters, digits and dashes"
+            submitLabel="add"
+            onInput={value => actions.projectDraft({ id: value }, id.key)}
+            onSubmit={value => actions.projectSubmit({ id: value })}
+          />
+          <Input
+            key={repoUrl.key}
+            label="Repo URL"
+            value={repoUrl.value}
+            placeholder="git@github.com:you/repo.git or https://…"
+            submitLabel="add"
+            onInput={value => actions.projectDraft({ repoUrl: value }, repoUrl.key)}
+            onSubmit={value => actions.projectSubmit({ repoUrl: value })}
+          />
+          {nodes && nodes.length > 0 ? (
+            <Select
+              key={PROJECT_KEYS.node}
+              label="Node    "
+              value={draft.node}
+              options={nodes.map(one => ({ value: one.name, label: `${one.name}${one.state === 'offline' ? ', offline' : ''}` }))}
+              onSelect={value => actions.projectDraft({ node: value })}
+            />
+          ) : (
+            <Text color={nodesFailure || nodes ? 'error' : 'subtle'}>
+              {nodesFailure ? `The nodes did not load: ${sentence(nodesFailure.message)}` : nodes ? 'No nodes yet, so there is no node to add the project on.' : 'Reading the nodes…'}
+            </Text>
+          )}
+          <Input
+            key={branch.key}
+            label="Branch  "
+            value={branch.value}
+            placeholder="main"
+            submitLabel="add"
+            onInput={value => actions.projectDraft({ branch: value }, branch.key)}
+            onSubmit={value => actions.projectSubmit({ branch: value })}
+          />
+          <Text color="subtle">Its threads' pylons boot on the node and check out the branch, unless a thread asks for others.</Text>
+          {draft.error && <Text color="error">{draft.error}</Text>}
+          {Notice(draw, scene.pane)}
+          <Box flexDirection="row" columnGap={2} marginTop={1}>
+            <Button key="project-submit" variant="primary" label={draft.isAdding ? 'Adding…' : 'Add project'} onPress={() => actions.projectSubmit()} />
+            <Button key="project-cancel" label="Cancel" onPress={actions.back} />
+          </Box>
+        </Box>
       </Box>,
     ],
   )

@@ -20,6 +20,7 @@ const PANE: NexusPane = {
   filter: '',
   draft: '',
   start: null,
+  project: null,
   fields: {},
   notice: null,
   portChanges: {},

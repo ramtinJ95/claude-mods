@@ -82,7 +82,7 @@ test('the list groups threads by project, folds the closed ones and opens the ro
   expect(cli.runs).toContainEqual(['nodes', '--json'])
   const ui = await mount()
   await keys(ui, 'h')
-  expect(await shows(ui, /◆ Nexus\s+1 working · 2 open/)).toBe(true)
+  expect(await shows(ui, /◆ Nexus threads · All projects\s+1 working · 2 open/)).toBe(true)
   expect(await shows(ui, '1/2 nodes online')).toBe(true)
   expect((await ui.find({ type: 'Button', key: ID }))?.text).toMatch(/^❯ ◉ Fix login form 500s\s+ working \s+now$/)
   // The row under the cursor opens a line of its facts.
@@ -1069,6 +1069,19 @@ test("a preview's link is the CLI's URL, with or without the nodes", async ($, o
   const ui = await mount()
   await toPorts(ui)
   expect((await ui.findAll({ type: 'Link' })).map(link => link.props.href)).toEqual([WEB_PREVIEW.url])
+})
+
+test("a preview whose service failed says so in red with the node's reason, and is no link", async ($, on) => {
+  const failed = { ...WEB_PREVIEW, ready: false, failed: 'web exited with code 1' }
+  const cli = fake({ detail: { ...DETAIL, previews: [failed], ports: DETAIL.ports.map(one => (one.preview?.service === 'web' ? { ...one, preview: failed } : one)) } })
+  const { nexus, mount } = await boot($, on, cli)
+  await nexus(`open ${ID}`)
+  const ui = await mount()
+  await toPorts(ui)
+  expect((await ui.find({ type: 'Button', key: 'preview-web' }))?.text).toMatch(/web :3000 {2}failed $/)
+  expect((await ui.find({ type: 'Text', text: 'web exited with code 1' }))?.props.color).toBe('error')
+  expect(await ui.find({ type: 'Link' })).toBeUndefined()
+  expect(await shows(ui, WEB_PREVIEW.url)).toBe(true)
 })
 
 test('o on a port publishes it: progress while the CLI waits, then Previews lists it with its link, before the details do', async ($, on) => {

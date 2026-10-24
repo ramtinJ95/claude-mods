@@ -114,6 +114,8 @@ export type Fake = {
   /** Every `$.process.spawn` argv, the CLI's name dropped. */
   spawns: string[][]
   threads: unknown[]
+  /** What `projects` lists; `project add` adds to it, as the control plane does. */
+  projects: unknown[]
   detail: unknown
   /** The watch's lines in order; a `{ delay }` holds the stream that long on the test's clock first. */
   watch: unknown[]
@@ -129,14 +131,47 @@ export type Fake = {
   answer: string
   asked: string[]
   copied: string[]
+  /** Every `$.ui.toast` text. */
+  toasts: string[]
   opens: number
   isOpen: boolean
-  /** What `$.store` holds as the session starts: the theme tip is taken as said unless a test says otherwise. */
+  /** What `$.store` holds, from the session's start on: the theme tip is taken as said unless a test says otherwise. */
   store: Record<string, unknown>
+  /** Runs before each `$.store.set` lands, to hold one while the test does something else. */
+  saving?: (key: string, value: unknown) => Promise<void>
+}
+
+/**
+ * `project add`'s arguments as node:util's parseArgs reads them for the CLI (strict, positionals allowed): `--name=value`
+ * or `--name value` is an option, anything after `--` a positional; or the error the CLI prints.
+ */
+function parseProjectAdd(args: readonly string[]): { values: Record<string, string>; positionals: string[] } | string {
+  const values: Record<string, string> = {}
+  const positionals: string[] = []
+  for (let at = 0; at < args.length; at++) {
+    const arg = args[at]!
+    if (arg === '--') {
+      positionals.push(...args.slice(at + 1))
+      break
+    }
+    if (!arg.startsWith('--')) {
+      positionals.push(arg)
+      continue
+    }
+    const [name, inline] = arg.slice(2).split(/=(.*)/s)
+    if (name === 'json') continue
+    if (name !== 'node' && name !== 'branch') return `Unknown option '--${name}'`
+    const value = inline ?? args[++at]
+    if (value === undefined) return `Option '--${name} <value>' argument missing`
+    values[name] = value
+  }
+  return positionals.length === 2 ? { values, positionals } : `project add takes 2 arguments, got ${positionals.length}`
 }
 
 export function fake(change: Partial<Fake> = {}): Fake {
-  return { runs: [], spawns: [], threads: THREADS, detail: DETAIL, watch: [{ type: 'reset', thread: ID, entries: ENTRIES }, state('working'), live()], slow: {}, fail: {}, printed: {}, publishes: true, answer: 'Keep', asked: [], copied: [], opens: 0, isOpen: false, store: { themeNotice: true }, ...change }
+  // A copy, as the mod writes the store a test reads: a fixture shared by tests would carry one's writes into the next.
+  const store = structuredClone(change.store ?? { themeNotice: true })
+  return { runs: [], spawns: [], threads: THREADS, projects: PROJECTS, detail: DETAIL, watch: [{ type: 'reset', thread: ID, entries: ENTRIES }, state('working'), live()], slow: {}, fail: {}, printed: {}, publishes: true, answer: 'Keep', asked: [], copied: [], toasts: [], opens: 0, isOpen: false, ...change, store }
 }
 
 /** `detail` with the linked preview of `port` published, or gone when `preview` is null. */
@@ -155,10 +190,16 @@ const reply = (json: unknown) => ({ value: { exitCode: 0, stdout: JSON.stringify
 /** Boots the mod over `cli`: its session, the engine's answers, and a clock that starts at T0 and moves only when told. */
 export async function boot(...[$, on, cli]: [...Body, Fake]) {
   const clock = mock.clock(on, { now: T0 })
-  mock.store(on, cli.store)
+  // The store as the mod leaves it, which a test reads back.
+  on('store.get', (_, e) => ({ value: cli.store[e.key] }))
+  on('store.set', async (_, e) => {
+    await cli.saving?.(e.key, e.value)
+    cli.store[e.key] = e.value
+    return { value: undefined }
+  })
   const answers: Record<string, () => unknown> = {
     nodes: () => NODES,
-    projects: () => PROJECTS,
+    projects: () => cli.projects,
     threads: () => cli.threads,
     show: () => cli.detail,
     wake: () => null,
@@ -180,6 +221,15 @@ export async function boot(...[$, on, cli]: [...Body, Fake]) {
     if (late) await clock.sleep(late)
     const failure = cli.fail[argv[0]!]
     if (failure) return { value: { exitCode: failure.exitCode, stdout: '', stderr: `${JSON.stringify({ error: failure.error, kind: 'failed', status: 500 })}\n`, isStdoutTruncated: false, isStderrTruncated: false } }
+    if (argv[0] === 'project') {
+      // `nexus project add`, read as the CLI's strict parseArgs reads it, its project built from its arguments.
+      const added = parseProjectAdd(argv.slice(2))
+      if (typeof added === 'string') return { value: { exitCode: 64, stdout: '', stderr: `${JSON.stringify({ error: added, kind: 'invalid', status: null })}\n`, isStdoutTruncated: false, isStderrTruncated: false } }
+      const { values, positionals: [id, repoUrl] } = added
+      const project = { id, repoUrl, defaultBranch: values.branch ?? 'main', defaultNode: values.node, resources: { cpus: 2, memoryGiB: 4, diskGiB: 10 }, allowedHosts: [], secrets: [], logins: [], preSetup: null }
+      cli.projects = [...cli.projects, project]
+      return reply(project)
+    }
     return reply(answers[argv[0]!]?.() ?? null)
   })
   on('process.spawn', async function* (_, e) {
@@ -219,6 +269,10 @@ export async function boot(...[$, on, cli]: [...Body, Fake]) {
     return { value: undefined }
   })
   on('ui.panes', () => ({ value: cli.isOpen ? [{ id: 'nexus', title: 'Nexus', isShown: true, isFocused: true, isPlaced: true }] : [] }))
+  on('ui.toast', (_, e) => {
+    cli.toasts.push(e.text)
+    return { value: undefined }
+  })
   on('ui.copy', (_, e) => {
     cli.copied.push(e.text)
     return { value: { isCopied: true } } as never
