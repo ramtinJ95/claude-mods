@@ -1635,7 +1635,9 @@ function SessionsBody(draw: Draw, scene: Scene, actions: PaneActions, area: numb
       : session.state === 'paused'
         ? { kind: 'say', text: pausedClose(sessionName(session.harness, session.title), status) }
         : { kind: 'close-session', thread: detail.thread.id, id: session.id }
-    const keysHint = session.state === 'paused' ? (scene.inHerdr ? '⏎ attaches in a new Herdr tab, waking the pylon; y copies nexus attach' : '⏎ or y copies nexus attach, which wakes the pylon') : scene.inHerdr ? '⏎ attaches in a new Herdr tab, y copies nexus attach, x closes the session' : '⏎ or y copies nexus attach, x closes the session'
+    const attachHint = scene.inHerdr ? '⏎ attaches in a new Herdr tab, y copies nexus attach' : '⏎ or y copies nexus attach'
+    // A paused row has no close; attaching wakes its pylon, except an archived thread's, which the CLI refuses.
+    const keysHint = session.state !== 'paused' ? `${attachHint}, x closes the session` : status === 'archived' ? attachHint : `${attachHint}, which wakes the pylon`
     place(
       <Box key={`row-${key}`} flexDirection="column">
         <Button key={key} plain autoFocus={isCursor ? true : undefined} onPress={() => actions.effect(attach)}>

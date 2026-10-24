@@ -303,6 +303,7 @@ test("an archived thread's paused session resumes on unarchive", async ($, on) =
   const ui = await mount()
   await toSessions(ui)
   expect(await row(ui, 'nexus:1.2')).toMatch(/◌ paused, resumes on unarchive/)
+  expect(await shows(ui, '⏎ or y copies nexus attach')).toBe(true)
   await keys(ui, 'x')
   expect(await shows(ui, 'Claude Code "claude" is paused: it resumes on unarchive, and can be closed once it runs.')).toBe(true)
 })
