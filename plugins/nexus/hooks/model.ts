@@ -562,7 +562,7 @@ export function previewLook(detail: Pick<NexusDetail, 'thread' | 'pylon'>, previ
   if (detail.thread.status === 'archived') return { linked: false, label: 'paused', tone: 'idle' as Tone, hint: 'Unarchive the thread to open it.' }
   if (detail.pylon.actualState === 'paused') return { linked: true, label: 'paused', tone: 'idle' as Tone, hint: 'Opening it wakes the pylon.' }
   // A failed service's URL answers 502 until the service runs again, so it is no link; the reason is the node's.
-  if (preview.failed !== null) return { linked: false, label: 'failed', tone: 'bad' as Tone, hint: preview.failed }
+  if (preview.failed) return { linked: false, label: 'failed', tone: 'bad' as Tone, hint: preview.failed }
   return preview.ready ? { linked: true, label: 'ready', tone: 'ok' as Tone, hint: null } : { linked: false, label: 'starting', tone: 'busy' as Tone, hint: null }
 }
 
