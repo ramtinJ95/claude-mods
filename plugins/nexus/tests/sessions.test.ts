@@ -2,7 +2,7 @@ import { expect, test } from 'claude-code/testing'
 
 import { SSH_HINT } from '../hooks/model'
 import { TOOLS } from '../hooks/tools'
-import { DETAIL, ID, THEME_KEYS, THREAD, boot, fake, field, typing } from './fake-cli'
+import { DETAIL, ID, THEME_KEYS, THREAD, boot, fake, field, state, typing } from './fake-cli'
 
 type Ui = Awaited<ReturnType<Awaited<ReturnType<typeof boot>>['mount']>>
 
@@ -253,14 +253,133 @@ test('/nexus session open, close and attach: a quoted title, a close that asks w
   expect(cli.runs).toContainEqual(['session', 'open', '--json', '--harness=pi', '--title=two words', '--', ID])
   expect(cli.toasts).toContain(`Opening pi "two words" in ${ID}. Its agent can take a minute to start.`)
   expect((await nexus(`session close ${ID}`)).text).toBe(`Kept the sessions of ${ID}.`)
-  expect(cli.asked).toEqual([`Close which session of ${ID}? Its agent ends.`])
+  expect(cli.asked).toEqual([`Close which session of ${ID}?`])
   expect(cli.offered).toEqual([['Keep them all', 'Claude Code "claude" in pane nexus:1.2, working', 'Shell in pane nexus:3.1, idle']])
   cli.answer = 'Shell in pane nexus:3.1, idle'
   expect((await nexus(`session close ${ID}`)).text).toBe(`Closed pane nexus:3.1 of ${ID}.`)
   expect(cli.runs).toContainEqual(['session', 'close', '--json', '--', ID, 'nexus:3.1'])
-  expect((await nexus(`session close ${ID} nexus:1.2`)).text).toBe(`Closed pane nexus:1.2 of ${ID}.`)
+  expect((await nexus(`session close ${ID} nexus:1.2`)).text).toBe(`Closed session nexus:1.2 of ${ID}.`)
   expect((await nexus(`session attach ${ID}`)).text).toContain(`run this in a terminal or a Herdr tab:\n\n  nexus attach ${ID}\n\n`)
   expect((await nexus(`session open ${ID} --harness vim`)).text).toMatch(/^\/nexus session open takes a harness of claude-code, pi, shell, not vim\./)
+})
+
+/** What the next wake brings back, and what the last one did not, as a control plane from CLI 0.8.0 lists them. */
+const PAUSED = { ...CLAUDE, id: 'nexus:1.2', state: 'paused', message: null }
+const FAILED = {
+  id: 'failed-0123456789ab',
+  herdrPane: null,
+  harness: 'pi',
+  harnessSessionId: '/home/user/.pi/agent/sessions/s.jsonl',
+  status: 'unknown',
+  title: 'plan',
+  pylon: 'pylon-7f3a',
+  state: 'failed',
+  message: 'herdr agent start: the agent did not start.',
+}
+const RUNNING = { ...SHELL, id: 'nexus:3.1', state: 'running', message: null }
+
+test('a paused session reads paused, resumes on wake; a failed one says failed with its message, by its ID when it has no pane', async ($, on) => {
+  const cli = fake({ detail: { ...DETAIL, sessions: [PAUSED, FAILED, RUNNING] } })
+  const { nexus, mount } = await boot($, on, cli)
+  await nexus(`open ${ID}`)
+  const ui = await mount()
+  expect((await ui.find({ type: 'Button', key: 'tab-sessions' }))?.text).toBe('Sessions 3')
+  await toSessions(ui)
+  expect(await row(ui, 'nexus:1.2')).toMatch(/^❯ Claude Code claude {2}◌ paused, resumes on wake {2}nexus:1\.2 {2}session 9c1e$/)
+  expect(await shows(ui, '⏎ or y copies nexus attach, which wakes the pylon')).toBe(true)
+  expect(await row(ui, 'failed-0123456789ab')).toMatch(/^ {2}pi {10}plan {2}✕ failed {2}failed-0123456789ab {2}session \/home\/user\/\.pi\/agent\/sessions\/s\.jsonl$/)
+  expect((await ui.find({ type: 'Text', text: 'herdr agent start: the agent did not start.' }))?.props.color).toBe('error')
+  // A running row is as before.
+  expect(await row(ui, 'nexus:3.1')).toMatch(/^ {2}Shell {7}○ idle {2}nexus:3\.1$/)
+  const painted = (await ui.findAll({})).flatMap(one => ['color', 'borderColor', 'backgroundColor'].flatMap(prop => (typeof one.props[prop] === 'string' ? [one.props[prop] as string] : [])))
+  expect(painted.filter(colour => !THEME_KEYS.has(colour))).toEqual([])
+})
+
+test("an archived thread's paused session resumes on unarchive", async ($, on) => {
+  const archived = { ...THREAD, status: 'archived' }
+  const cli = fake({ detail: { ...DETAIL, thread: archived, sessions: [PAUSED] }, watch: [{ type: 'reset', thread: ID, entries: [] }, state('idle', { status: 'archived' })] })
+  const { nexus, mount } = await boot($, on, cli)
+  await nexus(`open ${ID}`)
+  const ui = await mount()
+  await toSessions(ui)
+  expect(await row(ui, 'nexus:1.2')).toMatch(/◌ paused, resumes on unarchive/)
+  expect(await shows(ui, '⏎ or y copies nexus attach')).toBe(true)
+  await keys(ui, 'x')
+  expect(await shows(ui, 'Claude Code "claude" is paused: it resumes on unarchive, and can be closed once it runs.')).toBe(true)
+})
+
+test('x on a paused session says why it cannot close it, asking nothing and running no close; Enter still attaches', async ($, on) => {
+  const cli = fake({ detail: { ...DETAIL, sessions: [PAUSED] }, answer: 'Close' })
+  const { nexus, mount } = await boot($, on, cli)
+  await nexus(`open ${ID}`)
+  const ui = await mount()
+  await toSessions(ui)
+  await keys(ui, 'x')
+  expect(await shows(ui, 'Claude Code "claude" is paused: it resumes on wake, and can be closed once it runs.')).toBe(true)
+  expect(cli.asked).toEqual([])
+  expect(cli.runs.some(argv => argv[0] === 'session')).toBe(false)
+  // Enter on the row presses it, as the ring's Button.
+  await ui.press({ key: 'session-nexus:1.2' })
+  expect(cli.copied).toEqual([`nexus attach ${ID}`])
+})
+
+test('x on a failed session asks, then closes it by its ID, which drops it; the row goes', async ($, on) => {
+  const cli = fake({ detail: { ...DETAIL, sessions: [FAILED, RUNNING] }, answer: 'Close' })
+  const { nexus, mount } = await boot($, on, cli)
+  await nexus(`open ${ID}`)
+  const ui = await mount()
+  await toSessions(ui)
+  await keys(ui, 'x')
+  expect(cli.asked).toEqual(['Close pi "plan", which the last wake did not bring back?'])
+  expect(cli.runs).toContainEqual(['session', 'close', '--json', '--', ID, 'failed-0123456789ab'])
+  expect(await shows(ui, 'Closed session failed-0123456789ab.')).toBe(true)
+  // The details still list it until the node reads its sessions again.
+  expect(await row(ui, 'failed-0123456789ab')).toBeUndefined()
+  expect(await cursorOn(ui)).toBe('session-nexus:3.1')
+})
+
+test("a close the CLI refuses shows its message as printed, 409 or 404, and is run once, not again", async ($, on) => {
+  const paused = 'session nexus:3.1 is paused with its pylon and resumes when its pylon wakes. Close it once it runs'
+  const gone = 'no session is open in pane nexus:3.1 of pylon pylon-7f3a. A wake may have moved it to another pane, which the thread\'s sessions list'
+  const cli = fake({ detail: { ...DETAIL, sessions: [RUNNING] }, answer: 'Close', fail: { 'session close': { exitCode: 5, error: paused } } })
+  const { nexus, mount } = await boot($, on, cli)
+  await nexus(`open ${ID}`)
+  const ui = await mount()
+  await toSessions(ui)
+  await keys(ui, 'x')
+  expect(await shows(ui, `Pane nexus:3.1 was not closed: ${paused}.`)).toBe(true)
+  expect(await row(ui, 'nexus:3.1')).toMatch(/○ idle/)
+  cli.fail = { 'session close': { exitCode: 4, error: gone } }
+  await keys(ui, 'x')
+  expect(await shows(ui, `Pane nexus:3.1 was not closed: ${gone}.`)).toBe(true)
+  expect(cli.runs.filter(argv => argv[0] === 'session')).toHaveLength(2)
+  expect((await nexus(`session close ${ID} nexus:3.1`)).text).toBe(`No session is open in pane nexus:3.1 of pylon pylon-7f3a. A wake may have moved it to another pane, which the thread's sessions list.`)
+})
+
+test('a failed session whose close fails on a CLI before 0.8.0 says which version closing it needs', async ($, on) => {
+  const cli = fake({ detail: { ...DETAIL, sessions: [FAILED] }, answer: 'Close', version: '0.7.0', fail: { 'session close': { exitCode: 4, error: 'pylon pylon-7f3a has no pane failed-0123456789ab' } } })
+  const { nexus, mount } = await boot($, on, cli)
+  await nexus(`open ${ID}`)
+  const ui = await mount()
+  await toSessions(ui)
+  await keys(ui, 'x')
+  expect(await shows(ui, 'Session failed-0123456789ab was not closed: nexus is 0.7.0: closing a failed session needs Nexus CLI 0.8.0 or later (nexus --version).')).toBe(true)
+  expect((await nexus(`session close ${ID} failed-0123456789ab`)).text).toBe('Nexus is 0.7.0: closing a failed session needs Nexus CLI 0.8.0 or later (nexus --version).')
+  // A CLI from 0.8.0 on gets its own message.
+  cli.version = '0.8.0'
+  expect((await nexus(`session close ${ID} failed-0123456789ab`)).text).toBe('Pylon pylon-7f3a has no pane failed-0123456789ab.')
+})
+
+test('/nexus session close offers only the sessions that can be closed, and says when every one is paused', async ($, on) => {
+  const cli = fake({ detail: { ...DETAIL, sessions: [PAUSED, FAILED, RUNNING] } })
+  const { nexus } = await boot($, on, cli)
+  expect((await nexus(`session close ${ID}`)).text).toBe(`Kept the sessions of ${ID}.`)
+  expect(cli.offered).toEqual([['Keep them all', 'pi "plan" in session failed-0123456789ab, failed', 'Shell in pane nexus:3.1, idle']])
+  cli.answer = 'pi "plan" in session failed-0123456789ab, failed'
+  expect((await nexus(`session close ${ID}`)).text).toBe(`Closed session failed-0123456789ab of ${ID}.`)
+  expect(cli.runs).toContainEqual(['session', 'close', '--json', '--', ID, 'failed-0123456789ab'])
+  cli.detail = { ...DETAIL, sessions: [PAUSED] }
+  expect((await nexus(`session close ${ID}`)).text).toBe(`The sessions of ${ID} are paused: they resume on wake, and can be closed once they run.`)
 })
 
 test('no model tool opens, closes or attaches to a session', () => {

@@ -109,16 +109,27 @@ export type NexusWatch = {
   ended: string | null
 }
 
-/** A Herdr pane in the pylon, as its node last reported it. */
+/**
+ * A session in the pylon, as its node last reported it: open in its pane (`running`), one the pylon's next wake brings
+ * back (`paused`), or one the last wake did not bring back (`failed`, `message` saying why). A control plane older than
+ * CLI 0.8.0 sends only running sessions, without `state` or `id`.
+ */
 export type NexusSession = {
-  /** The pane, which `session close` takes. */
-  herdrPane: string
+  /** What `session close` takes: the pane, or `failed-<hash>` for a failed session in no pane. */
+  id: string
   harness: NexusHarness
   harnessSessionId: string | null
+  /** Herdr's, as last read while the session ran. */
   status: 'working' | 'idle' | 'blocked' | 'done' | 'unknown'
   /** Its Herdr workspace's label; null from a probe or control plane older than CLI 0.5.0. */
   title: string | null
-}
+} & (
+  | { state: 'running'; herdrPane: string; message: null }
+  /** `herdrPane` is the pane it had, which a wake may change. */
+  | { state: 'paused'; herdrPane: string | null; message: null }
+  /** `herdrPane` is the pane it left behind, or null. */
+  | { state: 'failed'; herdrPane: string | null; message: string }
+)
 
 /** The agents `session open` starts in a pylon. */
 export type NexusHarness = 'claude-code' | 'pi' | 'shell'
@@ -134,10 +145,15 @@ export type NexusOpenedSession = { herdrPane: string; harness: NexusHarness; tit
 export type NexusSessionChanges = {
   /** Each open under way, by the number the pane gave it. */
   opening: { id: number; harness: NexusHarness; title: string | null }[]
-  opened: { session: NexusOpenedSession; at: number }[]
+  /**
+   * `before`: the IDs and harness session IDs of the sessions the details listed when the open was confirmed, or null
+   * when they were not at hand. A wake moves a session's pane, and so its ID, but keeps its harness session ID.
+   */
+  opened: { session: NexusOpenedSession; at: number; before: { ids: string[]; harnessSessionIds: string[] } | null }[]
+  /** The IDs of the sessions whose close is under way. */
   closing: string[]
-  /** When each pane's close was confirmed, by pane. */
-  closed: Record<string, number>
+  /** Each close confirmed, by session ID: when, and the session's own ID, which a wake that moves its pane keeps. */
+  closed: Record<string, { at: number; harnessSessionId: string | null }>
 }
 
 /** What the open a session form holds: the harness, and a title that is the harness's name when empty. */
@@ -284,7 +300,7 @@ export type NexusPane = {
   detailsTop: number
   /** The Ports tab's row under the cursor: `preview-<service>` or `port-<port>`. */
   portCursor: string | null
-  /** The Sessions tab's row under the cursor: `session-<pane>`. */
+  /** The Sessions tab's row under the cursor: `session-<id>`. */
   sessionCursor: string | null
   /** The folds, tool rows and closed-thread groups the person opened or closed, by key; the rest follow the defaults. */
   toggled: Record<string, boolean>

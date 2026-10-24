@@ -48,6 +48,9 @@ import {
   HARNESSES,
   NO_SESSION_CHANGES,
   SESSION_TONE,
+  pausedClose,
+  resumesOn,
+  sessionPlace,
   SSH_HINT,
   type ShownSession,
   attachCommand,
@@ -1586,9 +1589,10 @@ function sessionsOf(scene: Scene, detail: NexusDetail): ShownSession[] {
 }
 
 /**
- * The pylon's sessions, one row each, as the dashboard lists them: harness, title, state, pane and session ID. The
- * opens under way follow, then how to attach from this Mac. Enter and y give the attach command wherever the cursor
- * is, and x closes the session under it, after asking.
+ * The pylon's sessions, one row each, as the dashboard lists them: harness, title, state, pane and session ID. A paused
+ * one says what brings it back, and a failed one why the last wake did not, below it. The opens under way follow, then
+ * how to attach from this Mac. Enter and y give the attach command wherever the cursor is, and x closes the running or
+ * failed session under it, after asking; on a paused one it says why it can't.
  */
 function SessionsBody(draw: Draw, scene: Scene, actions: PaneActions, area: number, canInsert: boolean): Body {
   const { Box, Text, Button } = draw
@@ -1597,7 +1601,7 @@ function SessionsBody(draw: Draw, scene: Scene, actions: PaneActions, area: numb
   if (!detail) return { nav: empty, node: <Text color="subtle">{scene.shown?.failure ? '' : 'Loading the sessions…'}</Text> }
   const changes = scene.pane.sessionChanges[detail.thread.id] ?? NO_SESSION_CHANGES
   const sessions = sessionsOf(scene, detail)
-  const keys = sessions.map(session => `session-${session.herdrPane}`)
+  const keys = sessions.map(session => `session-${session.id}`)
   const cursor = keys.find(key => key === scene.pane.sessionCursor) ?? keys[0] ?? null
   const items: NavItem[] = []
   const drawn: RenderChildren[] = []
@@ -1612,11 +1616,28 @@ function SessionsBody(draw: Draw, scene: Scene, actions: PaneActions, area: numb
   const copy: Effect = { kind: 'attach', thread: detail.thread.id, isCopy: true }
   place(SectionRule(draw, scene, 'Sessions', String(sessions.length), 'sessions'))
   if (sessions.length === 0 && changes.opening.length === 0) place(<Text key="no-sessions" color="subtle">No sessions. n opens one: Claude Code, pi or a shell.</Text>)
+  // The watch hears of an archive or unarchive before the next details.
+  const status = (scene.watch?.thread === id ? scene.watch.state?.status : undefined) ?? detail.thread.status
   for (const session of sessions) {
-    const key = `session-${session.herdrPane}`
+    const key = `session-${session.id}`
     const isCursor = cursor === key
-    const isClosing = changes.closing.includes(session.herdrPane)
-    const [status, tone]: [string, Tone] = isClosing ? ['closing…', 'busy'] : [session.status, SESSION_TONE[session.status]]
+    const isClosing = changes.closing.includes(session.id)
+    const where = sessionPlace(session.id, session)
+    const [label, tone]: [string, Tone] = isClosing
+      ? ['closing…', 'busy']
+      : session.state === 'paused'
+        ? [`paused, resumes on ${resumesOn(status)}`, 'muted']
+        : session.state === 'failed'
+          ? ['failed', 'bad']
+          : [session.status, SESSION_TONE[session.status]]
+    const x: Effect = isClosing
+      ? { kind: 'say', text: `${where.replace(/^./, first => first.toUpperCase())} is already closing.` }
+      : session.state === 'paused'
+        ? { kind: 'say', text: pausedClose(sessionName(session.harness, session.title), status) }
+        : { kind: 'close-session', thread: detail.thread.id, id: session.id }
+    const attachHint = scene.inHerdr ? '⏎ attaches in a new Herdr tab, y copies nexus attach' : '⏎ or y copies nexus attach'
+    // A paused row has no close; attaching wakes its pylon, except an archived thread's, which the CLI refuses.
+    const keysHint = session.state !== 'paused' ? `${attachHint}, x closes the session` : status === 'archived' ? attachHint : `${attachHint}, which wakes the pylon`
     place(
       <Box key={`row-${key}`} flexDirection="column">
         <Button key={key} plain autoFocus={isCursor ? true : undefined} onPress={() => actions.effect(attach)}>
@@ -1624,22 +1645,23 @@ function SessionsBody(draw: Draw, scene: Scene, actions: PaneActions, area: numb
           <Text>{HARNESS_LABEL[session.harness].padEnd(12)}</Text>
           {session.title ? <Text bold>{`${session.title}  `}</Text> : ''}
           {Dot(draw, tone)}
-          <Text>{` ${status}  `}</Text>
-          <Text color="subtle">{session.herdrPane}</Text>
+          <Text>{` ${label}  `}</Text>
+          {/* A failed session in no pane goes by the ID /nexus session close takes. */}
+          <Text color="subtle">{session.herdrPane ?? session.id}</Text>
           <Text color="subtle">{session.harnessSessionId ? `  session ${session.harnessSessionId}` : ''}</Text>
         </Button>
+        {session.state === 'failed' && (
+          <Box paddingLeft={4}>
+            <Text color="error">{session.message}</Text>
+          </Box>
+        )}
         {isCursor && !isClosing && (
           <Box paddingLeft={4}>
-            <Text color="subtle">{scene.inHerdr ? '⏎ attaches in a new Herdr tab, y copies nexus attach, x closes the session' : '⏎ or y copies nexus attach, x closes the session'}</Text>
+            <Text color="subtle">{keysHint}</Text>
           </Box>
         )}
       </Box>,
-      {
-        key,
-        enter: attach,
-        y: copy,
-        x: isClosing ? { kind: 'say', text: `Pane ${session.herdrPane} is already closing.` } : { kind: 'close-session', thread: detail.thread.id, pane: session.herdrPane },
-      },
+      { key, enter: attach, y: copy, x },
     )
   }
   for (const opening of changes.opening) {

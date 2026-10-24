@@ -105,8 +105,8 @@ export type Effect =
   | { kind: 'new-project' }
   /** The open a session form, for the thread shown. */
   | { kind: 'new-session' }
-  /** Asks, then closes the session in `pane` of `thread`. */
-  | { kind: 'close-session'; thread: string; pane: string }
+  /** Asks, then closes the session `id` of `thread`: a running one's pane, or a failed one. */
+  | { kind: 'close-session'; thread: string; id: string }
   /** `nexus attach` for `thread`'s sessions: run in a new Herdr tab inside Herdr, else copied; `isCopy` always copies. */
   | { kind: 'attach'; thread: string; isCopy: boolean }
   | { kind: 'refresh' }

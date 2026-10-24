@@ -141,6 +141,8 @@ export type Fake = {
   store: Record<string, unknown>
   /** The pane `session open` answers with. */
   nextPane: string
+  /** What `nexus --version` prints after `nexus `. */
+  version: string
   /** Every herdr argv, `herdr` dropped. */
   herdr: string[][]
   /** A herdr command, by its two words, that fails with this message. */
@@ -181,7 +183,7 @@ function parseProjectAdd(args: readonly string[]): { values: Record<string, stri
 export function fake(change: Partial<Fake> = {}): Fake {
   // A copy, as the mod writes the store a test reads: a fixture shared by tests would carry one's writes into the next.
   const store = structuredClone(change.store ?? { themeNotice: true })
-  return { runs: [], spawns: [], threads: THREADS, projects: PROJECTS, detail: DETAIL, watch: [{ type: 'reset', thread: ID, entries: ENTRIES }, state('working'), live()], slow: {}, fail: {}, printed: {}, publishes: true, answer: 'Keep', asked: [], offered: [], copied: [], toasts: [], opens: 0, isOpen: false, nextPane: 'nexus:2.1', herdr: [], herdrFail: {}, env: {}, ...change, store }
+  return { runs: [], spawns: [], threads: THREADS, projects: PROJECTS, detail: DETAIL, watch: [{ type: 'reset', thread: ID, entries: ENTRIES }, state('working'), live()], slow: {}, fail: {}, printed: {}, publishes: true, answer: 'Keep', asked: [], offered: [], copied: [], toasts: [], opens: 0, isOpen: false, nextPane: 'nexus:2.1', version: '0.8.0', herdr: [], herdrFail: {}, env: {}, ...change, store }
 }
 
 /** `detail` with the linked preview of `port` published, or gone when `preview` is null. */
@@ -235,6 +237,7 @@ export async function boot(...[$, on, cli]: [...Body, Fake]) {
       return reply(argv[0] === 'tab' ? { id: 'cli:tab:create', result: { tab: { tab_id: 'w9:t3' }, root_pane: { pane_id: 'w9:p7' } } } : { id: 'cli:pane:run', result: { type: 'ok' } })
     }
     cli.runs.push(argv)
+    if (argv[0] === '--version') return { value: { exitCode: 0, stdout: `nexus ${cli.version}\n`, stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
     // `session open` and `session close` are slowed or failed by both words.
     const verb = argv[0] === 'session' ? `session ${argv[1]}` : argv[0]!
     const late = cli.slow[verb]
