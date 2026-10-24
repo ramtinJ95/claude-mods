@@ -1341,6 +1341,15 @@ test('Enter starts the text it delivered, and keys typed after it leave the form
   expect(cli.runs.filter(argv => argv[0] === 'start').at(-1)).toEqual(['start', '--json', '--project=web', `--title=${shown}`])
 })
 
+test("a thread whose agent has not acted yet says never, as Details does, not the time since 1970", async ($, on) => {
+  const cli = fake({ threads: [{ ...THREAD, agentTurnRunning: false, lastAgentActivityAt: 0 }] })
+  const { nexus, mount } = await boot($, on, cli)
+  await nexus('')
+  const ui = await mount()
+  await keys(ui, 'h')
+  expect(await shows(ui, `    firebat · you 2 min · agent never · ${ID}`)).toBe(true)
+})
+
 test('a row or a show without a field docs/cli.md requires is a contract error, not a guess', async ($, on) => {
   const { pylon: _, ...bare } = THREAD
   const { attach: __, ...noAttach } = DETAIL

@@ -483,7 +483,7 @@ export function ListView(draw: Draw, scene: Scene, actions: PaneActions) {
           <Text color="subtle">{` ${age.padStart(5)}`}</Text>
         </Button>
         {isCursor && (
-          <Text color="subtle" wrap="truncate-end">{`    ${wants}${thread.pylon.node} · you ${span(now - thread.lastHumanActivityAt) ?? 'now'} · agent ${thread.agentTurnRunning ? 'working' : (span(now - thread.lastAgentActivityAt) ?? 'now')} · ${thread.id}`}</Text>
+          <Text color="subtle" wrap="truncate-end">{`    ${wants}${thread.pylon.node} · you ${span(now - thread.lastHumanActivityAt) ?? 'now'} · agent ${thread.agentTurnRunning ? 'working' : thread.lastAgentActivityAt === 0 ? 'never' : (span(now - thread.lastAgentActivityAt) ?? 'now')} · ${thread.id}`}</Text>
         )}
       </Box>,
       { key: thread.id, enter: { kind: 'open', thread: thread.id }, y: { kind: 'copy', text: thread.id } },
