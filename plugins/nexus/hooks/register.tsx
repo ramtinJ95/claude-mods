@@ -351,6 +351,14 @@ function watchInPane($: EngineInterface, thread: string) {
   })()
 }
 
+/** Closes the pane and, if no hook kept it open, stops its processes. */
+async function closePane($: EngineInterface) {
+  await $.ui.close({ id: PANE })
+  if ((await $.ui.panes()).some(one => one.id === PANE)) return false
+  stopPane()
+  return true
+}
+
 function stopPane() {
   poller?.timer.cancel()
   poller?.ticker.cancel()
@@ -832,9 +840,7 @@ async function runCommand($: EngineInterface, args: string): Promise<string> {
       if (command.isOn) void pollStrip($)
       return command.isOn ? 'The Nexus strip above the prompt is on.' : 'The Nexus strip above the prompt is off. /nexus strip on shows it again.'
     case 'close':
-      stopPane()
-      await $.ui.close({ id: PANE })
-      return 'Nexus pane closed.'
+      return (await closePane($)) ? 'Nexus pane closed.' : 'The Nexus pane stays open: another hook kept it.'
     case 'open': {
       const id = await resolveThread($, command.thread)
       if (!id.ok) return say(id)
@@ -1241,8 +1247,7 @@ function paneActions($: EngineInterface, surface: RenderSurface): PaneActions {
       case 'refresh':
         return refresh()
       case 'close':
-        stopPane()
-        return $.ui.close({ id: PANE })
+        return closePane($)
     }
   }
   return {
@@ -1328,9 +1333,11 @@ export const register: Register = (on, options) => {
 
   on('ui.close', async ($, e, next) => {
     if (e.id !== PANE) return next(e)
-    stopPane()
+    // A hook beneath may keep the pane open: only a close that happened stops its processes.
     const closed = await next(e)
-    if (!(await $.ui.panes()).some(one => one.id === PANE)) await update($, paneAtom, refilled)
+    if ((await $.ui.panes()).some(one => one.id === PANE)) return closed
+    stopPane()
+    await update($, paneAtom, refilled)
     return closed
   }).catch(($, e, next) => next(e))
 
