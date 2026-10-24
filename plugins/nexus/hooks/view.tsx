@@ -183,8 +183,8 @@ function TitleBar(draw: Draw, scene: Scene, left: RenderChildren, right: string)
   )
 }
 
-function Rule({ Text }: Draw, scene: Scene) {
-  return <Text color="subtle">{'─'.repeat(scene.width)}</Text>
+function Rule({ Text }: Draw, scene: Scene, color = 'subtle') {
+  return <Text color={color}>{'─'.repeat(scene.width)}</Text>
 }
 
 function SectionRule({ Box, Text }: Draw, scene: Scene, title: string, count: string, key: string) {
@@ -286,6 +286,48 @@ function inlineText(node: unknown): string {
 function wrapped(text: string, width: number): number {
   const room = Math.max(1, width)
   return text.split('\n').reduce((sum, line) => sum + Math.max(1, Math.ceil(cells(line) / room)), 0)
+}
+
+/** The most rows a field grows to; a short pane gives it a quarter of its rows, which the body above needs more. */
+const FIELD_ROWS = 6
+
+/**
+ * The rows a focused Input needs to show all of `text` in a pane `width` by `rows`. The engine wraps a field at the
+ * site's width less `label: `, the Enter hint and a cell for the cursor, never at the Box it sits in, so a field must
+ * span the site to wrap where it is drawn. From two rows the hint also names the newline key, when that leaves the
+ * text half the width. The key is `\⏎` or `shift+⏎` as the terminal allows, so the rows are the more of the two.
+ */
+export function fieldRows(text: string, label: string, submit: string, width: number, rows: number): number {
+  const room = width - (label ? cells(label) + 2 : 0)
+  const enter = ` ⏎ ${submit}`
+  const rowsAt = (columns: number) =>
+    text.split('\n').reduce((sum, line, index, lines) => {
+      let taken = 1
+      let used = 0
+      // A word wraps whole to the next row, one wider than the row breaks across it; the last line holds the cursor.
+      for (const word of (index === lines.length - 1 ? `${line} ` : line).split(' ')) {
+        const size = cells(word)
+        if (used > 0 && used + 1 + size > columns) {
+          taken += 1
+          used = 0
+        } else if (used > 0) used += 1
+        used += size
+        while (used > columns) {
+          taken += 1
+          used -= columns
+        }
+      }
+      return sum + taken
+    }, 0)
+  if (rowsAt(Math.max(12, room - cells(enter))) <= 1) return 1
+  const needed = Math.max(
+    ...['\\⏎', 'shift+⏎'].map(key => {
+      const newline = `${enter} · ${key} new line`
+      const hint = room - cells(newline) >= width / 2 ? newline : enter
+      return rowsAt(Math.max(12, room - cells(hint)))
+    }),
+  )
+  return Math.max(1, Math.min(FIELD_ROWS, Math.floor(rows / 4), needed))
 }
 
 /** The rows a built tree takes at `width`, as the column it sits in stacks it. An estimate of the engine's layout. */
@@ -1154,16 +1196,20 @@ function Composer(draw: Draw, scene: Scene, actions: PaneActions, pylon: { faile
   const queue = watch?.state ? watch.state.run !== 'idle' : false
   const pylonState = detail?.pylon.actualState ?? watch?.state?.pylon
   const placeholder = `${queue ? 'Queue a follow-up…' : 'Message the agent…'}${scene.pane.mode === 'insert' ? '' : '  (i to write)'}`
+  const submitLabel = queue ? 'queue' : 'send'
+  const border = scene.pane.mode === 'insert' ? 'promptBorder' : 'subtle'
+  // Rules, as Claude Code's own prompt has, rather than a box: a field narrower than the pane does not wrap (fieldRows).
   return (
     <Box key="composer" flexDirection="column" marginTop={1}>
       {pylonState === 'paused' && <Text color="subtle">The pylon is paused. Sending a message wakes it.</Text>}
-      <Box borderStyle="round" borderColor={scene.pane.mode === 'insert' ? 'promptBorder' : 'subtle'} paddingX={1}>
-        <Input
-          key={COMPOSE}
-          autoFocus={scene.pane.mode === 'insert' ? true : undefined}
-          label="❯"
-          value={scene.pane.draft} placeholder={placeholder} submitLabel={queue ? 'queue' : 'send'} onInput={actions.draft} onSubmit={actions.submit} />
-      </Box>
+      {Rule(draw, scene, border)}
+      <Input
+        key={COMPOSE}
+        autoFocus={scene.pane.mode === 'insert' ? true : undefined}
+        label="❯"
+        rows={fieldRows(scene.pane.draft, '❯', submitLabel, scene.width, scene.rows)}
+        value={scene.pane.draft} placeholder={placeholder} submitLabel={submitLabel} onInput={actions.draft} onSubmit={actions.submit} />
+      {Rule(draw, scene, border)}
     </Box>
   )
 }
@@ -1457,7 +1503,7 @@ export function StartView(draw: Draw, scene: Scene, actions: PaneActions) {
           <Input
             key={START_KEYS.message}
             label="Message"
-            rows={3}
+            rows={fieldRows(draft.message, 'Message', 'start', scene.width, scene.rows)}
             value={draft.message}
             placeholder="The first message for the agent"
             submitLabel="start"

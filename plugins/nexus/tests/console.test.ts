@@ -358,6 +358,48 @@ test('i writes in insert mode: the composer sends while the run is idle, and an 
   expect(await ui.find({ type: 'Input', key: 'compose' })).toBeDefined()
 })
 
+test('the composer and the start form grow a row for each the draft wraps to, a quarter of the pane at most, and shrink back to one', async ($, on) => {
+  const cli = fake()
+  cli.watch = [{ type: 'reset', thread: ID, entries: ENTRIES.slice(0, -1) }, state('idle'), live()]
+  const { nexus, mount } = await boot($, on, cli)
+  await nexus(`open ${ID}`)
+  const ui = await mount(60, 40)
+  const rows = async (key: string) => (await ui.find({ type: 'Input', key }))?.props.rows
+  const words = (count: number) => Array(count).fill('word').join(' ')
+  expect(await rows('compose')).toBe(1)
+  await keys(ui, 'i')
+  // 57 cells after `❯: `, less the hint: 50 on one row, 31 once it names shift+⏎ for a newline, six words a row.
+  await ui.input({ key: 'compose', text: words(10), kind: 'change' })
+  expect(await rows('compose')).toBe(1)
+  await ui.input({ key: 'compose', text: words(11), kind: 'change' })
+  expect(await rows('compose')).toBe(2)
+  await ui.input({ key: 'compose', text: words(20), kind: 'change' })
+  expect(await rows('compose')).toBe(4)
+  await ui.input({ key: 'compose', text: 'one\ntwo', kind: 'change' })
+  expect(await rows('compose')).toBe(2)
+  await ui.input({ key: 'compose', text: words(80), kind: 'change' })
+  expect(await rows('compose')).toBe(6)
+  await ui.input({ key: 'compose', text: '', kind: 'change' })
+  expect(await rows('compose')).toBe(1)
+  await ui.input({ key: 'compose', text: '' })
+
+  await keys(ui, 'h')
+  await keys(ui, 'n')
+  expect(await rows('start-message')).toBe(1)
+  // `Message: ` leaves 51 cells, 43 after ` ⏎ start`; the newline key's hint never fits beside it: eight words a row.
+  await ui.input({ key: 'start-message', text: words(8), kind: 'change' })
+  expect(await rows('start-message')).toBe(1)
+  await ui.input({ key: 'start-message', text: words(20), kind: 'change' })
+  expect(await rows('start-message')).toBe(3)
+  await ui.input({ key: 'start-message', text: '', kind: 'change' })
+  expect(await rows('start-message')).toBe(1)
+
+  await ui.unmount()
+  const short = await mount(60, 12)
+  await short.input({ key: 'start-message', text: words(80), kind: 'change' })
+  expect((await short.find({ type: 'Input', key: 'start-message' }))?.props.rows).toBe(3)
+})
+
 test('Esc from the composer, which hands the keys to the prompt, is back to normal mode with the keys taken back', async ($, on) => {
   const cli = fake()
   const { clock, nexus, mount } = await boot($, on, cli)
