@@ -139,6 +139,33 @@ export type Fake = {
   store: Record<string, unknown>
 }
 
+/**
+ * `project add`'s arguments as node:util's parseArgs reads them for the CLI (strict, positionals allowed): `--name=value`
+ * or `--name value` is an option, anything after `--` a positional; or the error the CLI prints.
+ */
+function parseProjectAdd(args: readonly string[]): { values: Record<string, string>; positionals: string[] } | string {
+  const values: Record<string, string> = {}
+  const positionals: string[] = []
+  for (let at = 0; at < args.length; at++) {
+    const arg = args[at]!
+    if (arg === '--') {
+      positionals.push(...args.slice(at + 1))
+      break
+    }
+    if (!arg.startsWith('--')) {
+      positionals.push(arg)
+      continue
+    }
+    const [name, inline] = arg.slice(2).split(/=(.*)/s)
+    if (name === 'json') continue
+    if (name !== 'node' && name !== 'branch') return `Unknown option '--${name}'`
+    const value = inline ?? args[++at]
+    if (value === undefined) return `Option '--${name} <value>' argument missing`
+    values[name] = value
+  }
+  return positionals.length === 2 ? { values, positionals } : `project add takes 2 arguments, got ${positionals.length}`
+}
+
 export function fake(change: Partial<Fake> = {}): Fake {
   // A copy, as the mod writes the store a test reads: a fixture shared by tests would carry one's writes into the next.
   const store = structuredClone(change.store ?? { themeNotice: true })
@@ -192,10 +219,11 @@ export async function boot(...[$, on, cli]: [...Body, Fake]) {
     const failure = cli.fail[argv[0]!]
     if (failure) return { value: { exitCode: failure.exitCode, stdout: '', stderr: `${JSON.stringify({ error: failure.error, kind: 'failed', status: 500 })}\n`, isStdoutTruncated: false, isStderrTruncated: false } }
     if (argv[0] === 'project') {
-      // `nexus project add <id> <repo-url> --json --node=N --branch=B`, its project built from its arguments.
-      const [id, repoUrl] = argv.slice(3)
-      const flag = (name: string) => argv.find(arg => arg.startsWith(`--${name}=`))?.slice(name.length + 3)
-      const project = { id, repoUrl, defaultBranch: flag('branch') ?? 'main', defaultNode: flag('node'), resources: { cpus: 2, memoryGiB: 4, diskGiB: 10 }, allowedHosts: [], secrets: [], logins: [], preSetup: null }
+      // `nexus project add`, read as the CLI's strict parseArgs reads it, its project built from its arguments.
+      const added = parseProjectAdd(argv.slice(2))
+      if (typeof added === 'string') return { value: { exitCode: 64, stdout: '', stderr: `${JSON.stringify({ error: added, kind: 'invalid', status: null })}\n`, isStdoutTruncated: false, isStderrTruncated: false } }
+      const { values, positionals: [id, repoUrl] } = added
+      const project = { id, repoUrl, defaultBranch: values.branch ?? 'main', defaultNode: values.node, resources: { cpus: 2, memoryGiB: 4, diskGiB: 10 }, allowedHosts: [], secrets: [], logins: [], preSetup: null }
       cli.projects = [...cli.projects, project]
       return reply(project)
     }

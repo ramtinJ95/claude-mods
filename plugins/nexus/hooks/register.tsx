@@ -478,7 +478,8 @@ async function checkScope($: EngineInterface, projects: readonly NexusProject[],
  * command.
  */
 async function addProject($: EngineInterface, add: { id: string; repoUrl: string; node: string; branch: string }): Promise<Outcome<NexusProject>> {
-  const got = await nexus($, ['project', 'add', add.id, add.repoUrl, `--node=${add.node}`, `--branch=${add.branch}`])
+  // After `--` the CLI's parseArgs reads the ID and URL as given, though one starts with dashes.
+  const got = await nexus($, ['project', 'add', `--node=${add.node}`, `--branch=${add.branch}`, '--', add.id, add.repoUrl])
   if (!got.ok && got.failure.message === 'unknown command project') {
     return { ok: false, failure: { kind: got.failure.kind, message: `${cli} has no project add command: adding a project needs Nexus CLI 0.4.0 or later (nexus --version)` } }
   }
@@ -1352,10 +1353,14 @@ async function showList($: EngineInterface) {
   await listShown($, left, pane)
 }
 
-/** Shows the threads of `project`, or every project's for null: a thread view gives way to the list. */
+/**
+ * Shows the threads of `project`, or every project's for null, and puts the picker away: a thread view gives way to
+ * the list. Enter on a row comes as the row's own press, which no key step closed the picker for.
+ */
 async function chooseScope($: EngineInterface, project: string | null) {
   await setScope($, project)
-  if ((await read($, paneAtom)).view !== 'list') await showList($)
+  const pane = await update($, paneAtom, was => (was.overlay?.kind === 'projects' ? { ...was, overlay: null } : was))
+  if (pane.view !== 'list') await showList($)
 }
 
 /** The handlers the pane's keys, buttons and fields run, each with the render hook's `$`. */

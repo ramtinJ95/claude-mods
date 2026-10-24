@@ -1,5 +1,6 @@
 import { expect, test } from 'claude-code/testing'
 
+import { cells } from '../hooks/model'
 import { ID, THREADS, boot, fake, field, typing } from './fake-cli'
 
 type Ui = Awaited<ReturnType<Awaited<ReturnType<typeof boot>>['mount']>>
@@ -132,6 +133,12 @@ test('the picker opens on the project shown: Enter keeps it, and a move starts f
   expect((await picker(ui))[1]).toBe('❯ web             git@github.com:me/web.git')
   await keys(ui, 'o')
   expect(cli.store.project).toBe('web')
+  // Enter on a row is that row's press: it chooses and puts the picker away, from the list as from a thread.
+  await keys(ui, 'p')
+  await ui.press({ key: 'scope-project-api' })
+  expect(cli.store.project).toBe('api')
+  expect(await picker(ui)).toEqual([])
+  expect(await title(ui)).toMatch(/^◆ Nexus threads · api/)
 })
 
 test('a narrow pane cuts the repo before the current mark, and the title before the nodes', async ($, on) => {
@@ -142,6 +149,15 @@ test('a narrow pane cuts the repo before the current mark, and the title before 
   expect((await ui.find({ type: 'Text', text: /nodes online$/ }))?.text).toBe('1/2 nodes online')
   await keys(ui, 'p')
   expect((await picker(ui))[2]).toBe('❯ api             git@github.c…  current')
+  // At 24 columns the IDs take half the row, the repo goes before the mark, and every row fits.
+  await ui.unmount()
+  await nexus('')
+  // The picker stays open over the pane mounted again.
+  const narrow = await mount(24)
+  const rows = await picker(narrow)
+  expect(rows[2]).toBe('❯ api          current')
+  expect(rows[1]).toBe('web          git@gith…')
+  expect(rows.filter(row => cells(row) > 22)).toEqual([])
 })
 
 test('p in a thread picks a project and opens its list', async ($, on) => {
@@ -176,13 +192,27 @@ test('New project… adds the project from the form, on the first online node an
   await fields.type('project-id', 'docs')
   await fields.type('project-url', DOCS)
   await ui.input({ key: await field(ui, 'project-branch'), text: '' })
-  expect(cli.runs).toContainEqual(['project', 'add', '--json', 'docs', DOCS, '--node=firebat', '--branch=main'])
+  expect(cli.runs).toContainEqual(['project', 'add', '--json', '--node=firebat', '--branch=main', '--', 'docs', DOCS])
   expect(cli.store.project).toBe('docs')
   expect(await title(ui)).toMatch(/^◆ Nexus threads · docs/)
   expect(await shows(ui, `Added the project docs (${DOCS}) on firebat. Nexus shows its threads.`)).toBe(true)
   expect(await shows(ui, 'No threads in docs yet. n starts one, p shows another project.')).toBe(true)
   await keys(ui, 'p')
   expect(await picker(ui)).toContain(`❯ docs            ${DOCS}  current`)
+})
+
+test('an ID or URL that starts with dashes reaches the CLI as given, not as one of its options', async ($, on) => {
+  const cli = fake()
+  const { nexus, mount } = await boot($, on, cli)
+  await nexus('')
+  const ui = await mount()
+  await keys(ui, 'hpgeo')
+  const fields = typing(ui)
+  await fields.type('project-id', 'odd')
+  await fields.type('project-url', '--branch=trunk')
+  await ui.press({ key: 'project-submit' })
+  expect(cli.projects.at(-1)).toMatchObject({ id: 'odd', repoUrl: '--branch=trunk', defaultBranch: 'main' })
+  expect(await title(ui)).toMatch(/^◆ Nexus threads · odd/)
 })
 
 test("a refused add shows the CLI's message as printed and keeps the form filled; Cancel goes back to the picker", async ($, on) => {
@@ -199,7 +229,7 @@ test("a refused add shows the CLI's message as printed and keeps the form filled
   await fields.type('project-url', 'git@github.com:me/web.git')
   await fields.type('project-branch', 'trunk')
   await ui.press({ key: 'project-submit' })
-  expect(cli.runs).toContainEqual(['project', 'add', '--json', 'web', 'git@github.com:me/web.git', '--node=firebat', '--branch=trunk'])
+  expect(cli.runs).toContainEqual(['project', 'add', '--json', '--node=firebat', '--branch=trunk', '--', 'web', 'git@github.com:me/web.git'])
   expect(await shows(ui, 'project web exists')).toBe(true)
   expect([await fields.shows('project-id'), await fields.shows('project-url'), await fields.shows('project-branch')]).toEqual(['web', 'git@github.com:me/web.git', 'trunk'])
 
@@ -230,10 +260,10 @@ test('/nexus project says which project is shown, switches it, refuses an unknow
   expect(cli.store.project).toBeNull()
 
   expect(await nexus(`project add docs ${DOCS} --node firebat`)).toEqual({ text: `Added the project docs (${DOCS}) on firebat. Nexus shows its threads.` })
-  expect(cli.runs).toContainEqual(['project', 'add', '--json', 'docs', DOCS, '--node=firebat', '--branch=main'])
+  expect(cli.runs).toContainEqual(['project', 'add', '--json', '--node=firebat', '--branch=main', '--', 'docs', DOCS])
   expect(cli.store.project).toBe('docs')
   await nexus(`project add api2 ${DOCS} --node=testbench --branch trunk`)
-  expect(cli.runs).toContainEqual(['project', 'add', '--json', 'api2', DOCS, '--node=testbench', '--branch=trunk'])
+  expect(cli.runs).toContainEqual(['project', 'add', '--json', '--node=testbench', '--branch=trunk', '--', 'api2', DOCS])
 
   // A failure is the CLI's message as it printed it, which the transcript heads with `nexus:`.
   cli.fail.project = { exitCode: 5, error: 'project web exists' }

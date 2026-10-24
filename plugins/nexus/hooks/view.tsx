@@ -846,7 +846,9 @@ function ProjectsBody(draw: Draw, scene: Scene, actions: PaneActions, area: numb
   const chosen = scene.pane.overlay?.kind === 'projects' ? scene.pane.overlay.cursor : null
   const cursor = Math.max(0, rows.findIndex(row => row.key === chosen), chosen ? -1 : rows.findIndex(row => row.isCurrent))
   const top = Math.max(0, items[cursor]!.top + 1 - area)
-  const column = Math.max(...rows.map(row => cells(row.name))) + 2
+  // Past the pointer, the IDs take at most half the row; the rest is the repo, which gives way to the current mark.
+  const line = scene.width - 2
+  const column = Math.min(Math.max(...rows.map(row => cells(row.name))), Math.floor(line / 2)) + 2
   const total = rows.length
   return {
     nav: { context: 'projects', items, area, drawn: rows[cursor]!.key },
@@ -857,17 +859,19 @@ function ProjectsBody(draw: Draw, scene: Scene, actions: PaneActions, area: numb
         </Text>
         {rows.map((row, at) => {
           const isCursor = at === cursor
-          // The repo gives way to the current mark, which is the row's point when the pane is narrow.
           const mark = row.isCurrent ? 'current' : ''
-          const room = Math.max(8, scene.width - column - 2) - (mark && row.repo ? cells(mark) + 2 : 0)
-          const detail = [row.repo && clip(row.repo, Math.max(8, room)), mark].filter(Boolean).join('  ')
+          const room = line - column
+          const repoRoom = room - (mark ? cells(mark) + 2 : 0)
+          // A repo cut shorter than a host's name says nothing, so it goes.
+          const detail = clip([repoRoom >= 8 ? clip(row.repo, repoRoom) : '', mark].filter(Boolean).join('  '), Math.max(0, room))
+          const name = clip(row.name, detail ? column - 2 : line)
           return [
             <Button key={row.key} plain autoFocus={isCursor ? true : undefined} onPress={() => actions.effect(row.enter)}>
               {Pointer(draw, isCursor)}
               <Text color={isCursor ? 'suggestion' : row.key === 'scope-new' ? 'subtle' : 'text'} bold={isCursor}>
-                {row.name}
+                {name}
               </Text>
-              {detail ? <Text color="subtle">{`${' '.repeat(column - cells(row.name))}${detail}`}</Text> : ''}
+              {detail ? <Text color="subtle">{`${' '.repeat(column - cells(name))}${detail}`}</Text> : ''}
             </Button>,
             at === 0 && note ? (
               <Text key="projects-note" color={projectsFailure ? 'error' : 'subtle'}>{`  ${note}`}</Text>
