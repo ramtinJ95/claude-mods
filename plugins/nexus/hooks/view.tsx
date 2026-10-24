@@ -113,7 +113,7 @@ export type PaneActions = {
   tab: (tab: NexusTab) => void
   filter: (text: string) => void
   /** Enter in the filter: back to normal mode, the cursor on the first thread it keeps. */
-  filterDone: (first: string | null) => void
+  filterDone: (text: string, first: string | null) => void
   draft: (text: string) => void
   submit: (text: string) => void
   back: () => void
@@ -512,7 +512,7 @@ export function ListView(draw: Draw, scene: Scene, actions: PaneActions) {
     ),
     isFiltering ? (
       <Box key="filter-box" marginTop={1} borderStyle="round" borderColor="promptBorder" paddingX={1}>
-        <Input key={fieldKey(pane.fields, FILTER)} autoFocus label="⌕" value={pane.fields[FILTER]?.text} placeholder="filter threads by title" submitLabel="done" onInput={actions.filter} onSubmit={() => actions.filterDone(order.find(one => !one.id.startsWith('closed-'))?.id ?? null)} />
+        <Input key={fieldKey(pane.fields, FILTER)} autoFocus label="⌕" value={pane.fields[FILTER]?.text} placeholder="filter threads by title" submitLabel="done" onInput={actions.filter} onSubmit={text => actions.filterDone(text, order.find(one => !one.id.startsWith('closed-'))?.id ?? null)} />
       </Box>
     ) : (
       pane.filter && <Text key="filtered" color="subtle">{`⌕ ${pane.filter}   f edits it, an empty filter shows all`}</Text>

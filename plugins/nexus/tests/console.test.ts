@@ -138,6 +138,11 @@ test('f filters by title in filter mode, opens a closed group it matches, and En
   // f edits the filter kept, though Enter emptied its field.
   await keys(ui, 'f')
   expect(await fields.shows('filter')).toBe('old')
+  // Enter keeps the text it sent, though the change that typed it has not landed.
+  await fields.submit('filter', { typing: 'old idea' })
+  expect(await shows(ui, /^⌕ old idea/)).toBe(true)
+  await keys(ui, 'f')
+  expect(await fields.shows('filter')).toBe('old idea')
 })
 
 test('Esc from the filter, which hands the keys to the prompt, clears it and takes them back', async ($, on) => {
@@ -1309,6 +1314,10 @@ test('a start the control plane refuses stays on the form with its reason', asyn
   expect(await shows(ui, 'no image is current.')).toBe(true)
   // Enter emptied the title, which the form puts back so the next try sends what it shows.
   expect(await fields.shows('start-title')).toBe('Try it')
+  // Typing while Enter's submit runs keeps the field, which the engine does not empty: no put goes over it.
+  const key = await field(ui, 'start-title')
+  await fields.submit('start-title', { during: () => fields.typeInto(key, 'Try it again') })
+  expect(await fields.shows('start-title')).toBe('Try it again')
 })
 
 test('a row or a show without a field docs/cli.md requires is a contract error, not a guess', async ($, on) => {

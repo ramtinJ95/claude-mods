@@ -643,14 +643,31 @@ function rehome($: EngineInterface, tree: unknown, pane: NexusPane, isFocused: b
 }
 
 /**
- * Enter in a form's field: the engine empties the field whose submit it delivered, but a form that stays (a refusal,
- * a field missing) must still show what it would send. So the field is put again with its text, under a new key, and
- * the ring follows it there.
+ * The list filtered by `text`. Each change of the filter opens the closed groups it matches afresh, as the dashboard's
+ * does, so a group the person folded or opened before follows the new filter.
  */
-async function putBack<Field extends string>($: EngineInterface, keys: Record<Field, string>, change: Partial<Record<Field, string>>) {
-  const texts = Object.fromEntries(Object.entries(change).map(([field, text]) => [keys[field as Field], text as string]))
-  const pane = await update($, paneAtom, was => ({ ...was, fields: putFields(was.fields, texts) }))
-  const [name] = Object.keys(texts)
+const filtered = (pane: NexusPane, text: string): NexusPane =>
+  text === pane.filter ? pane : { ...pane, filter: text, toggled: Object.fromEntries(Object.entries(pane.toggled).filter(([key]) => !key.startsWith(closedKey('')))) }
+
+/**
+ * Enter in a form's field: once the submit's hooks are done, the engine empties the field it delivered, unless it was
+ * typed in since (2.1.310's field store). A form that stays (a refusal, a field missing) must still show what it
+ * would send, so the field is put again with its text, under a new key, and the ring follows it there. A field
+ * typed in since holds `form`'s newer text, which the engine keeps: it is left alone.
+ */
+async function putBack<Field extends string>(
+  $: EngineInterface,
+  keys: Record<Field, string>,
+  change: Partial<Record<Field, string>>,
+  form: (pane: NexusPane) => Partial<Record<NoInfer<Field>, unknown>> | null,
+) {
+  let name: string | undefined
+  const pane = await update($, paneAtom, was => {
+    const held = form(was)
+    const texts = Object.fromEntries(Object.entries(change).flatMap(([field, text]) => (held?.[field as Field] === text ? [[keys[field as Field], text as string]] : [])))
+    name = Object.keys(texts)[0]
+    return name ? { ...was, fields: putFields(was.fields, texts) } : was
+  })
   if (name) await focusOn($, fieldKey(pane.fields, name))
 }
 
@@ -1271,14 +1288,18 @@ function paneActions($: EngineInterface, surface: RenderSurface): PaneActions {
       }),
     // Each change of the filter opens the closed groups it matches afresh, as the dashboard's does, so a group the
     // person folded or opened before follows the new filter.
-    filter: text =>
-      run(() =>
-        update($, paneAtom, pane => ({ ...pane, filter: text, toggled: Object.fromEntries(Object.entries(pane.toggled).filter(([key]) => !key.startsWith(closedKey('')))) })),
-      ),
-    filterDone: first =>
+    filter: text => run(() => update($, paneAtom, pane => filtered(pane, text))),
+    filterDone: (text, first) =>
       run(async () => {
-        // Enter emptied the field, so f would edit nothing: it is put again with the filter kept.
-        const pane = await update($, paneAtom, (was): NexusPane => ({ ...was, mode: 'normal', listCursor: first ?? was.listCursor, listTop: 0, fields: putFields(was.fields, { [FILTER]: was.filter }) }))
+        // Enter's text is the filter, though its last change may not have landed yet; the first match drawn is then
+        // another filter's. Enter emptied the field, so f would edit nothing: it is put again with that text.
+        const pane = await update($, paneAtom, (was): NexusPane => ({
+          ...filtered(was, text),
+          mode: 'normal',
+          listCursor: (text === was.filter ? first : null) ?? was.listCursor,
+          listTop: 0,
+          fields: putFields(was.fields, { [FILTER]: text }),
+        }))
         await focusRing($, pane)
       }),
     draft: text => run(() => update($, paneAtom, pane => ({ ...pane, draft: text }))),
@@ -1304,7 +1325,7 @@ function paneActions($: EngineInterface, surface: RenderSurface): PaneActions {
       run(async () => {
         if (change) {
           await setStart($, change)
-          await putBack($, START_KEYS, change)
+          await putBack($, START_KEYS, change, pane => pane.start)
         }
         await submitStart($)
       }),
