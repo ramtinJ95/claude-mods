@@ -47,7 +47,7 @@ import {
   stripChips,
   transcript,
 } from './model'
-import { COMPOSE, type Effect, FILTER, type MenuAction, press, putField, ringMoved } from './keys'
+import { COMPOSE, type Effect, FILTER, type MenuAction, fieldKey, fieldOf, press, putFields, ringMoved } from './keys'
 import { StripView } from './strip'
 import { needsHuman, portFacts, TOOLS } from './tools'
 import { type Draw, ListView, type PaneActions, START_KEYS, type Scene, StartView, ThreadView, ringOf } from './view'
@@ -525,7 +525,7 @@ const threadView = (pane: NexusPane, thread: string): Partial<NexusPane> => {
     portCursor: isSame ? pane.portCursor : null,
     listCursor: thread,
     draft: '',
-    fields: putField(pane.fields, COMPOSE, ''),
+    fields: putFields(pane.fields, { [COMPOSE]: '' }),
     start: null,
     notice: null,
     toggled: isSame ? pane.toggled : {},
@@ -601,7 +601,7 @@ async function openFromStrip($: EngineInterface, id: string) {
 async function recover($: EngineInterface) {
   recovering = undefined
   const pane = await update($, paneAtom, (was): NexusPane =>
-    was.mode === 'normal' && !was.overlay ? was : { ...was, mode: 'normal', overlay: null, pending: null, ...(was.mode === 'filter' ? { filter: '', fields: putField(was.fields, FILTER, '') } : {}) },
+    was.mode === 'normal' && !was.overlay ? was : { ...was, mode: 'normal', overlay: null, pending: null, ...(was.mode === 'filter' ? { filter: '', fields: putFields(was.fields, { [FILTER]: '' }) } : {}) },
   )
   // A pane closed since stays closed; asking for the keys it holds already changes nothing.
   if (!(await $.ui.panes()).some(one => one.id === PANE)) return
@@ -624,7 +624,7 @@ function focusRing($: EngineInterface, pane: NexusPane) {
 function rehome($: EngineInterface, tree: unknown, pane: NexusPane, isFocused: boolean) {
   if (!isFocused || pane.mode !== 'normal' || !ringAt || rehoming) return
   const { keys, home } = ringOf(tree)
-  const isLost = !keys.has(ringAt) || ringAt === COMPOSE || ringAt === FILTER
+  const isLost = !keys.has(ringAt) || fieldOf(ringAt) === COMPOSE || fieldOf(ringAt) === FILTER
   if (!isLost || !home || home === ringAt) return
   rehoming = $.clock.after(0, () => {
     rehoming = undefined
@@ -1066,13 +1066,20 @@ function failedTool() {
 
 const emptyStart = (project = '', title = ''): NexusStartDraft => ({ title, project, node: '', branch: '', message: '', error: null, isStarting: false, request: 0, focused: null })
 
+/** The start form's texts by field, as `putFields` takes them. */
+const startTexts = (start: NexusStartDraft) => ({ [START_KEYS.title]: start.title, [START_KEYS.branch]: start.branch, [START_KEYS.message]: start.message })
+
+/** The pane with each field put again with the text it holds for it: a closed pane's fields forget what was typed. */
+const refilled = (pane: NexusPane): NexusPane => ({
+  ...pane,
+  fields: putFields(pane.fields, { [COMPOSE]: pane.draft, [FILTER]: pane.filter, ...(pane.start ? startTexts(pane.start) : {}) }),
+})
+
 /** Opens the start form, its project and title given for Start again, and reads the projects and nodes it offers. */
 async function openStart($: EngineInterface, project?: string, title?: string) {
   await setPane($, pane => {
     const start = emptyStart(project, title)
-    const texts = { [START_KEYS.title]: start.title, [START_KEYS.branch]: start.branch, [START_KEYS.message]: start.message }
-    const fields = Object.entries(texts).reduce((all, [key, text]) => putField(all, key, text), pane.fields)
-    return { view: 'start', mode: 'normal', overlay: null, start, fields }
+    return { view: 'start', mode: 'normal', overlay: null, start, fields: putFields(pane.fields, startTexts(start)) }
   })
   await loadCatalog($, { projects: true })
   const { projects } = await read($, catalogAtom)
@@ -1212,9 +1219,9 @@ function paneActions($: EngineInterface, surface: RenderSurface): PaneActions {
         return runAction(effect.action)
       // The field's autoFocus takes the ring as it is drawn; this asks for it too, where it is drawn already.
       case 'insert':
-        return focusOn($, COMPOSE)
+        return focusOn($, fieldKey((await read($, paneAtom)).fields, COMPOSE))
       case 'filter':
-        return focusOn($, FILTER)
+        return focusOn($, fieldKey((await read($, paneAtom)).fields, FILTER))
       case 'new':
         return openStart($)
       case 'refresh':
@@ -1270,7 +1277,7 @@ function paneActions($: EngineInterface, surface: RenderSurface): PaneActions {
     startProject: project =>
       run(() =>
         update($, paneAtom, pane =>
-          pane.start ? { ...pane, start: { ...pane.start, project, node: '', branch: '', error: null }, fields: putField(pane.fields, START_KEYS.branch, '') } : pane,
+          pane.start ? { ...pane, start: { ...pane.start, project, node: '', branch: '', error: null }, fields: putFields(pane.fields, { [START_KEYS.branch]: '' }) } : pane,
         ),
       ),
     startSubmit: change =>
@@ -1301,9 +1308,12 @@ export const register: Register = (on, options) => {
     return next(e)
   })
 
-  on('ui.close', ($, e, next) => {
-    if (e.id === PANE) stopPane()
-    return next(e)
+  on('ui.close', async ($, e, next) => {
+    if (e.id !== PANE) return next(e)
+    stopPane()
+    const closed = await next(e)
+    if (!(await $.ui.panes()).some(one => one.id === PANE)) await update($, paneAtom, refilled)
+    return closed
   }).catch(($, e, next) => next(e))
 
   on('command.run', { command: 'nexus' }, async ($, e) => ({ text: await runCommand($, e.args) }))

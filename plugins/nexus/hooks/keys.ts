@@ -3,7 +3,7 @@
 // pane and the effects the hooks module carries out. Claude Code gives a pane's
 // hotkeys one lowercase letter or digit, Shift folded in, so vim's G, ctrl+d and
 // ctrl+u, / and ? are spelled ge, d, u, f and s here.
-import type { NexusMode, NexusPane, NexusTab } from '../types'
+import type { NexusField, NexusMode, NexusPane, NexusTab } from '../types'
 import type { Action } from './model'
 
 export type Command =
@@ -125,14 +125,21 @@ export const TABS: readonly NexusTab[] = ['conversation', 'details', 'ports']
 export const COMPOSE = 'compose'
 export const FILTER = 'filter'
 
-/**
- * `fields` with `text` put in the field `key`. The engine takes a field's `value` over the typing only when it changed
- * since the last drawing, so an empty put alternates `''` and `null`: emptying a field emptied before still empties it.
- */
-export const putField = (fields: Readonly<Record<string, string | null>>, key: string, text: string): Record<string, string | null> => ({
+/** `fields` with each of `texts`, keyed by field name, put in its field. */
+export const putFields = (fields: Readonly<Record<string, NexusField>>, texts: Readonly<Record<string, string>>): Record<string, NexusField> => ({
   ...fields,
-  [key]: text === '' && fields[key] === '' ? null : text,
+  ...Object.fromEntries(Object.entries(texts).map(([name, text]) => [name, { text, puts: (fields[name]?.puts ?? 0) + 1 }])),
 })
+
+/**
+ * The key the field `name` is drawn under: a new one for each put. The engine keeps what is typed in a field by key,
+ * and a `value` replaces it only when it differs from the one this mount last drew, so a put drawn under the same key
+ * could leave older typing in its place.
+ */
+export const fieldKey = (fields: Readonly<Record<string, NexusField>>, name: string) => `${name}#${fields[name]?.puts ?? 0}`
+
+/** The field a drawn key belongs to, or the key itself when it is no field's. */
+export const fieldOf = (key: string) => key.replace(/#\d+$/, '')
 
 type Step = { pane: NexusPane; effects: Effect[] }
 
@@ -348,13 +355,14 @@ export function press(before: NexusPane, pressed: Command, nav: Nav): Step {
 
 /** The pane's state after a person moved the ring onto `element` with the arrows, Tab or a click. */
 export function ringMoved(pane: NexusPane, element: string): NexusPane {
-  if (element === COMPOSE) return { ...pane, mode: 'insert', overlay: null, tab: 'conversation' }
-  if (element === FILTER) return { ...pane, mode: 'filter' }
+  const field = fieldOf(element)
+  if (field === COMPOSE) return { ...pane, mode: 'insert', overlay: null, tab: 'conversation' }
+  if (field === FILTER) return { ...pane, mode: 'filter' }
   // Leaving a field by the ring is leaving its mode.
   const base: NexusPane = pane.mode === 'normal' ? pane : { ...pane, mode: 'normal' }
   if (element.startsWith('menu-') && pane.overlay?.kind === 'menu') return { ...base, overlay: { kind: 'menu', cursor: element } }
   if (element.startsWith('preview-') || element.startsWith('port-')) return { ...base, portCursor: element }
   if (pane.view === 'list') return { ...base, listCursor: element }
-  if (pane.view === 'start' && pane.start) return { ...base, start: { ...pane.start, focused: element } }
+  if (pane.view === 'start' && pane.start) return { ...base, start: { ...pane.start, focused: field } }
   return base
 }

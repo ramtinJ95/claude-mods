@@ -170,7 +170,7 @@ export type NexusStartDraft = {
   isStarting: boolean
   /** The submission this form waits on, 0 before its first: a start that ends checks it is still the form's. */
   request: number
-  /** The element the person moved the ring to, which the message's rows follow. */
+  /** The field or element the person moved the ring to, which the message's rows follow. */
   focused: string | null
 }
 
@@ -207,6 +207,12 @@ export type NexusPortChange = {
   failure: { action: 'open' | 'close'; message: string } | null
 }
 
+/**
+ * A text field's `value` and how many times the pane has put one there. The field is drawn under a key of its own for
+ * each put (`fieldKey`), so the engine shows the put text, never the typing under an older key.
+ */
+export type NexusField = { text: string; puts: number }
+
 export type NexusPane = {
   view: NexusView
   tab: NexusTab
@@ -231,11 +237,8 @@ export type NexusPane = {
   /** The composer's text as the person typed it, for the rows it takes. */
   draft: string
   start: NexusStartDraft | null
-  /**
-   * What each text field is drawn with, by key: the text the pane last put there, never the typing (`putField`).
-   * The field keeps what is typed until it is drawn with another.
-   */
-  fields: Record<string, string | null>
+  /** What the pane last put in each text field, by the field's name (`putFields`). */
+  fields: Record<string, NexusField>
   /** The outcome of the last press, until the next one. */
   notice: { text: string; tone: 'error' | 'dim' } | null
   /**

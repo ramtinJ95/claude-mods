@@ -2,6 +2,8 @@
 // command from fixtures, and the engine's other calls the pane makes.
 import { mock, type TestBody } from 'claude-code/testing'
 
+import { fieldOf } from '../hooks/keys'
+
 type Body = Parameters<TestBody>
 
 export const ID = 'th-4f2a00000001'
@@ -245,6 +247,44 @@ export async function boot(...[$, on, cli]: [...Body, Fake]) {
   const strip = (columns = 120) =>
     $.ui.mount({ plugin: 'nexus', surface: 'terminal', component: 'AbovePrompt', requestId: 'above-prompt', props: { hasSurvey: false, isWorking: false, maxRows: 20, bodyColumns: columns, scroll: { offset: 0, bodyRows: 20 }, view: {} } } as never)
   return { clock, nexus, mount, strip }
+}
+
+type Ui = Awaited<ReturnType<Awaited<ReturnType<typeof boot>>['mount']>>
+
+/** The key the field `name` is drawn under now (`fieldKey`), or `name` itself when it is not drawn. */
+export const field = async (ui: Ui, name: string) => (await ui.findAll({ type: 'Input' })).find(one => one.key !== undefined && fieldOf(one.key) === name)?.key ?? name
+
+/**
+ * What the fields of a mounted pane show, as 2.1.310's field store keeps it (read from its renderer): the typing, by
+ * key, until a drawing gives that key a `value` other than the one this mount last drew, then that `value`. The kit
+ * draws no fields, so this reads each drawing the test takes as the engine reads every drawing. A pane closed loses its
+ * store, so a pane opened again is a new mount with a new `typing`.
+ */
+export function typing(ui: Ui) {
+  const typed = new Map<string, string>()
+  const drawn = new Map<string, unknown>()
+  const read = async () => {
+    const inputs = await ui.findAll({ type: 'Input' })
+    for (const one of inputs) {
+      if (drawn.has(one.key!) && drawn.get(one.key!) !== one.props.value) typed.delete(one.key!)
+      drawn.set(one.key!, one.props.value)
+    }
+    return inputs
+  }
+  return {
+    /** Types `text` over the field `name`, as the person editing it does. */
+    async type(name: string, text: string) {
+      await read()
+      const key = await field(ui, name)
+      typed.set(key, text)
+      await ui.input({ key, text, kind: 'change' })
+    },
+    /** What the field `name` shows, or undefined when it is not drawn. */
+    async shows(name: string) {
+      const one = (await read()).find(input => fieldOf(input.key!) === name)
+      return one && (typed.get(one.key!) ?? (one.props.value as string | undefined) ?? '')
+    },
+  }
 }
 
 /**

@@ -36,7 +36,7 @@ import type {
   NexusThreadRow,
   NexusWatch,
 } from '../types'
-import { COMPOSE, type Command, type Effect, FILTER, HELP, KEYMAP, type MenuAction, type Nav, type NavItem, blockAt, keepInView, scrolledRows } from './keys'
+import { COMPOSE, type Command, type Effect, FILTER, HELP, KEYMAP, type MenuAction, type Nav, type NavItem, blockAt, fieldKey, keepInView, scrolledRows } from './keys'
 import {
   ACTUAL_BADGE,
   type Block,
@@ -294,40 +294,71 @@ function wrapped(text: string, width: number): number {
 const FIELD_ROWS = 6
 
 /**
+ * The rows a focused field's editor wraps `text` to in `columns`: as `Bun.wrapAnsi(text, columns - 1, { hard: true,
+ * trim: false })` does in 2.1.310, the last cell kept for the cursor. A word moves whole to the next row, keeping the
+ * space before it on the row it left, and one wider than a row breaks across rows.
+ */
+export function editorRows(text: string, columns: number): number {
+  const width = columns - 1
+  return text.split('\n').reduce((sum, line) => {
+    let rows = 1
+    let used = 0
+    for (const [index, word] of line.split(' ').entries()) {
+      if (index > 0) {
+        if (used >= width) {
+          rows += 1
+          used = 0
+        }
+        used += 1
+      }
+      const size = cells(word)
+      if (size > width) {
+        if (Math.floor((size - 1) / width) < 1 + Math.floor((size - (width - used) - 1) / width)) {
+          rows += 1
+          used = 0
+        }
+        const chars = [...word]
+        for (const [at, char] of chars.entries()) {
+          const taken = cells(char)
+          if (used + taken > width) {
+            rows += 1
+            used = 0
+          }
+          used += taken
+          if (used === width && at < chars.length - 1) {
+            rows += 1
+            used = 0
+          }
+        }
+        continue
+      }
+      if (used > 0 && size > 0 && used + size > width) {
+        rows += 1
+        used = 0
+      }
+      used += size
+    }
+    return sum + rows
+  }, 0)
+}
+
+/**
  * The rows an Input needs to show all of `text` in a pane `width` by `rows`, two at least while it has the keys: a
- * field of one row submits on `\⏎` instead of typing a newline. The engine wraps a focused field at the site's width
- * less `label: `, the Enter hint and a cell for the cursor, never at the Box it sits in, so a field must span the site
- * to wrap where it is drawn. From two rows the hint also names the newline key, when that leaves the text half the
- * width. The key is `\⏎` or `shift+⏎` as the terminal allows, so the rows are the more of the two.
+ * field of one row submits on `\⏎` instead of typing a newline. The engine sizes a focused field's editor from the
+ * site's width less `label: ` and the Enter hint, never from the Box it sits in, so a field must span the site to wrap
+ * where it is drawn. From two rows the hint also names the newline key, when that leaves the text half the width. The
+ * key is `\⏎` or `shift+⏎` as the terminal allows, so the rows are the more of the two.
  */
 export function fieldRows(text: string, label: string, submit: string, width: number, rows: number, hasKeys: boolean): number {
   const room = width - (label ? cells(label) + 2 : 0)
   const enter = ` ⏎ ${submit}`
-  const rowsAt = (columns: number) =>
-    text.split('\n').reduce((sum, line, index, lines) => {
-      let taken = 1
-      let used = 0
-      // A word wraps whole to the next row, one wider than the row breaks across it; the last line holds the cursor.
-      for (const word of (index === lines.length - 1 ? `${line} ` : line).split(' ')) {
-        const size = cells(word)
-        if (used > 0 && used + 1 + size > columns) {
-          taken += 1
-          used = 0
-        } else if (used > 0) used += 1
-        used += size
-        while (used > columns) {
-          taken += 1
-          used -= columns
-        }
-      }
-      return sum + taken
-    }, 0)
-  if (!hasKeys && rowsAt(Math.max(12, room - cells(enter))) <= 1) return 1
+  const rowsAt = (columns: number) => editorRows(text, Math.max(12, columns))
+  if (!hasKeys && rowsAt(room - cells(enter)) <= 1) return 1
   const needed = Math.max(
     ...['\\⏎', 'shift+⏎'].map(key => {
       const newline = `${enter} · ${key} new line`
       const hint = room - cells(newline) >= width / 2 ? newline : enter
-      return rowsAt(Math.max(12, room - cells(hint)))
+      return rowsAt(room - cells(hint))
     }),
   )
   return Math.max(2, Math.min(FIELD_ROWS, Math.floor(rows / 4), needed))
@@ -480,7 +511,7 @@ export function ListView(draw: Draw, scene: Scene, actions: PaneActions) {
     ),
     isFiltering ? (
       <Box key="filter-box" marginTop={1} borderStyle="round" borderColor="promptBorder" paddingX={1}>
-        <Input key={FILTER} autoFocus label="⌕" value={pane.fields[FILTER] ?? undefined} placeholder="filter threads by title" submitLabel="done" onInput={actions.filter} onSubmit={() => actions.filterDone(order.find(one => !one.id.startsWith('closed-'))?.id ?? null)} />
+        <Input key={fieldKey(pane.fields, FILTER)} autoFocus label="⌕" value={pane.fields[FILTER]?.text} placeholder="filter threads by title" submitLabel="done" onInput={actions.filter} onSubmit={() => actions.filterDone(order.find(one => !one.id.startsWith('closed-'))?.id ?? null)} />
       </Box>
     ) : (
       pane.filter && <Text key="filtered" color="subtle">{`⌕ ${pane.filter}   f edits it, an empty filter shows all`}</Text>
@@ -1207,11 +1238,11 @@ function Composer(draw: Draw, scene: Scene, actions: PaneActions, pylon: { faile
       {pylonState === 'paused' && <Text color="subtle">The pylon is paused. Sending a message wakes it.</Text>}
       {Rule(draw, scene, border)}
       <Input
-        key={COMPOSE}
+        key={fieldKey(scene.pane.fields, COMPOSE)}
         autoFocus={scene.pane.mode === 'insert' ? true : undefined}
         label="❯"
         rows={fieldRows(scene.pane.draft, '❯', submitLabel, scene.width, scene.rows, scene.isFocused && scene.pane.mode === 'insert')}
-        value={scene.pane.fields[COMPOSE] ?? undefined} placeholder={placeholder} submitLabel={submitLabel} onInput={actions.draft} onSubmit={actions.submit} />
+        value={scene.pane.fields[COMPOSE]?.text} placeholder={placeholder} submitLabel={submitLabel} onInput={actions.draft} onSubmit={actions.submit} />
       {Rule(draw, scene, border)}
     </Box>
   )
@@ -1468,10 +1499,10 @@ export function StartView(draw: Draw, scene: Scene, actions: PaneActions) {
       {projects && projects.length > 0 && (
         <Box flexDirection="column" marginTop={1} rowGap={0}>
           <Input
-            key={START_KEYS.title}
+            key={fieldKey(scene.pane.fields, START_KEYS.title)}
             autoFocus
             label="Title  "
-            value={scene.pane.fields[START_KEYS.title] ?? undefined}
+            value={scene.pane.fields[START_KEYS.title]?.text}
             placeholder="What should this thread do?"
             submitLabel="start"
             onInput={title => actions.startDraft({ title })}
@@ -1495,19 +1526,19 @@ export function StartView(draw: Draw, scene: Scene, actions: PaneActions) {
             onSelect={value => actions.startDraft({ node: value })}
           />
           <Input
-            key={START_KEYS.branch}
+            key={fieldKey(scene.pane.fields, START_KEYS.branch)}
             label="Branch "
-            value={scene.pane.fields[START_KEYS.branch] ?? undefined}
+            value={scene.pane.fields[START_KEYS.branch]?.text}
             placeholder={chosen?.defaultBranch ?? ''}
             submitLabel="start"
             onInput={value => actions.startDraft({ branch: value })}
             onSubmit={value => actions.startSubmit({ branch: value })}
           />
           <Input
-            key={START_KEYS.message}
+            key={fieldKey(scene.pane.fields, START_KEYS.message)}
             label="Message"
             rows={fieldRows(draft.message, 'Message', 'start', scene.width, scene.rows, scene.isFocused && draft.focused === START_KEYS.message)}
-            value={scene.pane.fields[START_KEYS.message] ?? undefined}
+            value={scene.pane.fields[START_KEYS.message]?.text}
             placeholder="The first message for the agent"
             submitLabel="start"
             onInput={message => actions.startDraft({ message })}
