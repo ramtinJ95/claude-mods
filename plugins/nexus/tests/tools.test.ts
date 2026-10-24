@@ -99,3 +99,25 @@ test('preview publishes a port and answers its URL once the node serves it, or w
   cli.fail.preview = { exitCode: 5, error: 'the pylon is not running' }
   expect(await call(5173)).toMatchObject({ deny: 'nexus (conflict): the pylon is not running' })
 })
+
+test("unpublish closes a linked port's preview from the tool and /nexus, says why it could not, and names the CLI an old one needs", async ($, on) => {
+  const cli = fake()
+  const { nexus } = await boot($, on, cli)
+  const call = (port: number) => $.tool.call({ tool: 'mcp__nexus__unpublish', thread: '4f2a', port } as never)
+  const { result } = await call(5173)
+  expect(cli.spawns).toContainEqual(['unpreview', '--json', ID, '5173'])
+  expect(JSON.parse(String(result))).toEqual({ thread: ID, port: 5173, unpublished: true })
+  expect(await nexus('unpublish 8080 4f2a')).toEqual({ text: `Unpublished port 8080 of ${ID}. Publishing it again may give it a new URL.` })
+  expect(cli.spawns).toContainEqual(['unpreview', '--json', ID, '8080'])
+  // Without an ID it takes the thread open in the pane.
+  await nexus(`open ${ID}`)
+  await nexus('unpublish 3001')
+  expect(cli.spawns).toContainEqual(['unpreview', '--json', ID, '3001'])
+  cli.fail.unpreview = { exitCode: 1, error: 'port 3000 is previewed by the service web, which unpreview does not close' }
+  expect(await call(3000)).toMatchObject({ deny: 'nexus (failed): port 3000 is previewed by the service web, which unpreview does not close' })
+  expect(await nexus('unpublish 3000')).toEqual({ text: 'Port 3000 is previewed by the service web, which unpreview does not close.' })
+  cli.fail.unpreview = { exitCode: 64, error: 'unknown command unpreview' }
+  const needs = 'nexus has no unpreview command: unpublishing a preview needs Nexus CLI 0.3.0 or later (nexus --version)'
+  expect(await call(5173)).toMatchObject({ deny: `nexus (invalid): ${needs}` })
+  expect(await nexus('unpublish 5173')).toEqual({ text: `N${needs.slice(1)}.` })
+})

@@ -55,6 +55,9 @@ export const DETAIL = {
   attach: 'herdr --session nexus-7f3a',
 }
 
+/** The details once 5173 is published: a linked port's preview, which `unpreview` can close. */
+export const PUBLISHED = { ...DETAIL, previews: [...DETAIL.previews, OPENED], ports: PORTS.map(one => (one.port === 5173 ? { ...one, preview: OPENED } : one)) }
+
 export const NODES = [
   { name: 'firebat', tailnetHost: 'rj-firebat.example.ts.net', tailnetNodeId: 'n1', state: 'online', capacity: null, observedAt: null },
   { name: 'testbench', tailnetHost: 'testbench.example.ts.net', tailnetNodeId: 'n2', state: 'offline', capacity: null, observedAt: null },
@@ -116,6 +119,8 @@ export type Fake = {
   slow: Record<string, number>
   /** A verb that fails: its exit code and stderr. */
   fail: Record<string, { exitCode: number; error: string }>
+  /** Whether `preview` and `unpreview` change what `show` lists, as the control plane does; false as if another client undid each at once. */
+  publishes: boolean
   /** The answer AskUserQuestion gives. */
   answer: string
   asked: string[]
@@ -125,7 +130,18 @@ export type Fake = {
 }
 
 export function fake(change: Partial<Fake> = {}): Fake {
-  return { runs: [], spawns: [], threads: THREADS, detail: DETAIL, watch: [{ type: 'reset', thread: ID, entries: ENTRIES }, state('working'), live()], slow: {}, fail: {}, answer: 'Keep', asked: [], copied: [], opens: 0, isOpen: false, ...change }
+  return { runs: [], spawns: [], threads: THREADS, detail: DETAIL, watch: [{ type: 'reset', thread: ID, entries: ENTRIES }, state('working'), live()], slow: {}, fail: {}, publishes: true, answer: 'Keep', asked: [], copied: [], opens: 0, isOpen: false, ...change }
+}
+
+/** `detail` with the linked preview of `port` published, or gone when `preview` is null. */
+function withPreview(detail: unknown, port: number, preview: typeof OPENED | null) {
+  const shown = detail as typeof DETAIL
+  const service = `port-${port}`
+  return {
+    ...shown,
+    previews: [...shown.previews.filter(one => one.service !== service), ...(preview ? [preview] : [])],
+    ports: shown.ports?.map(one => (one.port === port ? { ...one, preview } : one)) ?? null,
+  }
 }
 
 const reply = (json: unknown) => ({ value: { exitCode: 0, stdout: JSON.stringify(json), stderr: '', isStdoutTruncated: false, isStderrTruncated: false } })
@@ -148,6 +164,7 @@ export async function boot(...[$, on, cli]: [...Body, Fake]) {
     delete: () => ({ ...THREAD, status: 'deleted' }),
     start: () => ({ ...THREAD, id: 'th-123456789abc', title: 'New one', agentTurnRunning: false }),
     preview: () => OPENED,
+    unpreview: () => null,
   }
   on('process.run', async (_, e) => {
     const argv = e.argv.slice(1)
@@ -175,6 +192,9 @@ export async function boot(...[$, on, cli]: [...Body, Fake]) {
       if (failure) {
         yield { stream: 'stderr' as const, text: `${JSON.stringify({ error: failure.error, kind: 'failed', status: 500 })}\n` }
         return { value: { code: failure.exitCode, signal: null } }
+      }
+      if (cli.publishes && (argv[0] === 'preview' || argv[0] === 'unpreview')) {
+        cli.detail = withPreview(cli.detail, Number(argv[3]), argv[0] === 'preview' ? OPENED : null)
       }
       yield { stream: 'stdout' as const, text: JSON.stringify(answers[argv[0]!]?.() ?? null) }
     }

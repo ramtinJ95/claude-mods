@@ -61,6 +61,11 @@ describe('/nexus arguments', () => {
     expect(parseCommand('')).toEqual({ verb: 'pane' })
     expect(parseCommand('archive a b').verb).toBe('invalid')
     expect(parseCommand('frobnicate').verb).toBe('invalid')
+    expect(parseCommand('unpublish 5173')).toEqual({ verb: 'unpublish', port: 5173 })
+    expect(parseCommand('unpublish 5173 4f2a')).toEqual({ verb: 'unpublish', port: 5173, thread: '4f2a' })
+    expect(parseCommand('unpublish').verb).toBe('invalid')
+    expect(parseCommand('unpublish 4f2a 5173').verb).toBe('invalid')
+    expect(parseCommand('unpublish 5173 4f2a extra').verb).toBe('invalid')
   })
 
   test('a prefix names the one thread it starts', () => {

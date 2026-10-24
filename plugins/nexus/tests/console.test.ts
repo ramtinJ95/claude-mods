@@ -1,7 +1,7 @@
 import { expect, test, type TestBody } from 'claude-code/testing'
 
 import { cutTree } from '../hooks/view'
-import { DETAIL, ENTRIES, ID, OPENED, PATCH, THEME_KEYS, THREAD, THREADS, WEB_PREVIEW, boot, fake, live, state } from './fake-cli'
+import { DETAIL, ENTRIES, ID, OPENED, PATCH, PUBLISHED, THEME_KEYS, THREAD, THREADS, WEB_PREVIEW, boot, fake, live, state } from './fake-cli'
 
 type Ui = Awaited<ReturnType<Awaited<ReturnType<typeof boot>>['mount']>>
 
@@ -630,7 +630,7 @@ test("a preview's link is the CLI's URL, with or without the nodes", async ($, o
   expect((await ui.findAll({ type: 'Link' })).map(link => link.props.href)).toEqual([WEB_PREVIEW.url])
 })
 
-test('a port opens on its digit: progress while the CLI waits, then its link, and Previews takes it at the next details', async ($, on) => {
+test('a port opens on its digit: progress while the CLI waits, then Previews lists it with its link, before the details do', async ($, on) => {
   const cli = fake({ slow: { preview: 3_000 } })
   const { clock, nexus, mount } = await boot($, on, cli)
   await nexus(`open ${ID}`)
@@ -645,8 +645,10 @@ test('a port opens on its digit: progress while the CLI waits, then its link, an
   const polled = cli.spawns.filter(argv => argv[0] === 'show').length
   await clock.advance(3_000)
   expect((await ui.find({ type: 'Link', text: OPENED.url }))?.props.href).toBe(OPENED.url)
+  expect(await ui.find({ key: 'port-5173' })).toBeUndefined()
+  expect(await shows(ui, new RegExp(`^●port-5173ready${OPENED.url}$`), 'Box')).toBe(true)
   expect(cli.spawns.filter(argv => argv[0] === 'show').length).toBeGreaterThan(polled)
-  // The next details list it as a preview of its own, so Ports no longer does.
+  // The next details list it too, once.
   const opened = { ...OPENED, pylon: 'pylon-7f3a' }
   cli.detail = { ...DETAIL, previews: [...DETAIL.previews, opened], ports: DETAIL.ports.map(one => (one.port === 5173 ? { ...one, preview: opened } : one)) }
   await clock.advance(5_000)
@@ -668,6 +670,156 @@ test('a port that does not open says why, and opens again when pressed', async (
   await ui.press({ key: 'port-5173' })
   expect(cli.spawns.filter(argv => argv[0] === 'preview')).toHaveLength(2)
   expect(await ui.find({ type: 'Link', text: OPENED.url })).toBeDefined()
+})
+
+const closeKeys = async (ui: Ui) => (await ui.findAll({ type: 'Button' })).flatMap(one => (one.key?.startsWith('close-') ? [[one.key, one.props.hotkey]] : []))
+
+test("x then a preview's digit unpublishes a linked port: closing… while the CLI runs, then the port is back under Ports", async ($, on) => {
+  const cli = fake({ detail: PUBLISHED, slow: { unpreview: 3_000 } })
+  const { clock, nexus, mount } = await boot($, on, cli)
+  await nexus(`open ${ID}`)
+  const ui = await mount()
+  await ui.press({ key: 'key-i' })
+  expect(await shows(ui, /^Previews 3$/)).toBe(true)
+  expect((await ui.find({ type: 'Button', key: 'key-x' }))?.props.label).toBe('unpublish a preview')
+  expect(await closeKeys(ui)).toEqual([])
+  await ui.press({ key: 'key-x' })
+  // Only the linked port's preview can be closed; the digits leave Ports meanwhile.
+  expect(await closeKeys(ui)).toEqual([['close-5173', '1']])
+  expect(await hotkeys(ui)).not.toContain('2')
+  expect((await ui.find({ type: 'Button', key: 'key-x' }))?.props.label).toBe('cancel unpublish')
+  expect(await shows(ui, "A preview's digit unpublishes it. Publishing the port again may give it a new URL.")).toBe(true)
+  await ui.press({ key: 'close-5173' })
+  expect(cli.spawns).toContainEqual(['unpreview', '--json', ID, '5173'])
+  expect(await shows(ui, new RegExp(`^●port-5173closing…${OPENED.url}$`), 'Box')).toBe(true)
+  expect(await ui.find({ type: 'Link', text: OPENED.url })).toBeUndefined()
+  expect(await closeKeys(ui)).toEqual([])
+  // Nothing else to unpublish while it closes.
+  expect(await ui.find({ type: 'Button', key: 'key-x' })).toBeUndefined()
+  const polled = cli.spawns.filter(argv => argv[0] === 'show').length
+  await clock.advance(3_000)
+  expect(cli.spawns.filter(argv => argv[0] === 'show').length).toBeGreaterThan(polled)
+  // Closed: Ports lists it again, publishable on its digit, before the details catch up.
+  expect(await shows(ui, /^Previews 2$/)).toBe(true)
+  expect(await shows(ui, /^Ports 2$/)).toBe(true)
+  expect((await ui.find({ type: 'Button', key: 'port-5173' }))?.props).toMatchObject({ hotkey: '1' })
+  expect((await ui.find({ type: 'Button', key: 'port-5173' }))?.text).toBe('● 5173 no preview yet; press to open one')
+  expect(await ui.find({ type: 'Button', key: 'key-x' })).toBeUndefined()
+  cli.detail = DETAIL
+  await clock.advance(5_000)
+  expect((await ui.find({ type: 'Button', key: 'port-5173' }))?.text).toBe('● 5173 no preview yet; press to open one')
+  expect(cli.spawns.filter(argv => argv[0] === 'unpreview')).toHaveLength(1)
+})
+
+test('a preview that does not close says why on its row and keeps its link; an old CLI names the version it needs', async ($, on) => {
+  const cli = fake({ detail: PUBLISHED, fail: { unpreview: { exitCode: 2, error: 'the node firebat cannot be reached' } } })
+  const { nexus, mount } = await boot($, on, cli)
+  await nexus(`open ${ID}`)
+  const ui = await mount()
+  await ui.press({ key: 'key-i' })
+  await ui.press({ key: 'key-x' })
+  await ui.press({ key: 'close-5173' })
+  expect((await ui.find({ type: 'Text', text: /the node firebat cannot be reached\.$/ }))?.props).toMatchObject({ color: 'error' })
+  expect(await ui.find({ type: 'Link', text: OPENED.url })).toBeDefined()
+  cli.fail.unpreview = { exitCode: 64, error: 'unknown command unpreview' }
+  await ui.press({ key: 'key-x' })
+  await ui.press({ key: 'close-5173' })
+  expect(await shows(ui, /nexus has no unpreview command: unpublishing a preview needs Nexus CLI 0.3.0 or later \(nexus --version\)\.$/)).toBe(true)
+})
+
+test('a publish still waiting is not offered for unpublishing, even once the details list its preview', async ($, on) => {
+  const cli = fake({ slow: { preview: 10_000 } })
+  const { clock, nexus, mount } = await boot($, on, cli)
+  await nexus(`open ${ID}`)
+  const ui = await mount()
+  await ui.press({ key: 'key-i' })
+  await ui.press({ key: 'port-5173' })
+  // The control plane allocates the preview while `preview --wait` still waits for the node to serve it.
+  const allocated = { ...OPENED, ready: false }
+  cli.detail = { ...DETAIL, previews: [...DETAIL.previews, allocated], ports: DETAIL.ports.map(one => (one.port === 5173 ? { ...one, preview: allocated } : one)) }
+  await clock.advance(5_000)
+  expect(await hotkeys(ui)).not.toContain('x')
+  expect(await shows(ui, new RegExp(`^●port-5173opening…${OPENED.url}$`), 'Box')).toBe(true)
+  cli.detail = PUBLISHED
+  await clock.advance(5_000)
+  expect(await ui.find({ type: 'Link', text: OPENED.url })).toBeDefined()
+  expect(await hotkeys(ui)).toContain('x')
+})
+
+test('a publish under way is still known after leaving the thread and opening it again, and nothing else starts on its port', async ($, on) => {
+  const cli = fake({ slow: { preview: 20_000 } })
+  const { clock, nexus, mount } = await boot($, on, cli)
+  await nexus(`open ${ID}`)
+  const ui = await mount()
+  await ui.press({ key: 'key-i' })
+  await ui.press({ key: 'port-5173' })
+  await ui.press({ key: 'key-b' })
+  await ui.press({ key: 'key-b' })
+  expect(await ui.find({ type: 'Markdown' })).toBeUndefined()
+  await nexus(`open ${ID}`)
+  await ui.press({ key: 'key-i' })
+  expect((await ui.find({ type: 'Button', key: 'port-5173' }))?.text).toBe('● 5173 opening: publishing it and waiting for the node to serve its URL…')
+  // The control plane lists the allocated preview while `preview --wait` still waits.
+  const allocated = { ...OPENED, ready: false }
+  cli.detail = { ...DETAIL, previews: [...DETAIL.previews, allocated], ports: DETAIL.ports.map(one => (one.port === 5173 ? { ...one, preview: allocated } : one)) }
+  await clock.advance(5_000)
+  expect(await hotkeys(ui)).not.toContain('x')
+  expect(await shows(ui, new RegExp(`^●port-5173opening…${OPENED.url}$`), 'Box')).toBe(true)
+  await clock.advance(15_000)
+  expect(await ui.find({ type: 'Link', text: OPENED.url })).toBeDefined()
+  expect(cli.spawns.filter(argv => argv[0] === 'preview' || argv[0] === 'unpreview')).toHaveLength(1)
+})
+
+test('the details asked for right after a publish ends count, even in the same millisecond: a preview another client closed at once does not linger', async ($, on) => {
+  const cli = fake({ slow: { preview: 3_000 }, publishes: false })
+  const { clock, nexus, mount } = await boot($, on, cli)
+  await nexus(`open ${ID}`)
+  const ui = await mount()
+  await ui.press({ key: 'key-i' })
+  await ui.press({ key: 'port-5173' })
+  const polled = cli.spawns.filter(argv => argv[0] === 'show').length
+  await clock.advance(3_000)
+  expect(cli.spawns.filter(argv => argv[0] === 'show').length).toBe(polled + 1)
+  expect(await ui.find({ type: 'Link', text: OPENED.url })).toBeUndefined()
+  expect((await ui.find({ type: 'Button', key: 'port-5173' }))?.text).toBe('● 5173 no preview yet; press to open one')
+})
+
+test('a port unpublished then published again before the details catch up stays under Ports, and says why the publish failed', async ($, on) => {
+  const cli = fake({ detail: PUBLISHED })
+  const { clock, nexus, mount } = await boot($, on, cli)
+  await nexus(`open ${ID}`)
+  const ui = await mount()
+  await ui.press({ key: 'key-i' })
+  // From here the details lag: every `show` hangs, so the pane keeps the snapshot that lists the preview.
+  cli.slow.show = 600_000
+  await ui.press({ key: 'key-x' })
+  await ui.press({ key: 'close-5173' })
+  expect(await shows(ui, /^Previews 2$/)).toBe(true)
+  cli.slow.preview = 3_000
+  cli.fail.preview = { exitCode: 1, error: 'the node did not serve the preview within 120 s' }
+  await ui.press({ key: 'port-5173' })
+  expect(await shows(ui, /^Previews 2$/)).toBe(true)
+  expect((await ui.find({ type: 'Button', key: 'port-5173' }))?.text).toBe('● 5173 opening: publishing it and waiting for the node to serve its URL…')
+  await clock.advance(3_000)
+  expect(await shows(ui, /^Previews 2$/)).toBe(true)
+  expect(await ui.find({ type: 'Link', text: OPENED.url })).toBeUndefined()
+  expect((await ui.find({ type: 'Button', key: 'port-5173' }))?.text).toBe('● 5173 did not open; press again to retry')
+  expect((await ui.find({ type: 'Text', text: /the node did not serve the preview within 120 s\.$/ }))?.props).toMatchObject({ color: 'error' })
+})
+
+test("no unpublish is offered for a service's preview, nor for an archived thread's", async ($, on) => {
+  const cli = fake()
+  const { clock, nexus, mount } = await boot($, on, cli)
+  await nexus(`open ${ID}`)
+  const ui = await mount()
+  await ui.press({ key: 'key-i' })
+  expect(await hotkeys(ui)).not.toContain('x')
+  const archived = { ...THREAD, status: 'archived', agentTurnRunning: false }
+  cli.detail = { ...PUBLISHED, thread: archived }
+  await clock.advance(5_000)
+  expect(await ui.find({ type: 'Link', text: OPENED.url })).toBeUndefined()
+  expect(await shows(ui, /^●port-5173paused/, 'Box')).toBe(true)
+  expect(await hotkeys(ui)).not.toContain('x')
 })
 
 test('with no port to open, Ports says why: nothing listens and the ::1 hint, a pylon not running, or ports unknown', async ($, on) => {
