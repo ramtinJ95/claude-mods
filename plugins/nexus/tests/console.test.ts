@@ -411,6 +411,34 @@ test('o and Enter on the tab open the block under the cursor, k moves it up, and
   expect(cli.copied).toEqual(['Fixed: the regex rejected plus addressing.'])
 })
 
+test("a burst of changes lands in the order typed, though the first one's write is slow", async ($, on) => {
+  let isReleased = false
+  let isHeld = false
+  const drafts: string[] = []
+  // The write of the first change waits until the second has had its chance to write: out of order, the second lands
+  // first and the first, written again on the newer version, ends on top.
+  on('state.set', async (_, e, next) => {
+    if (e.key !== 'pane' || e.value?.draft === e.previous?.draft) return next(e)
+    if (e.value.draft === 'one' && !isHeld) {
+      isHeld = true
+      for (let turn = 0; turn < 200 && !isReleased; turn++) await Promise.resolve()
+    }
+    const landed = await next(e)
+    if (landed.value?.isSet !== false) drafts.push(e.value.draft)
+    if (e.value.draft === 'one two') isReleased = true
+    return landed
+  })
+  const cli = fake()
+  cli.watch = [{ type: 'reset', thread: ID, entries: ENTRIES.slice(0, -1) }, state('idle'), live()]
+  const { nexus, mount } = await boot($, on, cli)
+  await nexus(`open ${ID}`)
+  const ui = await mount()
+  await keys(ui, 'i')
+  const key = await field(ui, 'compose')
+  await Promise.all([ui.input({ key, text: 'one', kind: 'change' }), ui.input({ key, text: 'one two', kind: 'change' })])
+  expect(drafts.at(-1)).toBe('one two')
+})
+
 test('i writes in insert mode: the composer sends while the run is idle, and an empty Enter is back to normal mode', async ($, on) => {
   const cli = fake()
   cli.watch = [{ type: 'reset', thread: ID, entries: ENTRIES.slice(0, -1) }, state('idle'), live()]

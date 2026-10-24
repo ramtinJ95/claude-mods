@@ -676,6 +676,18 @@ async function putBack<Field extends string>(
   if (name) await focusOn($, fieldKey(pane.fields, name))
 }
 
+/**
+ * Runs the pane's field changes one after another, in the order the engine delivered them. Each handler answers the
+ * engine at once and writes later, and `update` tries again when its write misses: a burst (held backspace, fast
+ * typing) could otherwise land out of order, the older text written last. A submit's snapshot queues here too.
+ */
+let fieldTurn: Promise<unknown> = Promise.resolve()
+function inTurn<T>(fn: () => Promise<T>): Promise<T> {
+  const turn = fieldTurn.then(fn)
+  fieldTurn = turn.catch(() => undefined)
+  return turn
+}
+
 /** Whether the field drawn as `key` is still drawn so: a put draws it anew, and keys typed into the old one go with it. */
 const isDrawn = (pane: NexusPane, key: string) => fieldKey(pane.fields, fieldOf(key)) === key
 
@@ -1309,9 +1321,9 @@ function paneActions($: EngineInterface, surface: RenderSurface): PaneActions {
       }),
     // Each change of the filter opens the closed groups it matches afresh, as the dashboard's does, so a group the
     // person folded or opened before follows the new filter.
-    filter: (text, at) => run(() => update($, paneAtom, pane => (isDrawn(pane, at) ? filtered(pane, text) : pane))),
+    filter: (text, at) => run(() => inTurn(() => update($, paneAtom, pane => (isDrawn(pane, at) ? filtered(pane, text) : pane)))),
     filterDone: text =>
-      run(async () => {
+      run(() => inTurn(async () => {
         const { threads } = await read($, listAtom)
         // Enter's text is the filter, though its last change may not have landed yet, so its first match is read from
         // the list here, not from a drawing made for an older filter. An empty filter keeps every thread, so the cursor
@@ -1322,34 +1334,36 @@ function paneActions($: EngineInterface, surface: RenderSurface): PaneActions {
           return { ...next, mode: 'normal', listCursor: first?.id ?? was.listCursor, listTop: 0, fields: putFields(was.fields, { [FILTER]: text }) }
         })
         await focusRing($, pane)
-      }),
-    draft: text => run(() => update($, paneAtom, pane => ({ ...pane, draft: text }))),
+      })),
+    draft: text => run(() => inTurn(() => update($, paneAtom, pane => ({ ...pane, draft: text })))),
     submit: text =>
       run(async () => {
         // An empty Enter is back to normal mode; a sent message keeps the composer, as Claude Code's prompt does.
         if (!text.trim()) {
-          await setPane($, () => ({ mode: 'normal' }))
+          await inTurn(() => setPane($, () => ({ mode: 'normal' })))
           return focusRing($, await read($, paneAtom))
         }
-        await setPane($, () => ({ draft: '' }))
+        await inTurn(() => setPane($, () => ({ draft: '' })))
         await onShown(id => send($, id, text.trim()))
       }),
     back: () => run(back),
     startDraft: (change, at) =>
-      run(() => update($, paneAtom, pane => (pane.start && (at === undefined || isDrawn(pane, at)) ? { ...pane, start: { ...pane.start, ...change, error: null } } : pane))),
+      run(() => inTurn(() => update($, paneAtom, pane => (pane.start && (at === undefined || isDrawn(pane, at)) ? { ...pane, start: { ...pane.start, ...change, error: null } } : pane)))),
     startProject: project =>
       run(() =>
-        update($, paneAtom, pane =>
-          pane.start ? { ...pane, start: { ...pane.start, project, node: '', branch: '', error: null }, fields: putFields(pane.fields, { [START_KEYS.branch]: '' }) } : pane,
+        inTurn(() =>
+          update($, paneAtom, pane =>
+            pane.start ? { ...pane, start: { ...pane.start, project, node: '', branch: '', error: null }, fields: putFields(pane.fields, { [START_KEYS.branch]: '' }) } : pane,
+          ),
         ),
       ),
     startSubmit: change =>
       run(async () => {
         // What starts is the form as Enter left it: the engine empties the field at once, and typing there after Enter
-        // is the next draft's.
-        const { start: sent } = await setStart($, change ?? {})
-        if (change) await putBack($, START_KEYS, change, pane => pane.start)
+        // is the next draft's. A form still open once the start is answered gets Enter's text back, if not typed over.
+        const { start: sent } = await inTurn(() => setStart($, change ?? {}))
         await submitStart($, sent)
+        if (change) await inTurn(() => putBack($, START_KEYS, change, pane => pane.start))
       }),
   }
 }
