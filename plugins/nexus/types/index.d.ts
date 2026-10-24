@@ -170,6 +170,8 @@ export type NexusStartDraft = {
   isStarting: boolean
   /** The submission this form waits on, 0 before its first: a start that ends checks it is still the form's. */
   request: number
+  /** The field or element the person moved the ring to, which the message's rows follow. */
+  focused: string | null
 }
 
 export type NexusView = 'list' | 'thread' | 'start'
@@ -205,6 +207,12 @@ export type NexusPortChange = {
   failure: { action: 'open' | 'close'; message: string } | null
 }
 
+/**
+ * A text field's `value` and how many times the pane has put one there. The field is drawn under a key of its own for
+ * each put (`fieldKey`), so the engine shows the put text, never the typing under an older key.
+ */
+export type NexusField = { text: string; puts: number }
+
 export type NexusPane = {
   view: NexusView
   tab: NexusTab
@@ -218,6 +226,12 @@ export type NexusPane = {
   listCursor: string | null
   /** The list's first row shown, as last scrolled; each drawing clamps it so the cursor shows. */
   listTop: number
+  /**
+   * The pane took the keys back without the person asking (`recover`) and put the ring on the list's cursor. An Enter
+   * typed for the field the keys left may still be on its way, so the next Enter on a row opens nothing and says what
+   * a second would open. The person's next key or move of the ring clears it.
+   */
+  isRetaken: boolean
   scroll: NexusScroll
   /** The details' first row shown. */
   detailsTop: number
@@ -226,9 +240,11 @@ export type NexusPane = {
   /** The folds, tool rows and closed-thread groups the person opened or closed, by key; the rest follow the defaults. */
   toggled: Record<string, boolean>
   filter: string
-  /** The message typed so far, kept so a redraw does not lose it. */
+  /** The composer's text as the person typed it, for the rows it takes. */
   draft: string
   start: NexusStartDraft | null
+  /** What the pane last put in each text field, by the field's name (`putFields`). */
+  fields: Record<string, NexusField>
   /** The outcome of the last press, until the next one. */
   notice: { text: string; tone: 'error' | 'dim' } | null
   /**

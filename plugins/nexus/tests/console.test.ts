@@ -1,8 +1,9 @@
 import { expect, test, type TestBody } from 'claude-code/testing'
 
-import { KEYMAP } from '../hooks/keys'
-import { cutTree, ringOf } from '../hooks/view'
-import { DETAIL, ENTRIES, ID, OPENED, PATCH, PUBLISHED, THEME_KEYS, THREAD, THREADS, WEB_PREVIEW, boot, fake, live, state } from './fake-cli'
+import { KEYMAP, putFields } from '../hooks/keys'
+import type { NexusPane } from '../types'
+import { cutTree, editorRows, fieldRows, ringOf } from '../hooks/view'
+import { DETAIL, ENTRIES, ID, OPENED, PATCH, PUBLISHED, THEME_KEYS, THREAD, THREADS, WEB_PREVIEW, boot, fake, field, live, state, typing } from './fake-cli'
 
 type Ui = Awaited<ReturnType<Awaited<ReturnType<typeof boot>>['mount']>>
 
@@ -125,14 +126,55 @@ test('f filters by title in filter mode, opens a closed group it matches, and En
   await ui.press({ key: 'closed-web' })
   expect(await ui.find({ type: 'Button', key: 'th-9b0000000002' })).toBeUndefined()
   await keys(ui, 'f')
-  expect((await ui.find({ type: 'Input', key: 'filter' }))?.props.autoFocus).toBe(true)
+  expect((await ui.find({ type: 'Input', key: await field(ui, 'filter') }))?.props.autoFocus).toBe(true)
   expect(await mode(ui)).toBe('FILTER')
-  await ui.input({ key: 'filter', text: 'old', kind: 'change' })
+  const fields = typing(ui)
+  await fields.type('filter', 'old')
   expect((await ui.findAll({ type: 'Button' })).flatMap(one => (one.props.hotkey ? [] : [one.key]))).toEqual(['closed-web', 'th-9b0000000002'])
-  await ui.input({ key: 'filter', text: 'old' })
+  await fields.submit('filter')
   expect(await mode(ui)).toBe('NORMAL')
   expect(await cursorOn(ui)).toBe('th-9b0000000002')
   expect(await shows(ui, /^⌕ old/)).toBe(true)
+  // f edits the filter kept, though Enter emptied its field.
+  await keys(ui, 'f')
+  expect(await fields.shows('filter')).toBe('old')
+  // Enter keeps the text it sent, though the change that typed it has not landed.
+  await fields.submit('filter', { typing: 'old idea' })
+  expect(await shows(ui, /^⌕ old idea/)).toBe(true)
+  await keys(ui, 'f')
+  expect(await fields.shows('filter')).toBe('old idea')
+})
+
+test("Enter puts the cursor on the first thread its own filter keeps, though the filter's change has not landed", async ($, on) => {
+  const cli = fake()
+  const { nexus, mount } = await boot($, on, cli)
+  await nexus('')
+  const ui = await mount()
+  await keys(ui, 'h')
+  // The cursor is on Fix login form 500s, which "o" keeps, but API docs comes first.
+  expect(await cursorOn(ui)).toBe(ID)
+  await keys(ui, 'f')
+  const fields = typing(ui)
+  await fields.submit('filter', { typing: 'o' })
+  expect(await cursorOn(ui)).toBe('th-7c0000000003')
+})
+
+test('Enter in a filter emptied again opens nothing and leaves the cursor where it was', async ($, on) => {
+  const cli = fake()
+  const { nexus, mount } = await boot($, on, cli)
+  await nexus('')
+  const ui = await mount()
+  await keys(ui, 'hj')
+  const before = await cursorOn(ui)
+  expect(before).not.toBe(ID)
+  await keys(ui, 'f')
+  const fields = typing(ui)
+  await fields.type('filter', 'old')
+  await fields.type('filter', '')
+  await fields.submit('filter')
+  expect(await mode(ui)).toBe('NORMAL')
+  expect(await cursorOn(ui)).toBe(before)
+  expect(await shows(ui, /^◆ Nexus\s/)).toBe(true)
 })
 
 test('Esc from the filter, which hands the keys to the prompt, clears it and takes them back', async ($, on) => {
@@ -142,7 +184,7 @@ test('Esc from the filter, which hands the keys to the prompt, clears it and tak
   const ui = await mount()
   await keys(ui, 'h')
   await keys(ui, 'f')
-  await ui.input({ key: 'filter', text: 'old', kind: 'change' })
+  await ui.input({ key: await field(ui, 'filter'), text: 'old', kind: 'change' })
   const opens = cli.opens
   await ui.redraw({ title: 'Nexus', isFocused: false, bodyColumns: 100, placement: 'dock', scroll: { offset: 0, bodyRows: 60 }, view: {} } as never)
   expect(await shows(ui, /the keys are at the prompt/)).toBe(true)
@@ -150,8 +192,37 @@ test('Esc from the filter, which hands the keys to the prompt, clears it and tak
   expect(cli.opens).toBe(opens + 1)
   await ui.redraw({ title: 'Nexus', isFocused: true, bodyColumns: 100, placement: 'dock', scroll: { offset: 0, bodyRows: 60 }, view: {} } as never)
   expect(await mode(ui)).toBe('NORMAL')
-  expect(await ui.find({ type: 'Input', key: 'filter' })).toBeUndefined()
+  expect(await ui.find({ type: 'Input', key: await field(ui, 'filter') })).toBeUndefined()
   expect(await ui.find({ type: 'Button', key: 'th-7c0000000003' })).toBeDefined()
+})
+
+test('after the pane takes the keys back unasked, Enter on the row the ring lands on says what it would open first', async ($, on) => {
+  const cli = fake()
+  const { clock, nexus, mount } = await boot($, on, cli)
+  await nexus('')
+  const ui = await mount()
+  await keys(ui, 'hf')
+  await ui.input({ key: await field(ui, 'filter'), text: 'old', kind: 'change' })
+  // The keys left the filter without an Enter, as Esc or the engine moving them takes them: an Enter typed for the
+  // filter may come after the pane takes them back.
+  await ui.redraw({ title: 'Nexus', isFocused: false, bodyColumns: 100, placement: 'dock', scroll: { offset: 0, bodyRows: 60 }, view: {} } as never)
+  await clock.advance(1)
+  await ui.redraw({ title: 'Nexus', isFocused: true, bodyColumns: 100, placement: 'dock', scroll: { offset: 0, bodyRows: 60 }, view: {} } as never)
+  const row = await cursorOn(ui)
+  expect(row).toBe(ID)
+  await ui.press({ key: ID })
+  expect(await shows(ui, /^◆ Nexus\s/)).toBe(true)
+  expect(await shows(ui, 'The pane took the keys back after losing them, so that Enter opened nothing. Enter again opens Fix login form 500s.')).toBe(true)
+  await ui.press({ key: ID })
+  expect(await shows(ui, /^‹ web \/ Fix login form 500s$/)).toBe(true)
+  // A key the person presses first is theirs: Enter then opens at once.
+  await keys(ui, 'hf')
+  await ui.redraw({ title: 'Nexus', isFocused: false, bodyColumns: 100, placement: 'dock', scroll: { offset: 0, bodyRows: 60 }, view: {} } as never)
+  await clock.advance(1)
+  await ui.redraw({ title: 'Nexus', isFocused: true, bodyColumns: 100, placement: 'dock', scroll: { offset: 0, bodyRows: 60 }, view: {} } as never)
+  await keys(ui, 'jk')
+  await ui.press({ key: ID })
+  expect(await shows(ui, /^‹ web \/ Fix login form 500s$/)).toBe(true)
 })
 
 test('a thread draws as a Claude Code transcript: prompts, ⏺ answers in Markdown, tool calls with ⎿ results, edits as diffs', async ($, on) => {
@@ -180,7 +251,7 @@ test('a thread draws as a Claude Code transcript: prompts, ⏺ answers in Markdo
   expect((await ui.find({ type: 'Button', key: 'fold-r-a' }))?.text).toBe('⏺ Read 4 files, ran 1 command · 1 running (5 steps, o to fold)')
   expect((await ui.find({ type: 'Text', text: /Working…/ }))?.text).toBe('· Working… (1m 12s · 7 tools this turn · new messages queue · m to abort)')
   expect((await ui.find({ type: 'Text', text: /^· Working… $/ }))?.props.color).toBe('claude')
-  expect((await ui.find({ type: 'Input', key: 'compose' }))?.props.placeholder).toBe('Queue a follow-up…  (i to write)')
+  expect((await ui.find({ type: 'Input', key: await field(ui, 'compose') }))?.props.placeholder).toBe('Queue a follow-up…  (i to write)')
   expect(await mode(ui)).toBe('NORMAL')
   expect(await hotkeys(ui)).toEqual(LETTERS)
   await expectThemeColours(ui)
@@ -340,22 +411,194 @@ test('o and Enter on the tab open the block under the cursor, k moves it up, and
   expect(cli.copied).toEqual(['Fixed: the regex rejected plus addressing.'])
 })
 
+test("a burst of changes lands in the order typed, though the first one's write is slow", async ($, on) => {
+  let isReleased = false
+  let isHeld = false
+  const drafts: string[] = []
+  // The write of the first change waits until the second has had its chance to write: out of order, the second lands
+  // first and the first, written again on the newer version, ends on top.
+  on('state.set', async (_, e, next) => {
+    if (e.key !== 'pane' || e.value?.draft === e.previous?.draft) return next(e)
+    if (e.value.draft === 'one' && !isHeld) {
+      isHeld = true
+      for (let turn = 0; turn < 200 && !isReleased; turn++) await Promise.resolve()
+    }
+    const landed = await next(e)
+    if (landed.value?.isSet !== false) drafts.push(e.value.draft)
+    if (e.value.draft === 'one two') isReleased = true
+    return landed
+  })
+  const cli = fake()
+  cli.watch = [{ type: 'reset', thread: ID, entries: ENTRIES.slice(0, -1) }, state('idle'), live()]
+  const { nexus, mount } = await boot($, on, cli)
+  await nexus(`open ${ID}`)
+  const ui = await mount()
+  await keys(ui, 'i')
+  const key = await field(ui, 'compose')
+  await Promise.all([ui.input({ key, text: 'one', kind: 'change' }), ui.input({ key, text: 'one two', kind: 'change' })])
+  expect(drafts.at(-1)).toBe('one two')
+})
+
 test('i writes in insert mode: the composer sends while the run is idle, and an empty Enter is back to normal mode', async ($, on) => {
   const cli = fake()
   cli.watch = [{ type: 'reset', thread: ID, entries: ENTRIES.slice(0, -1) }, state('idle'), live()]
   const { nexus, mount } = await boot($, on, cli)
   await nexus(`open ${ID}`)
   const ui = await mount()
-  expect((await ui.find({ type: 'Input', key: 'compose' }))?.props).toMatchObject({ placeholder: 'Message the agent…  (i to write)', submitLabel: 'send' })
+  expect((await ui.find({ type: 'Input', key: await field(ui, 'compose') }))?.props).toMatchObject({ placeholder: 'Message the agent…  (i to write)', submitLabel: 'send' })
   await keys(ui, 'i')
-  expect((await ui.find({ type: 'Input', key: 'compose' }))?.props).toMatchObject({ placeholder: 'Message the agent…', autoFocus: true })
+  expect((await ui.find({ type: 'Input', key: await field(ui, 'compose') }))?.props).toMatchObject({ placeholder: 'Message the agent…', autoFocus: true })
   expect(await mode(ui)).toBe('INSERT')
-  await ui.input({ key: 'compose', text: '-n add a test' })
+  await ui.input({ key: await field(ui, 'compose'), text: '-n add a test' })
   expect(cli.runs).toContainEqual(['send', '--json', ID, '--', '-n add a test'])
   expect(await mode(ui)).toBe('INSERT')
-  await ui.input({ key: 'compose', text: '' })
+  await ui.input({ key: await field(ui, 'compose'), text: '' })
   expect(await mode(ui)).toBe('NORMAL')
-  expect(await ui.find({ type: 'Input', key: 'compose' })).toBeDefined()
+  expect(await ui.find({ type: 'Input', key: await field(ui, 'compose') })).toBeDefined()
+})
+
+test('the composer and the start form grow a row for each the draft wraps to, a quarter of the pane at most, two while they have the keys', async ($, on) => {
+  const cli = fake()
+  cli.watch = [{ type: 'reset', thread: ID, entries: ENTRIES.slice(0, -1) }, state('idle'), live()]
+  const { nexus, mount } = await boot($, on, cli)
+  await nexus(`open ${ID}`)
+  const ui = await mount(60, 40)
+  const rows = async (name: string) => (await ui.find({ type: 'Input', key: await field(ui, name) }))?.props.rows
+  const words = (count: number) => Array(count).fill('word').join(' ')
+  expect(await rows('compose')).toBe(1)
+  // Two rows in insert mode, so \⏎ types a newline rather than submitting.
+  await keys(ui, 'i')
+  expect(await rows('compose')).toBe(2)
+  // 57 cells after `❯: `, less the hint: 31 once it names shift+⏎ for a newline, six words a row.
+  await ui.input({ key: await field(ui, 'compose'), text: words(11), kind: 'change' })
+  expect(await rows('compose')).toBe(2)
+  await ui.input({ key: await field(ui, 'compose'), text: words(20), kind: 'change' })
+  expect(await rows('compose')).toBe(4)
+  await ui.input({ key: await field(ui, 'compose'), text: 'one\ntwo\nthree', kind: 'change' })
+  expect(await rows('compose')).toBe(3)
+  await ui.input({ key: await field(ui, 'compose'), text: words(80), kind: 'change' })
+  expect(await rows('compose')).toBe(6)
+  // The field keeps the typing: it is drawn with what the pane last put there, so a burst of keys is never undone.
+  expect((await ui.find({ type: 'Input', key: await field(ui, 'compose') }))?.props.value).toBe('')
+  await ui.input({ key: await field(ui, 'compose'), text: '', kind: 'change' })
+  expect(await rows('compose')).toBe(2)
+  await ui.input({ key: await field(ui, 'compose'), text: '' })
+  expect(await mode(ui)).toBe('NORMAL')
+  expect(await rows('compose')).toBe(1)
+
+  await keys(ui, 'h')
+  await keys(ui, 'n')
+  expect(await rows('start-message')).toBe(1)
+  // `Message: ` leaves 51 cells, 43 after ` ⏎ start`; the newline key's hint never fits beside it: eight words a row.
+  await ui.input({ key: await field(ui, 'start-message'), text: words(8), kind: 'change' })
+  expect(await rows('start-message')).toBe(1)
+  await ui.input({ key: await field(ui, 'start-message'), text: words(20), kind: 'change' })
+  expect(await rows('start-message')).toBe(3)
+  await ui.input({ key: await field(ui, 'start-message'), text: '', kind: 'change' })
+  expect(await rows('start-message')).toBe(1)
+
+  await ui.unmount()
+  const short = await mount(60, 12)
+  await short.input({ key: await field(short, 'start-message'), text: words(80), kind: 'change' })
+  expect((await short.find({ type: 'Input', key: await field(short, 'start-message') }))?.props.rows).toBe(3)
+})
+
+test("a field's rows are the rows the engine wraps its text to, a cell short of its columns for the cursor", async () => {
+  // Each count is what `Bun.wrapAnsi(text, columns - 1, { hard: true, trim: false })` gives, as the editor wraps.
+  const wraps: [text: string, columns: number, rows: number][] = [
+    ['x'.repeat(30), 31, 1],
+    ['x'.repeat(31), 31, 2],
+    ['x'.repeat(61), 31, 3],
+    ['word '.repeat(6).trim(), 31, 1],
+    ['word '.repeat(7).trim(), 31, 2],
+    [`${'x'.repeat(29)} y`, 31, 2],
+    [`${'x'.repeat(30)} y`, 31, 2],
+    [`${'x'.repeat(28)} ${'z'.repeat(40)}`, 31, 3],
+    ['one\n\ntwo', 31, 3],
+    ['漢字'.repeat(8), 31, 2],
+    ['⌚'.repeat(15), 31, 1],
+    ['✅'.repeat(16), 31, 2],
+    [`${'x'.repeat(30)}\r\ny`, 31, 2],
+  ]
+  expect(wraps.map(([text, columns]) => editorRows(text, columns))).toEqual(wraps.map(([, , rows]) => rows))
+  // At 60 columns the composer's hint leaves 31: 61 letters take three rows of 30.
+  expect(fieldRows('x'.repeat(61), '❯', 'send', 60, 40, true)).toBe(3)
+})
+
+test('a field shows the text Enter or Start would submit: after another thread, Start again, a project and a close', async ($, on) => {
+  const failure = 'setup failed: git clone exited 128'
+  const [archived, idle] = [THREADS[1]!.id, THREADS[2]!.id]
+  const cli = fake()
+  let held: NexusPane | undefined
+  on('state.set', async (_, e, next) => {
+    const set = await next(e)
+    if (e.key === 'pane' && set.value?.isSet) held = e.value as NexusPane
+    return set
+  })
+  const pane = async () => held!
+  const { nexus, mount } = await boot($, on, cli)
+  const watchOf = (thread: string, extra: Record<string, unknown>) => [{ type: 'reset', thread, entries: [] }, { ...state('idle', extra), thread }, live({ thread })]
+  await nexus(`open ${ID}`)
+  let ui = await mount()
+  let fields = typing(ui)
+  await keys(ui, 'i')
+  await fields.type('compose', 'for the first thread only')
+  expect(await fields.shows('compose')).toBe((await pane()).draft)
+  // A thread without a composer between two with one never draws the empty composer it was given.
+  cli.watch = watchOf(archived, { status: 'archived', pylon: 'paused' })
+  await nexus(`open ${archived}`)
+  expect(await fields.shows('compose')).toBeUndefined()
+  cli.watch = watchOf(idle, {})
+  await nexus(`open ${idle}`)
+  expect(await fields.shows('compose')).toBe('')
+  expect((await pane()).draft).toBe('')
+
+  // Start again puts the same title each time: the second still replaces what was typed over the first.
+  cli.detail = { ...DETAIL, pylon: { ...DETAIL.pylon, actualState: 'failed', failed: failure } }
+  cli.watch = watchOf(ID, { pylon: 'failed', failed: failure })
+  await nexus(`open ${ID}`)
+  await keys(ui, 'm')
+  await ui.press({ key: 'menu-start-again' })
+  expect(await fields.shows('start-title')).toBe('Fix login form 500s')
+  await fields.type('start-title', 'Edited')
+  await fields.type('start-branch', 'dev')
+  await ui.press({ key: 'start-cancel' })
+  await keys(ui, 'm')
+  await ui.press({ key: 'menu-start-again' })
+  const form = (await pane()).start!
+  expect(await fields.shows('start-title')).toBe(form.title)
+  expect(await fields.shows('start-branch')).toBe(form.branch)
+  expect(form.title).toBe('Fix login form 500s')
+  await fields.type('start-branch', 'dev')
+  await ui.select({ key: 'start-project', value: 'api' })
+  expect(await fields.shows('start-branch')).toBe((await pane()).start!.branch)
+
+  // A closed pane's fields forget what was typed; open again, they show what the pane holds.
+  await fields.type('start-message', 'build it')
+  await nexus('close')
+  await ui.unmount()
+  await nexus('')
+  ui = await mount()
+  fields = typing(ui)
+  const reopened = (await pane()).start!
+  expect(await fields.shows('start-title')).toBe(reopened.title)
+  expect(await fields.shows('start-message')).toBe('build it')
+  expect(reopened.message).toBe('build it')
+  await ui.press({ key: 'start-submit' })
+  expect(cli.runs).toContainEqual(['start', '--json', '--project=api', '--title=Fix login form 500s', '--message=build it'])
+
+  cli.detail = DETAIL
+  cli.watch = watchOf(idle, {})
+  await nexus(`open ${idle}`)
+  await keys(ui, 'i')
+  await fields.type('compose', 'kept over a close')
+  await nexus('close')
+  await ui.unmount()
+  await nexus('')
+  ui = await mount()
+  fields = typing(ui)
+  expect(await fields.shows('compose')).toBe('kept over a close')
+  expect((await pane()).draft).toBe('kept over a close')
 })
 
 test('Esc from the composer, which hands the keys to the prompt, is back to normal mode with the keys taken back', async ($, on) => {
@@ -383,7 +626,7 @@ test("a composer the thread's change takes away leaves the letters to the keys: 
   const ui = await mount()
   await keys(ui, 'i')
   await clock.advance(5_000)
-  expect(await ui.find({ type: 'Input', key: 'compose' })).toBeUndefined()
+  expect(await ui.find({ type: 'Input', key: await field(ui, 'compose') })).toBeUndefined()
   expect(await shows(ui, /^An archived thread takes no messages/)).toBe(true)
   expect(await mode(ui)).toBe('NORMAL')
   await keys(ui, 'm')
@@ -609,8 +852,8 @@ test('m opens the Actions menu: j and k move its cursor, o runs the entry, q clo
   await nexus(`open ${ID}`)
   const ui = await mount()
   await keys(ui, 'i')
-  expect((await ui.find({ type: 'Input', key: 'compose' }))?.props).toMatchObject({ placeholder: 'Queue a follow-up…', submitLabel: 'queue' })
-  await ui.input({ key: 'compose', text: '' })
+  expect((await ui.find({ type: 'Input', key: await field(ui, 'compose') }))?.props).toMatchObject({ placeholder: 'Queue a follow-up…', submitLabel: 'queue' })
+  await ui.input({ key: await field(ui, 'compose'), text: '' })
   await keys(ui, 'm')
   expect(await menu(ui)).toEqual(['abort', 'archive', 'copy-attach', 'rewatch', 'delete'])
   expect(await cursorOn(ui)).toBe('menu-abort')
@@ -647,7 +890,7 @@ test('a failed pylon replaces the composer; the menu retries it or starts again 
   const ui = await mount()
   expect(await shows(ui, /^The planner gave up on this thread's pylon/)).toBe(true)
   expect((await ui.find({ type: 'Code', text: failure }))?.text).toBe(failure)
-  expect(await ui.find({ type: 'Input', key: 'compose' })).toBeUndefined()
+  expect(await ui.find({ type: 'Input', key: await field(ui, 'compose') })).toBeUndefined()
   await keys(ui, 'i')
   expect(await mode(ui)).toBe('NORMAL')
   await keys(ui, 'm')
@@ -657,7 +900,7 @@ test('a failed pylon replaces the composer; the menu retries it or starts again 
   await keys(ui, 'm')
   await ui.press({ key: 'menu-start-again' })
   expect(cli.runs).toContainEqual(['projects', '--json'])
-  expect((await ui.find({ type: 'Input', key: 'start-title' }))?.props.value).toBe('Fix login form 500s')
+  expect((await ui.find({ type: 'Input', key: await field(ui, 'start-title') }))?.props.value).toBe('Fix login form 500s')
   expect((await ui.find({ type: 'Select', key: 'start-project' }))?.props.value).toBe('web')
 })
 
@@ -805,7 +1048,7 @@ test('Ports lists the previews linked by their own URL and the ports with none, 
   await toPorts(ui)
   expect((await ui.findAll({ type: 'Link' })).map(link => [link.props.href, link.text])).toEqual([[WEB_PREVIEW.url, WEB_PREVIEW.url]])
   expect((await ui.find({ type: 'Button', key: 'preview-web' }))?.text).toBe('❯ ● web :3000  ready ')
-  expect(await shows(ui, /^ {4}⏎ or y copies the URL$/)).toBe(true)
+  expect(await shows(ui, /^⏎ or y copies the URL$/)).toBe(true)
   expect(await shows(ui, /^ {2}◐ api {2}starting https:\/\/rj-firebat\.example\.ts\.net:10202\/$/, 'Box')).toBe(true)
   // Each port once: 3000 has its preview above, so Ports lists the other two.
   expect(await shows(ui, /^PORTS 2 ─/, 'Box')).toBe(true)
@@ -884,7 +1127,7 @@ test("x unpublishes the linked preview under the cursor: closing… while the CL
   await toPorts(ui)
   expect(await shows(ui, /^PREVIEWS 3 ─/, 'Box')).toBe(true)
   await cursorTo(ui, 'preview-port-5173')
-  expect(await shows(ui, /^ {4}⏎ or y copies the URL · x unpublishes it \(a new publish may get a new URL\)$/)).toBe(true)
+  expect(await shows(ui, /^⏎ or y copies the URL · x unpublishes it \(a new publish may get a new URL\)$/)).toBe(true)
   await keys(ui, 'x')
   expect(cli.spawns).toContainEqual(['unpreview', '--json', ID, '5173'])
   expect((await ui.find({ type: 'Button', key: 'preview-port-5173' }))?.text).toMatch(/closing… $/)
@@ -1059,10 +1302,10 @@ test('the start form offers the projects and nodes, starts with every field it w
   expect(await shows(ui, 'Boots a pylon on firebat and checks out main.')).toBe(true)
   await ui.select({ key: 'start-project', value: 'api' })
   expect(await shows(ui, 'Boots a pylon on testbench and checks out trunk.')).toBe(true)
-  await ui.input({ key: 'start-title', text: 'New one', kind: 'change' })
+  await ui.input({ key: await field(ui, 'start-title'), text: 'New one', kind: 'change' })
   await ui.select({ key: 'start-node', value: 'firebat' })
-  await ui.input({ key: 'start-branch', text: 'dev', kind: 'change' })
-  await ui.input({ key: 'start-message', text: 'build it' })
+  await ui.input({ key: await field(ui, 'start-branch'), text: 'dev', kind: 'change' })
+  await ui.input({ key: await field(ui, 'start-message'), text: 'build it' })
   expect(cli.runs).toContainEqual(['start', '--json', '--project=api', '--title=New one', '--message=build it', '--node=firebat', '--branch=dev'])
   expect(cli.spawns).toContainEqual(['watch', 'th-123456789abc', '--json'])
   await expectThemeColours(ui)
@@ -1075,7 +1318,7 @@ test('a start the person left while it ran only says how it went', async ($, on)
   const ui = await mount()
   await keys(ui, 'h')
   await keys(ui, 'n')
-  await ui.input({ key: 'start-title', text: 'New one' })
+  await ui.input({ key: await field(ui, 'start-title'), text: 'New one' })
   await ui.press({ key: 'start-cancel' })
   await clock.advance(5_000)
   expect(cli.runs).toContainEqual(['start', '--json', '--project=web', '--title=New one'])
@@ -1091,11 +1334,11 @@ test('a start the person left for another form does not take that form over', as
   const ui = await mount()
   await keys(ui, 'h')
   await keys(ui, 'n')
-  await ui.input({ key: 'start-title', text: 'First' })
+  await ui.input({ key: await field(ui, 'start-title'), text: 'First' })
   await clock.advance(2_000)
   await ui.press({ key: 'start-cancel' })
   await keys(ui, 'n')
-  await ui.input({ key: 'start-title', text: 'Second' })
+  await ui.input({ key: await field(ui, 'start-title'), text: 'Second' })
   await clock.advance(3_000)
   // The first start ended: the second form stays, still starting.
   expect((await ui.find({ type: 'Button', key: 'start-submit' }))?.props.label).toBe('Starting…')
@@ -1113,7 +1356,7 @@ test('a start whose switch to the thread loses a race to a new form follows noth
   on('state.set', async (_, e, next) => {
     if (isRaced || e.key !== 'pane' || e.ifVersion === undefined || e.value.view !== 'thread' || e.value.selected !== 'th-123456789abc' || !e.previous?.start) return next(e)
     isRaced = true
-    const landed = await next({ ...e, value: { ...e.previous, start: { ...e.previous.start, title: 'Other', isStarting: false, request: -1 } } })
+    const landed = await next({ ...e, value: { ...e.previous, start: { ...e.previous.start, title: 'Other', isStarting: false, request: -1 }, fields: putFields(e.previous.fields, { 'start-title': 'Other' }) } })
     return landed.value ? { value: { isSet: false, version: landed.value.version } } : landed
   })
   const { clock, nexus, mount } = await boot($, on, cli)
@@ -1121,10 +1364,10 @@ test('a start whose switch to the thread loses a race to a new form follows noth
   const ui = await mount()
   await keys(ui, 'h')
   await keys(ui, 'n')
-  await ui.input({ key: 'start-title', text: 'New one' })
+  await ui.input({ key: await field(ui, 'start-title'), text: 'New one' })
   await clock.advance(5_000)
   expect(isRaced).toBe(true)
-  expect((await ui.find({ type: 'Input', key: 'start-title' }))?.props.value).toBe('Other')
+  expect((await ui.find({ type: 'Input', key: await field(ui, 'start-title') }))?.props.value).toBe('Other')
   expect(await shows(ui, 'Started New one.')).toBe(true)
   expect(cli.spawns.some(argv => argv[1] === 'th-123456789abc')).toBe(false)
 })
@@ -1136,7 +1379,7 @@ test('a start that ends after the pane closed watches nothing until the pane ope
   const ui = await mount()
   await keys(ui, 'h')
   await keys(ui, 'n')
-  await ui.input({ key: 'start-title', text: 'New one' })
+  await ui.input({ key: await field(ui, 'start-title'), text: 'New one' })
   await nexus('close')
   const watches = cli.spawns.filter(argv => argv[0] === 'watch').length
   await clock.advance(5_000)
@@ -1154,9 +1397,44 @@ test('a start the control plane refuses stays on the form with its reason', asyn
   await keys(ui, 'n')
   await ui.press({ key: 'start-submit' })
   expect(await shows(ui, 'Give the thread a title or a first message.')).toBe(true)
-  await ui.input({ key: 'start-title', text: 'Try it' })
+  const fields = typing(ui)
+  await fields.type('start-title', 'Try it')
+  await fields.submit('start-title')
   expect(await shows(ui, 'no image is current.')).toBe(true)
-  expect(await ui.find({ type: 'Input', key: 'start-title' })).toBeDefined()
+  // Enter emptied the title, which the form puts back so the next try sends what it shows.
+  expect(await fields.shows('start-title')).toBe('Try it')
+  // Typing while Enter's submit runs keeps the field, which the engine does not empty: no put goes over it.
+  const key = await field(ui, 'start-title')
+  await fields.submit('start-title', { during: () => fields.typeInto(key, 'Try it again') })
+  expect(await fields.shows('start-title')).toBe('Try it again')
+})
+
+test('Enter starts the text it delivered, and keys typed after it are the next draft', async ($, on) => {
+  const cli = fake({ fail: { start: { exitCode: 1, error: 'no image is current' } } })
+  const { nexus, mount } = await boot($, on, cli)
+  await nexus('')
+  const ui = await mount()
+  await keys(ui, 'n')
+  const fields = typing(ui)
+  await fields.type('start-title', 'Try it')
+  // The engine empties the field as soon as the submit's hooks answer, so the next keys land in it before the CLI runs.
+  const key = await field(ui, 'start-title')
+  await fields.submit('start-title', { during: () => fields.typeInto(key, 'zz') })
+  expect(await shows(ui, 'no image is current.')).toBe(true)
+  expect(cli.runs.filter(argv => argv[0] === 'start')).toEqual([['start', '--json', '--project=web', '--title=Try it']])
+  // The field keeps the keys, and the form holds them: the button sends what the field shows.
+  expect(await fields.shows('start-title')).toBe('zz')
+  await ui.press({ key: 'start-submit' })
+  expect(cli.runs.filter(argv => argv[0] === 'start').at(-1)).toEqual(['start', '--json', '--project=web', '--title=zz'])
+})
+
+test("a thread whose agent has not acted yet says never, as Details does, not the time since 1970", async ($, on) => {
+  const cli = fake({ threads: [{ ...THREAD, agentTurnRunning: false, lastAgentActivityAt: 0 }] })
+  const { nexus, mount } = await boot($, on, cli)
+  await nexus('')
+  const ui = await mount()
+  await keys(ui, 'h')
+  expect(await shows(ui, `    firebat · you 2 min · agent never · ${ID}`)).toBe(true)
 })
 
 test('a row or a show without a field docs/cli.md requires is a contract error, not a guess', async ($, on) => {

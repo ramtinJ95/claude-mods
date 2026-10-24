@@ -36,7 +36,7 @@ import type {
   NexusThreadRow,
   NexusWatch,
 } from '../types'
-import { COMPOSE, type Command, type Effect, FILTER, HELP, KEYMAP, type MenuAction, type Nav, type NavItem, blockAt, keepInView, scrolledRows } from './keys'
+import { COMPOSE, type Command, type Effect, FILTER, HELP, KEYMAP, type MenuAction, type Nav, type NavItem, blockAt, fieldKey, keepInView, scrolledRows } from './keys'
 import {
   ACTUAL_BADGE,
   type Block,
@@ -58,6 +58,7 @@ import {
   exitCode,
   foldSummary,
   groupThreads,
+  listOrder,
   linkedPort,
   NO_CHANGE,
   portChange,
@@ -111,15 +112,19 @@ export type PaneActions = {
   /** Opens or closes a fold, a tool row or a group's closed threads, as drawn now. */
   toggle: (key: string, isOpen: boolean) => void
   tab: (tab: NexusTab) => void
-  filter: (text: string) => void
-  /** Enter in the filter: back to normal mode, the cursor on the first thread it keeps. */
-  filterDone: (first: string | null) => void
+  /** A change of the filter, typed into the field drawn as `at`. */
+  filter: (text: string, at: string) => void
+  /** Enter in the filter: back to normal mode, the cursor on the first thread it keeps, or where it was when it is empty. */
+  filterDone: (text: string) => void
   draft: (text: string) => void
   submit: (text: string) => void
   back: () => void
-  startDraft: (change: Partial<NexusStartDraft>) => void
+  /** A change of the start form; `at` is the field it was typed into, as drawn. */
+  startDraft: (change: Partial<NexusStartDraft>, at?: string) => void
+  /** Picks the form's project, which clears the node and branch chosen for the one before. */
+  startProject: (project: string) => void
   /** Starts the thread, the field Enter was pressed in carrying its text: it may not have reported it yet. */
-  startSubmit: (change?: Partial<NexusStartDraft>) => void
+  startSubmit: (change?: Partial<Pick<NexusStartDraft, 'title' | 'branch' | 'message'>>) => void
 }
 
 
@@ -183,8 +188,8 @@ function TitleBar(draw: Draw, scene: Scene, left: RenderChildren, right: string)
   )
 }
 
-function Rule({ Text }: Draw, scene: Scene) {
-  return <Text color="subtle">{'─'.repeat(scene.width)}</Text>
+function Rule({ Text }: Draw, scene: Scene, color = 'subtle') {
+  return <Text color={color}>{'─'.repeat(scene.width)}</Text>
 }
 
 function SectionRule({ Box, Text }: Draw, scene: Scene, title: string, count: string, key: string) {
@@ -288,6 +293,81 @@ function wrapped(text: string, width: number): number {
   return text.split('\n').reduce((sum, line) => sum + Math.max(1, Math.ceil(cells(line) / room)), 0)
 }
 
+/** The most rows a field grows to; a short pane gives it a quarter of its rows, which the body above needs more. */
+const FIELD_ROWS = 6
+
+/**
+ * The rows a focused field's editor wraps `text` to in `columns`: as `Bun.wrapAnsi(text, columns - 1, { hard: true,
+ * trim: false })` does in 2.1.310, the last cell kept for the cursor. A word moves whole to the next row, keeping the
+ * space before it on the row it left, and one wider than a row breaks across rows.
+ */
+export function editorRows(text: string, columns: number): number {
+  const width = columns - 1
+  // The wrap reads a pasted `\r\n` as one line break.
+  return text.replace(/\r\n/g, '\n').split('\n').reduce((sum, line) => {
+    let rows = 1
+    let used = 0
+    for (const [index, word] of line.split(' ').entries()) {
+      if (index > 0) {
+        if (used >= width) {
+          rows += 1
+          used = 0
+        }
+        used += 1
+      }
+      const size = cells(word)
+      if (size > width) {
+        if (Math.floor((size - 1) / width) < 1 + Math.floor((size - (width - used) - 1) / width)) {
+          rows += 1
+          used = 0
+        }
+        const chars = [...word]
+        for (const [at, char] of chars.entries()) {
+          const taken = cells(char)
+          if (used + taken > width) {
+            rows += 1
+            used = 0
+          }
+          used += taken
+          if (used === width && at < chars.length - 1) {
+            rows += 1
+            used = 0
+          }
+        }
+        continue
+      }
+      if (used > 0 && size > 0 && used + size > width) {
+        rows += 1
+        used = 0
+      }
+      used += size
+    }
+    return sum + rows
+  }, 0)
+}
+
+/**
+ * The rows an Input needs to show all of `text` in a pane `width` by `rows`, two at least while it has the keys: a
+ * field of one row submits on `\⏎` instead of typing a newline. The engine sizes a focused field's editor from the
+ * site's width less `label: ` and the Enter hint, never from the Box it sits in, so a field must span the site to wrap
+ * where it is drawn. From two rows the hint also names the newline key, when that leaves the text half the width. The
+ * key is `\⏎` or `shift+⏎` as the terminal allows, so the rows are the more of the two.
+ */
+export function fieldRows(text: string, label: string, submit: string, width: number, rows: number, hasKeys: boolean): number {
+  const room = width - (label ? cells(label) + 2 : 0)
+  const enter = ` ⏎ ${submit}`
+  const rowsAt = (columns: number) => editorRows(text, Math.max(12, columns))
+  if (!hasKeys && rowsAt(room - cells(enter)) <= 1) return 1
+  const needed = Math.max(
+    ...['\\⏎', 'shift+⏎'].map(key => {
+      const newline = `${enter} · ${key} new line`
+      const hint = room - cells(newline) >= width / 2 ? newline : enter
+      return rowsAt(room - cells(hint))
+    }),
+  )
+  return Math.max(2, Math.min(FIELD_ROWS, Math.floor(rows / 4), needed))
+}
+
 /** The rows a built tree takes at `width`, as the column it sits in stacks it. An estimate of the engine's layout. */
 export function rowsOf(node: unknown, width: number): number {
   if (node === null || node === undefined || typeof node === 'boolean') return 0
@@ -374,7 +454,7 @@ export function ListView(draw: Draw, scene: Scene, actions: PaneActions) {
   const groups = groupThreads(threads, pane.filter, pane.toggled)
   const now = list.polledAt ?? scene.now
   const isFiltering = pane.mode === 'filter'
-  const order = groups.flatMap(group => [...group.open, ...(group.closed.length > 0 ? [{ id: closedKey(group.project) }] : []), ...(group.isUnfolded ? group.closed : [])])
+  const order = listOrder(groups)
   const cursor = order.some(one => one.id === pane.listCursor) ? pane.listCursor : (order[0]?.id ?? null)
   const items: NavItem[] = []
   const drawn: RenderChildren[] = []
@@ -404,7 +484,7 @@ export function ListView(draw: Draw, scene: Scene, actions: PaneActions) {
           <Text color="subtle">{` ${age.padStart(5)}`}</Text>
         </Button>
         {isCursor && (
-          <Text color="subtle" wrap="truncate-end">{`    ${wants}${thread.pylon.node} · you ${span(now - thread.lastHumanActivityAt) ?? 'now'} · agent ${thread.agentTurnRunning ? 'working' : (span(now - thread.lastAgentActivityAt) ?? 'now')} · ${thread.id}`}</Text>
+          <Text color="subtle" wrap="truncate-end">{`    ${wants}${thread.pylon.node} · you ${span(now - thread.lastHumanActivityAt) ?? 'now'} · agent ${thread.agentTurnRunning ? 'working' : thread.lastAgentActivityAt === 0 ? 'never' : (span(now - thread.lastAgentActivityAt) ?? 'now')} · ${thread.id}`}</Text>
         )}
       </Box>,
       { key: thread.id, enter: { kind: 'open', thread: thread.id }, y: { kind: 'copy', text: thread.id } },
@@ -435,7 +515,7 @@ export function ListView(draw: Draw, scene: Scene, actions: PaneActions) {
     ),
     isFiltering ? (
       <Box key="filter-box" marginTop={1} borderStyle="round" borderColor="promptBorder" paddingX={1}>
-        <Input key={FILTER} autoFocus label="⌕" value={pane.filter} placeholder="filter threads by title" submitLabel="done" onInput={actions.filter} onSubmit={() => actions.filterDone(order.find(one => !one.id.startsWith('closed-'))?.id ?? null)} />
+        <Input key={fieldKey(pane.fields, FILTER)} autoFocus label="⌕" value={pane.fields[FILTER]?.text} placeholder="filter threads by title" submitLabel="done" onInput={text => actions.filter(text, fieldKey(pane.fields, FILTER))} onSubmit={actions.filterDone} />
       </Box>
     ) : (
       pane.filter && <Text key="filtered" color="subtle">{`⌕ ${pane.filter}   f edits it, an empty filter shows all`}</Text>
@@ -1154,16 +1234,20 @@ function Composer(draw: Draw, scene: Scene, actions: PaneActions, pylon: { faile
   const queue = watch?.state ? watch.state.run !== 'idle' : false
   const pylonState = detail?.pylon.actualState ?? watch?.state?.pylon
   const placeholder = `${queue ? 'Queue a follow-up…' : 'Message the agent…'}${scene.pane.mode === 'insert' ? '' : '  (i to write)'}`
+  const submitLabel = queue ? 'queue' : 'send'
+  const border = scene.pane.mode === 'insert' ? 'promptBorder' : 'subtle'
+  // Rules, as Claude Code's own prompt has, rather than a box: a field narrower than the pane does not wrap (fieldRows).
   return (
     <Box key="composer" flexDirection="column" marginTop={1}>
       {pylonState === 'paused' && <Text color="subtle">The pylon is paused. Sending a message wakes it.</Text>}
-      <Box borderStyle="round" borderColor={scene.pane.mode === 'insert' ? 'promptBorder' : 'subtle'} paddingX={1}>
-        <Input
-          key={COMPOSE}
-          autoFocus={scene.pane.mode === 'insert' ? true : undefined}
-          label="❯"
-          value={scene.pane.draft} placeholder={placeholder} submitLabel={queue ? 'queue' : 'send'} onInput={actions.draft} onSubmit={actions.submit} />
-      </Box>
+      {Rule(draw, scene, border)}
+      <Input
+        key={fieldKey(scene.pane.fields, COMPOSE)}
+        autoFocus={scene.pane.mode === 'insert' ? true : undefined}
+        label="❯"
+        rows={fieldRows(scene.pane.draft, '❯', submitLabel, scene.width, scene.rows, scene.isFocused && scene.pane.mode === 'insert')}
+        value={scene.pane.fields[COMPOSE]?.text} placeholder={placeholder} submitLabel={submitLabel} onInput={actions.draft} onSubmit={actions.submit} />
+      {Rule(draw, scene, border)}
     </Box>
   )
 }
@@ -1317,9 +1401,11 @@ function PortsBody(draw: Draw, scene: Scene, actions: PaneActions, area: number,
           </Button>
           {look.linked ? <Link href={preview.url} /> : <Text color="subtle">{preview.url}</Text>}
         </Box>
-        {isCursor && <Text color="subtle">{`    ⏎ or y copies the URL${isClosable ? ' · x unpublishes it (a new publish may get a new URL)' : ''}`}</Text>}
-        {look.hint && <Text color="subtle">{`    ${look.hint}`}</Text>}
-        {change.failure && <Text color="error">{`    ${change.failure.message}`}</Text>}
+        <Box flexDirection="column" paddingLeft={4}>
+          {isCursor && <Text color="subtle">{`⏎ or y copies the URL${isClosable ? ' · x unpublishes it (a new publish may get a new URL)' : ''}`}</Text>}
+          {look.hint && <Text color="subtle">{look.hint}</Text>}
+          {change.failure && <Text color="error">{change.failure.message}</Text>}
+        </Box>
       </Box>,
       {
         key,
@@ -1378,7 +1464,11 @@ function PortRow(draw: Draw, actions: PaneActions, thread: string, port: NexusPo
         {Pointer(draw, isCursor)}
         {Dot(draw, tone)} <Text bold>{String(port.port)}</Text> <Text color="subtle">{note}</Text>
       </Button>
-      {change.failure && <Text color="error">{`    ${change.failure.message}`}</Text>}
+      {change.failure && (
+        <Box paddingLeft={4}>
+          <Text color="error">{change.failure.message}</Text>
+        </Box>
+      )}
     </Box>,
     { key, enter: { kind: 'publish', thread, port: port.port }, x: { kind: 'say', text: `Port ${port.port} has no preview to unpublish.` } },
   ]
@@ -1419,13 +1509,13 @@ export function StartView(draw: Draw, scene: Scene, actions: PaneActions) {
       {projects && projects.length > 0 && (
         <Box flexDirection="column" marginTop={1} rowGap={0}>
           <Input
-            key={START_KEYS.title}
+            key={fieldKey(scene.pane.fields, START_KEYS.title)}
             autoFocus
             label="Title  "
-            value={draft.title}
+            value={scene.pane.fields[START_KEYS.title]?.text}
             placeholder="What should this thread do?"
             submitLabel="start"
-            onInput={title => actions.startDraft({ title })}
+            onInput={title => actions.startDraft({ title }, fieldKey(scene.pane.fields, START_KEYS.title))}
             onSubmit={title => actions.startSubmit({ title })}
           />
           <Select
@@ -1433,7 +1523,7 @@ export function StartView(draw: Draw, scene: Scene, actions: PaneActions) {
             label="Project"
             value={draft.project}
             options={projects.map(project => ({ value: project.id, label: `${project.id}  ${project.repoUrl}` }))}
-            onSelect={project => actions.startDraft({ project, node: '', branch: '' })}
+            onSelect={actions.startProject}
           />
           <Select
             key={START_KEYS.node}
@@ -1446,22 +1536,22 @@ export function StartView(draw: Draw, scene: Scene, actions: PaneActions) {
             onSelect={value => actions.startDraft({ node: value })}
           />
           <Input
-            key={START_KEYS.branch}
+            key={fieldKey(scene.pane.fields, START_KEYS.branch)}
             label="Branch "
-            value={draft.branch}
+            value={scene.pane.fields[START_KEYS.branch]?.text}
             placeholder={chosen?.defaultBranch ?? ''}
             submitLabel="start"
-            onInput={value => actions.startDraft({ branch: value })}
+            onInput={value => actions.startDraft({ branch: value }, fieldKey(scene.pane.fields, START_KEYS.branch))}
             onSubmit={value => actions.startSubmit({ branch: value })}
           />
           <Input
-            key={START_KEYS.message}
+            key={fieldKey(scene.pane.fields, START_KEYS.message)}
             label="Message"
-            rows={3}
-            value={draft.message}
+            rows={fieldRows(draft.message, 'Message', 'start', scene.width, scene.rows, scene.isFocused && draft.focused === START_KEYS.message)}
+            value={scene.pane.fields[START_KEYS.message]?.text}
             placeholder="The first message for the agent"
             submitLabel="start"
-            onInput={message => actions.startDraft({ message })}
+            onInput={message => actions.startDraft({ message }, fieldKey(scene.pane.fields, START_KEYS.message))}
             onSubmit={message => actions.startSubmit({ message })}
           />
           <Text color="subtle">{`Boots a pylon on ${node} and checks out ${branch}.`}</Text>
