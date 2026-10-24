@@ -4,7 +4,7 @@
 import type { BoxProps, ButtonProps, ElementConstructor, TextProps } from 'claude-code'
 
 import type { NexusList } from '../types'
-import { type Chip, cells, clip } from './model'
+import { type Chip, cells, clip, scopeLabel } from './model'
 
 type Draw = { Box: ElementConstructor<BoxProps>; Text: ElementConstructor<TextProps>; Button: ElementConstructor<ButtonProps> }
 
@@ -18,45 +18,53 @@ const HEAD = '◆ Nexus'
 /** The most a chip's title takes, so three chips fit beside one another in a narrow column. */
 const TITLE_CELLS = 24
 
-const chipText = (chip: Chip) => ` ${LOOK[chip.kind].glyph} ${clip(chip.thread.title, TITLE_CELLS)}  ${chip.note} `
+/** The least a chip's title takes: the first chip shortens its title to this to fit beside a project's name. */
+const LEAST_TITLE_CELLS = 8
 
-/** The chips that fit in `width` on one row, the rest counted as `+N`, or why the list could not be read. */
-export function StripView(draw: Draw, list: NexusList, chips: readonly Chip[], width: number, cursor: string | null, open: (id: string) => void) {
+const chipText = (chip: Chip, title: number) => ` ${LOOK[chip.kind].glyph} ${clip(chip.thread.title, title)}  ${chip.note} `
+
+/**
+ * The chips that fit in `width` on one row, the rest counted as `+N`, or why the list could not be read. One project
+ * shown is named after the head.
+ */
+export function StripView(draw: Draw, list: NexusList, chips: readonly Chip[], width: number, cursor: string | null, scope: string | null, open: (id: string) => void) {
   const { Box, Text, Button } = draw
+  const head = scope === null ? HEAD : `${HEAD} · ${scopeLabel(scope)}`
   if (list.failure && !list.threads) {
     return (
       <Box flexDirection="row" width={width}>
         <Text wrap="truncate-end">
           <Text bold color="claude">
-            {HEAD}
+            {head}
           </Text>
           <Text color="error">{`  ${list.failure.kind}: ${list.failure.message}`}</Text>
         </Text>
       </Box>
     )
   }
-  const room = width - cells(HEAD) - 6
-  const shown: Chip[] = []
+  const room = width - cells(head) - 6
+  const shown: { chip: Chip; title: number }[] = []
   let used = 0
   for (const chip of chips) {
-    const size = cells(chipText(chip)) + 1
-    if (used + size > room) break
-    shown.push(chip)
-    used += size
+    const over = used + cells(chipText(chip, TITLE_CELLS)) + 1 - room
+    const title = cells(clip(chip.thread.title, TITLE_CELLS)) - Math.max(0, over)
+    if (over > 0 && (shown.length > 0 || title < LEAST_TITLE_CELLS)) break
+    shown.push({ chip, title })
+    used += cells(chipText(chip, title)) + 1
   }
   const more = chips.length - shown.length
   return (
     <Box flexDirection="row" columnGap={1} width={width}>
       <Text bold color="claude">
-        {HEAD}
+        {head}
       </Text>
-      {shown.map(chip => {
+      {shown.map(({ chip, title }) => {
         const isCursor = cursor === chip.thread.id
         return (
           <Button key={chip.thread.id} plain onPress={() => open(chip.thread.id)}>
             <Text backgroundColor={isCursor ? 'suggestion' : undefined} color={isCursor ? 'inverseText' : undefined}>
               <Text color={isCursor ? 'inverseText' : LOOK[chip.kind].color}>{` ${LOOK[chip.kind].glyph} `}</Text>
-              {clip(chip.thread.title, TITLE_CELLS)}
+              {clip(chip.thread.title, title)}
               <Text color={isCursor ? 'inverseText' : chip.kind === 'working' ? 'subtle' : LOOK[chip.kind].color}>{`  ${chip.note} `}</Text>
             </Text>
           </Button>

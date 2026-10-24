@@ -149,7 +149,7 @@ export type NexusShown = {
 export type NexusProject = { id: string; repoUrl: string; defaultBranch: string; defaultNode: string }
 export type NexusNode = { name: string; tailnetHost: string; state: 'online' | 'offline' }
 
-/** `projects` and `nodes`, read when the pane opens, on a refresh and when the start form opens. */
+/** `projects` and `nodes`, read when the pane opens, on a refresh, and when the start form or the project picker opens. */
 export type NexusCatalog = {
   projects: NexusProject[] | null
   nodes: NexusNode[] | null
@@ -174,7 +174,22 @@ export type NexusStartDraft = {
   focused: string | null
 }
 
-export type NexusView = 'list' | 'thread' | 'start'
+/** What the new project form holds while the person fills it in: what `nexus project add` takes. */
+export type NexusProjectDraft = {
+  id: string
+  repoUrl: string
+  /** A node's name; the first online one to begin with. */
+  node: string
+  /** Empty for `main`. */
+  branch: string
+  /** Why the last add failed, the CLI's message as it printed it. */
+  error: string | null
+  isAdding: boolean
+  /** The add this form waits on, 0 before its first: an add that ends checks it is still the form's. */
+  request: number
+}
+
+export type NexusView = 'list' | 'thread' | 'start' | 'project'
 
 /** The thread view's tabs, in the order h and l walk them. */
 export type NexusTab = 'conversation' | 'details' | 'ports'
@@ -185,8 +200,11 @@ export type NexusTab = 'conversation' | 'details' | 'ports'
  */
 export type NexusMode = 'normal' | 'insert' | 'filter'
 
-/** What covers the view's body: the Actions menu with the key of the entry under its cursor, the key help, or nothing. */
-export type NexusOverlay = { kind: 'menu'; cursor: string | null } | { kind: 'help'; top: number } | null
+/**
+ * What covers the view's body: the Actions menu or the project picker with the key of the row under its cursor, the
+ * key help, or nothing.
+ */
+export type NexusOverlay = { kind: 'menu'; cursor: string | null } | { kind: 'projects'; cursor: string | null } | { kind: 'help'; top: number } | null
 
 /**
  * How far the conversation is scrolled back: null follows its end; else the body's bottom edge stands `rows` above
@@ -243,6 +261,7 @@ export type NexusPane = {
   /** The composer's text as the person typed it, for the rows it takes. */
   draft: string
   start: NexusStartDraft | null
+  project: NexusProjectDraft | null
   /** What the pane last put in each text field, by the field's name (`putFields`). */
   fields: Record<string, NexusField>
   /** The outcome of the last press, until the next one. */
@@ -273,6 +292,8 @@ declare module 'claude-code' {
       catalog: NexusCatalog
       pane: NexusPane
       strip: NexusStrip
+      /** The project whose threads the list, the strip and `/nexus` show, null for every project; kept in `$.store`. */
+      scope: string | null
       /** The strip's chip under the focus ring, a thread's ID, drawn highlighted. */
       stripCursor: string | null
       /** The run clock, ticked each second while a shown run works. */

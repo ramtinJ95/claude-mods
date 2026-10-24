@@ -82,7 +82,7 @@ test('the list groups threads by project, folds the closed ones and opens the ro
   expect(cli.runs).toContainEqual(['nodes', '--json'])
   const ui = await mount()
   await keys(ui, 'h')
-  expect(await shows(ui, /◆ Nexus\s+1 working · 2 open/)).toBe(true)
+  expect(await shows(ui, /◆ Nexus threads · All projects\s+1 working · 2 open/)).toBe(true)
   expect(await shows(ui, '1/2 nodes online')).toBe(true)
   expect((await ui.find({ type: 'Button', key: ID }))?.text).toMatch(/^❯ ◉ Fix login form 500s\s+ working \s+now$/)
   // The row under the cursor opens a line of its facts.

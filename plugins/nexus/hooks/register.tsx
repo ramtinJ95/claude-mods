@@ -8,6 +8,8 @@ import type {
   NexusPane,
   NexusPortChange,
   NexusPreview,
+  NexusProject,
+  NexusProjectDraft,
   NexusRunState,
   NexusShown,
   NexusStartDraft,
@@ -32,10 +34,12 @@ import {
   groupThreads,
   isSettled,
   foldReply,
+  inScope,
   leftOut,
   listOrder,
   matchThread,
   parseCommand,
+  parseAdded,
   parseDetail,
   parseFailure,
   parseNodes,
@@ -52,7 +56,7 @@ import {
 import { COMPOSE, type Effect, FILTER, type MenuAction, fieldKey, fieldOf, press, putFields, ringMoved } from './keys'
 import { StripView } from './strip'
 import { needsHuman, portFacts, TOOLS } from './tools'
-import { type Draw, ListView, type PaneActions, START_KEYS, type Scene, StartView, ThreadView, ringOf } from './view'
+import { type Draw, ListView, PROJECT_KEYS, type PaneActions, ProjectView, START_KEYS, type Scene, StartView, ThreadView, ringOf } from './view'
 
 const PANE = 'nexus'
 const POLL_MS = 5_000
@@ -97,6 +101,7 @@ const paneAtom = atom({ plugin: 'nexus', key: 'pane' } as const, {
   filter: '',
   draft: '',
   start: null,
+  project: null,
   fields: {},
   notice: null,
   portChanges: {},
@@ -104,6 +109,9 @@ const paneAtom = atom({ plugin: 'nexus', key: 'pane' } as const, {
 const STRIP = { plugin: 'nexus', key: 'strip' } as const
 /** What `$.store` keeps under `strip`, mirrored here so a change draws the strip again. */
 const stripAtom = atom(STRIP, { isOn: true, seen: {}, since: 0 })
+const SCOPE = { plugin: 'nexus', key: 'scope' } as const
+/** What `$.store` keeps under `project`, mirrored here so a change draws the list and the strip again. */
+const scopeAtom = atom(SCOPE, null)
 const STRIP_CURSOR = { plugin: 'nexus', key: 'stripCursor' } as const
 const stripCursorAtom = atom(STRIP_CURSOR, null)
 
@@ -133,6 +141,8 @@ let ringAt: string | null | undefined
 let rehoming: Timer | undefined
 /** Start submissions so far, which number each form's `request`. */
 let starts = 0
+/** Project adds from the form so far, which number its `request`. */
+let adds = 0
 /**
  * Orders each port change's confirmation and each `show` asked for, exactly where a clock could give two the same
  * millisecond: a `show` asked for after a confirmation lists what it confirmed, or what changed since.
@@ -146,11 +156,12 @@ const failed = (message: string): Outcome<never> => ({ ok: false, failure: { kin
 const couldNotRun = (error: unknown) =>
   `could not run ${cli} (${messageOf(error)}); install the Nexus CLI or set its path in the nexus plugin's cli option`
 
-/** One CLI command with `--json` after its name: its parsed stdout, or how it failed. */
+/** One CLI command with `--json` after its name, `project add` being its one name of two words: its parsed stdout, or how it failed. */
 async function nexus($: EngineInterface, args: readonly string[]): Promise<Outcome<unknown>> {
+  const words = args[0] === 'project' ? 2 : 1
   let ran: Awaited<ReturnType<EngineInterface['process']['run']>>
   try {
-    ran = await $.process.run([cli, args[0]!, '--json', ...args.slice(1)], { timeoutMs: RUN_MS })
+    ran = await $.process.run([cli, ...args.slice(0, words), '--json', ...args.slice(words)], { timeoutMs: RUN_MS })
   } catch (error) {
     return failed(couldNotRun(error))
   }
@@ -422,8 +433,9 @@ async function tick($: EngineInterface) {
   if (watch?.state?.run === 'working') await $.state.set(NOW, await $.clock.now())
 }
 
-/** `projects` and `nodes` for the start form, the list's nodes line and the previews' links. */
+/** `projects` and `nodes` for the start form, the project picker, the list's nodes line and the previews' links. */
 async function loadCatalog($: EngineInterface, wanted: { projects: boolean }) {
+  const asked = await read($, scopeAtom)
   const [nodes, projects] = await Promise.all([
     nexus($, ['nodes']).then(got => parsed(got, parseNodes)),
     wanted.projects ? nexus($, ['projects']).then(got => parsed(got, parseProjects)) : undefined,
@@ -433,6 +445,46 @@ async function loadCatalog($: EngineInterface, wanted: { projects: boolean }) {
     ...(nodes.ok ? { nodes: nodes.value, nodesFailure: null } : { nodesFailure: nodes.failure }),
     ...(projects ? (projects.ok ? { projects: projects.value, projectsFailure: null } : { projectsFailure: projects.failure }) : {}),
   }))
+  if (projects?.ok) await checkScope($, projects.value, asked)
+}
+
+/** The scope as `$.store` kept it, and a check that its project still exists. */
+async function loadScope($: EngineInterface) {
+  const stored = await $.store.get('project')
+  await $.state.set(SCOPE, typeof stored === 'string' ? stored : null)
+  if (typeof stored === 'string') void loadCatalog($, { projects: true })
+}
+
+/** Shows `project`'s threads, or every project's for null, in this session and later ones. */
+async function setScope($: EngineInterface, project: string | null) {
+  await $.state.set(SCOPE, project)
+  await $.store.set('project', project)
+}
+
+/**
+ * Goes back to every project, saying so once, when the project shown is not among `projects`, as after it was
+ * deleted; saving that keeps the notice from coming back. `asked` is the scope when the list was asked for: a list read
+ * before another project was chosen, or added, cannot tell whether that one exists.
+ */
+async function checkScope($: EngineInterface, projects: readonly NexusProject[], asked: string | null) {
+  const gone = await read($, scopeAtom)
+  if (gone === null || gone !== asked || projects.some(project => project.id === gone)) return
+  await setScope($, null)
+  await $.ui.toast(`The project ${gone} no longer exists, so Nexus shows every project again.`)
+}
+
+/**
+ * `nexus project add`: the project added, its list read again. A CLI before 0.4.0 says only that it does not know the
+ * command.
+ */
+async function addProject($: EngineInterface, add: { id: string; repoUrl: string; node: string; branch: string }): Promise<Outcome<NexusProject>> {
+  const got = await nexus($, ['project', 'add', add.id, add.repoUrl, `--node=${add.node}`, `--branch=${add.branch}`])
+  if (!got.ok && got.failure.message === 'unknown command project') {
+    return { ok: false, failure: { kind: got.failure.kind, message: `${cli} has no project add command: adding a project needs Nexus CLI 0.4.0 or later (nexus --version)` } }
+  }
+  const added = parsed(got, parseAdded)
+  if (added.ok) void loadCatalog($, { projects: true })
+  return added
 }
 
 /** Starts what an open pane needs, keeping what runs: the poll, polled now, the ticker and the watch of the thread it shows. */
@@ -497,8 +549,8 @@ async function themeNotice($: EngineInterface) {
 const THEME_NAME = 'Dark (ANSI), Nexus pane on the terminal background'
 
 /**
- * The pane opened by `/nexus` with nothing shown opens on the thread whose agent works, the newest when several do,
- * reading the list first when no poll has.
+ * The pane opened by `/nexus` with nothing shown opens on the thread whose agent works in the project shown, the
+ * newest when several do, reading the list first when no poll has.
  */
 async function openWorking($: EngineInterface) {
   const pane = await read($, paneAtom)
@@ -511,7 +563,7 @@ async function openWorking($: EngineInterface) {
     await update($, listAtom, (): NexusList => ({ threads: got.value, failure: null, polledAt: now }))
     threads = got.value
   }
-  const working = threads
+  const working = inScope(threads, await read($, scopeAtom))
     .filter(thread => thread.agentTurnRunning && (thread.status === 'active' || thread.status === 'idle'))
     .sort((a, b) => b.lastActivityAt - a.lastActivityAt)[0]
   if (working) await showThread($, working.id)
@@ -878,6 +930,16 @@ async function runCommand($: EngineInterface, args: string): Promise<string> {
       return command.isOn ? 'The Nexus strip above the prompt is on.' : 'The Nexus strip above the prompt is off. /nexus strip on shows it again.'
     case 'close':
       return (await closePane($)) ? 'Nexus pane closed.' : 'The Nexus pane stays open: another hook kept it.'
+    case 'scope':
+      return say(await scopeCommand($, command.project))
+    case 'add-project': {
+      const { verb: _, ...add } = command
+      const added = await addProject($, { ...add, branch: add.branch ?? 'main' })
+      // The transcript heads a reply with the plugin's name: a failure reads `nexus: <the CLI's message>`.
+      if (!added.ok) return added.failure.message
+      await setScope($, added.value.id)
+      return `Added the project ${added.value.id} (${added.value.repoUrl}) on ${added.value.defaultNode}. Nexus shows its threads.`
+    }
     case 'open': {
       const id = await resolveThread($, command.thread)
       if (!id.ok) return say(id)
@@ -912,6 +974,27 @@ async function runCommand($: EngineInterface, args: string): Promise<string> {
       return `Unpublished port ${command.port} of ${id.value}. Publishing it again may give it a new URL.`
     }
   }
+}
+
+/** `/nexus project [id|all]`: which project's threads show, or a switch to another, which must exist. */
+async function scopeCommand($: EngineInterface, project: string | null | undefined): Promise<Outcome<string>> {
+  if (project === undefined) {
+    const shown = await read($, scopeAtom)
+    return { ok: true, value: shown === null ? 'Nexus shows every project. /nexus project <id> shows one.' : `Nexus shows the project ${shown}. /nexus project all shows every project.` }
+  }
+  if (project === null) {
+    await setScope($, null)
+    return { ok: true, value: 'Nexus shows every project.' }
+  }
+  const projects = parsed(await nexus($, ['projects']), parseProjects)
+  if (!projects.ok) return projects
+  if (!projects.value.some(one => one.id === project)) {
+    const known = projects.value.map(one => one.id)
+    const list = known.length === 0 ? 'There are none yet' : `The projects are ${known.length === 1 ? known[0] : `${known.slice(0, -1).join(', ')} and ${known.at(-1)}`}`
+    return failed(`there is no project ${project}. ${list}`)
+  }
+  await setScope($, project)
+  return { ok: true, value: `Nexus shows the project ${project}.` }
 }
 
 /** The thread's state and context as the watch's first poll reports them. */
@@ -1126,16 +1209,23 @@ const emptyStart = (project = '', title = ''): NexusStartDraft => ({ title, proj
 /** The start form's texts by field, as `putFields` takes them. */
 const startTexts = (start: NexusStartDraft) => ({ [START_KEYS.title]: start.title, [START_KEYS.branch]: start.branch, [START_KEYS.message]: start.message })
 
+/** The new project form's texts by field, as `putFields` takes them. */
+const projectTexts = (draft: NexusProjectDraft) => ({ [PROJECT_KEYS.id]: draft.id, [PROJECT_KEYS.repoUrl]: draft.repoUrl, [PROJECT_KEYS.branch]: draft.branch })
+
 /** The pane with each field put again with the text it holds for it: a closed pane's fields forget what was typed. */
 const refilled = (pane: NexusPane): NexusPane => ({
   ...pane,
-  fields: putFields(pane.fields, { [COMPOSE]: pane.draft, [FILTER]: pane.filter, ...(pane.start ? startTexts(pane.start) : {}) }),
+  fields: putFields(pane.fields, { [COMPOSE]: pane.draft, [FILTER]: pane.filter, ...(pane.start ? startTexts(pane.start) : {}), ...(pane.project ? projectTexts(pane.project) : {}) }),
 })
 
-/** Opens the start form, its project and title given for Start again, and reads the projects and nodes it offers. */
+/**
+ * Opens the start form, its project and title given for Start again, else on the project shown, and reads the projects
+ * and nodes it offers. A project shown that no longer exists gives way to the first, as the scope goes back to all.
+ */
 async function openStart($: EngineInterface, project?: string, title?: string) {
+  const scope = await read($, scopeAtom)
   await setPane($, pane => {
-    const start = emptyStart(project, title)
+    const start = emptyStart(project ?? scope ?? '', title)
     return { view: 'start', mode: 'normal', overlay: null, start, fields: putFields(pane.fields, startTexts(start)) }
   })
   await loadCatalog($, { projects: true })
@@ -1143,7 +1233,8 @@ async function openStart($: EngineInterface, project?: string, title?: string) {
   await update($, paneAtom, pane => {
     if (!pane.start) return pane
     const offered = projects?.some(one => one.id === pane.start!.project)
-    if (pane.start.project && !offered && projects) return { ...pane, start: { ...pane.start, project: '', error: `Project ${pane.start.project} is not offered here.` } }
+    if (pane.start.project && !offered && projects && project !== undefined) return { ...pane, start: { ...pane.start, project: '', error: `Project ${pane.start.project} is not offered here.` } }
+    if (pane.start.project && !offered && projects) return projects[0] ? { ...pane, start: { ...pane.start, project: projects[0].id } } : { ...pane, start: { ...pane.start, project: '' } }
     return pane.start.project || !projects?.[0] ? pane : { ...pane, start: { ...pane.start, project: projects[0].id } }
   })
 }
@@ -1178,6 +1269,95 @@ async function submitStart($: EngineInterface, draft: NexusStartDraft | null) {
 const setStart = ($: EngineInterface, change: Partial<NexusStartDraft>) =>
   update($, paneAtom, pane => (pane.start ? { ...pane, start: { ...pane.start, ...change } } : pane))
 
+/** The node a new project's pylons boot on unless chosen: the first online, as pi-nexus picks, else the first. */
+const firstNode = (catalog: NexusCatalog) => (catalog.nodes?.find(node => node.state === 'online') ?? catalog.nodes?.[0])?.name ?? ''
+
+/** Opens the new project form over the view the picker was on, and reads the nodes it offers afresh. */
+async function openProjectForm($: EngineInterface) {
+  const draft: NexusProjectDraft = { id: '', repoUrl: '', node: firstNode(await read($, catalogAtom)), branch: '', error: null, isAdding: false, request: 0 }
+  await setPane($, pane => ({ view: 'project', mode: 'normal', overlay: null, project: draft, fields: putFields(pane.fields, projectTexts(draft)) }))
+  await loadCatalog($, { projects: false })
+  const node = firstNode(await read($, catalogAtom))
+  await update($, paneAtom, pane => (pane.project && !pane.project.node ? { ...pane, project: { ...pane.project, node } } : pane))
+}
+
+const setProjectDraft = ($: EngineInterface, change: Partial<NexusProjectDraft>) =>
+  update($, paneAtom, pane => (pane.project ? { ...pane, project: { ...pane.project, ...change } } : pane))
+
+/**
+ * Adds the project the form describes and shows its threads; a failure stays on the form with the CLI's message as it
+ * printed it, since it names what to fix. One that ends after the person left the form only says how it went.
+ */
+async function submitProject($: EngineInterface) {
+  const { project: draft } = await read($, paneAtom)
+  if (!draft || draft.isAdding) return
+  const add = { id: draft.id.trim(), repoUrl: draft.repoUrl.trim(), node: draft.node, branch: draft.branch.trim() || 'main' }
+  const missing = !add.id ? 'A project needs an ID.' : !add.repoUrl ? 'A project needs a repo URL.' : !add.node ? 'Pick the node its pylons boot on.' : null
+  if (missing) return void (await setProjectDraft($, { error: missing }))
+  adds += 1
+  const request = adds
+  await setProjectDraft($, { isAdding: true, error: null, request })
+  const added = await addProject($, add)
+  if (added.ok) await setScope($, added.value.id)
+  let left: string | null | undefined
+  const committed = await update($, paneAtom, (pane): NexusPane => {
+    left = undefined
+    if (pane.view !== 'project' || pane.project?.request !== request) {
+      const said = added.ok ? `Added the project ${added.value.id}. Nexus shows its threads.` : `The project was not added: ${added.failure.message}`
+      return { ...pane, notice: { text: said, tone: added.ok ? 'dim' : 'error' } }
+    }
+    if (!added.ok) return { ...pane, project: { ...pane.project, isAdding: false, error: added.failure.message } }
+    left = pane.selected
+    const { id, repoUrl, defaultNode } = added.value
+    return { ...listView(pane), notice: { text: `Added the project ${id} (${repoUrl}) on ${defaultNode}. Nexus shows its threads.`, tone: 'dim' } }
+  })
+  if (left !== undefined) await listShown($, left, committed)
+}
+
+/** The pane on the list, the cursor on the thread it left. */
+const listView = (was: NexusPane): NexusPane => ({
+  ...was,
+  view: 'list',
+  selected: null,
+  mode: 'normal',
+  overlay: null,
+  pending: null,
+  notice: null,
+  draft: '',
+  start: null,
+  project: null,
+  toggled: {},
+  scroll: null,
+  detailsTop: 0,
+  portCursor: null,
+  listCursor: was.selected ?? was.listCursor,
+})
+
+/** After the list took the place of the thread `left`: its watch stopped, what was read of it dropped, the list polled. */
+async function listShown($: EngineInterface, left: string | null, pane: NexusPane) {
+  watcher?.stop()
+  if (left) void markSeen($, left)
+  await Promise.all([$.state.set(WATCH, null), $.state.set(LIVE, null), $.state.set(SHOWN, null)])
+  void poll($)
+  await focusRing($, pane)
+}
+
+/** Back to the list from a thread, a form, or the list itself. */
+async function showList($: EngineInterface) {
+  let left: string | null = null
+  const pane = await update($, paneAtom, was => {
+    left = was.selected
+    return listView(was)
+  })
+  await listShown($, left, pane)
+}
+
+/** Shows the threads of `project`, or every project's for null: a thread view gives way to the list. */
+async function chooseScope($: EngineInterface, project: string | null) {
+  await setScope($, project)
+  if ((await read($, paneAtom)).view !== 'list') await showList($)
+}
+
 /** The handlers the pane's keys, buttons and fields run, each with the render hook's `$`. */
 function paneActions($: EngineInterface, surface: RenderSurface): PaneActions {
   const notify = (outcome: Outcome<string>) =>
@@ -1199,28 +1379,9 @@ function paneActions($: EngineInterface, surface: RenderSurface): PaneActions {
       await setPane($, () => ({ view: 'thread', mode: 'normal', start: null }))
       return focusRing($, await read($, paneAtom))
     }
-    watcher?.stop()
-    if (selected) void markSeen($, selected)
-    // The cursor goes back to the thread just left.
-    const pane = await update($, paneAtom, (was): NexusPane => ({
-      ...was,
-      view: 'list',
-      selected: null,
-      mode: 'normal',
-      overlay: null,
-      pending: null,
-      notice: null,
-      draft: '',
-      start: null,
-      toggled: {},
-      scroll: null,
-      detailsTop: 0,
-      portCursor: null,
-      listCursor: selected ?? was.listCursor,
-    }))
-    await Promise.all([$.state.set(WATCH, null), $.state.set(LIVE, null), $.state.set(SHOWN, null)])
-    void poll($)
-    await focusRing($, pane)
+    // The new project form goes back to the picker it was opened from, over the list or the thread.
+    if (view === 'project') return setPane($, () => ({ view: selected ? 'thread' : 'list', mode: 'normal', project: null, overlay: { kind: 'projects', cursor: 'scope-new' } }))
+    await showList($)
   }
   const refresh = async () => {
     const { selected, view } = await read($, paneAtom)
@@ -1280,6 +1441,12 @@ function paneActions($: EngineInterface, surface: RenderSurface): PaneActions {
         return focusOn($, fieldKey((await read($, paneAtom)).fields, FILTER))
       case 'new':
         return openStart($)
+      case 'projects':
+        return loadCatalog($, { projects: true })
+      case 'scope':
+        return chooseScope($, effect.project)
+      case 'new-project':
+        return openProjectForm($)
       case 'refresh':
         return refresh()
       case 'close':
@@ -1365,6 +1532,15 @@ function paneActions($: EngineInterface, surface: RenderSurface): PaneActions {
         await submitStart($, sent)
         if (change) await inTurn(() => putBack($, START_KEYS, change, pane => pane.start))
       }),
+    projectDraft: change => run(() => setProjectDraft($, { ...change, error: null })),
+    projectSubmit: change =>
+      run(async () => {
+        if (change) {
+          await setProjectDraft($, change)
+          await putBack($, PROJECT_KEYS, change, pane => pane.project)
+        }
+        await submitProject($)
+      }),
   }
 }
 
@@ -1376,9 +1552,10 @@ export const register: Register = (on, options) => {
 
   on('session.start', async ($, e, next) => {
     await Promise.all([
-      $.command.register({ name: 'nexus', description: 'Drive Nexus threads: the pane, new, send, open, unpublish, archive, abort, retry, delete, strip', argumentHint: '[help]', immediate: true }),
+      $.command.register({ name: 'nexus', description: 'Drive Nexus threads: the pane, new, send, open, unpublish, archive, abort, retry, delete, strip, project', argumentHint: '[help]', immediate: true }),
       ...Object.values(TOOLS).map(spec => $.tool.register(spec)),
       loadStrip($),
+      loadScope($),
     ])
     stripper?.cancel()
     stripper = $.clock.every(STRIP_MS, () => void pollStrip($))
@@ -1412,20 +1589,21 @@ export const register: Register = (on, options) => {
 
   on('ui.render', { component: 'AbovePrompt' }, async ($, e, next) => {
     if (e.props.hasSurvey) return next(e)
-    const [strip, list, watch, shown, now, cursor] = await Promise.all([
+    const [strip, list, watch, shown, now, cursor, scope] = await Promise.all([
       read($, stripAtom),
       read($, listAtom),
       read($, watchAtom),
       read($, shownAtom),
       read($, nowAtom),
       read($, stripCursorAtom),
+      read($, scopeAtom),
     ])
     if (!strip.isOn) return next(e)
     // The list has no parked tasks: only the thread the pane watches is known to hold them.
     const parked = new Set([...(watch?.state?.run === 'parked' ? [watch.thread] : []), ...(shown?.detail?.agent?.parkedTasks ? [shown.thread] : [])])
-    const chips = stripChips(list.threads ?? [], strip, Math.max(now, list.polledAt ?? 0), parked)
+    const chips = stripChips(inScope(list.threads ?? [], scope), strip, Math.max(now, list.polledAt ?? 0), parked)
     if (chips.length === 0 && !(list.failure && !list.threads)) return next(e)
-    return StripView($.ui.resolve(e), list, chips, e.props.bodyColumns, cursor, id => void openFromStrip($, id))
+    return StripView($.ui.resolve(e), list, chips, e.props.bodyColumns, cursor, scope, id => void openFromStrip($, id))
   })
 
   on('ui.focus', { component: 'AbovePrompt' }, async ($, e, next) => {
@@ -1448,7 +1626,7 @@ export const register: Register = (on, options) => {
       return <Text dimColor>The Nexus pane needs a surface with text fields.</Text>
     }
     const draw: Draw = $.ui.resolve(e)
-    const [list, watch, live, shown, catalog, pane, now] = await Promise.all([
+    const [list, watch, live, shown, catalog, pane, now, scope] = await Promise.all([
       read($, listAtom),
       read($, watchAtom),
       read($, liveAtom),
@@ -1456,6 +1634,7 @@ export const register: Register = (on, options) => {
       read($, catalogAtom),
       read($, paneAtom),
       read($, nowAtom),
+      read($, scopeAtom),
     ])
     // A drawing may not write: Esc out of a field or an overlay is taken up after it.
     if (!e.props.isFocused && (pane.mode !== 'normal' || pane.overlay) && !recovering) recovering = $.clock.after(0, () => void recover($))
@@ -1466,6 +1645,7 @@ export const register: Register = (on, options) => {
       shown,
       catalog,
       pane,
+      scope,
       now: Math.max(now, list.polledAt ?? 0),
       width: Math.max(24, e.props.bodyColumns),
       rows: e.props.placement === 'dock' ? e.props.scroll.bodyRows : Math.min(e.props.scroll.bodyRows, INLINE_ROWS),
@@ -1474,7 +1654,14 @@ export const register: Register = (on, options) => {
       surface: e.surface,
     }
     const actions = paneActions($, e.surface)
-    const tree = pane.view === 'start' ? StartView(draw, scene, actions) : !pane.selected || pane.view === 'list' ? ListView(draw, scene, actions) : ThreadView(draw, scene, actions)
+    const tree =
+      pane.view === 'start'
+        ? StartView(draw, scene, actions)
+        : pane.view === 'project'
+          ? ProjectView(draw, scene, actions)
+          : !pane.selected || pane.view === 'list'
+            ? ListView(draw, scene, actions)
+            : ThreadView(draw, scene, actions)
     rehome($, tree, pane, e.props.isFocused)
     return tree
   })

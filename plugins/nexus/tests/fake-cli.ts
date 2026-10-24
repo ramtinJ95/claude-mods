@@ -114,6 +114,8 @@ export type Fake = {
   /** Every `$.process.spawn` argv, the CLI's name dropped. */
   spawns: string[][]
   threads: unknown[]
+  /** What `projects` lists; `project add` adds to it, as the control plane does. */
+  projects: unknown[]
   detail: unknown
   /** The watch's lines in order; a `{ delay }` holds the stream that long on the test's clock first. */
   watch: unknown[]
@@ -129,14 +131,18 @@ export type Fake = {
   answer: string
   asked: string[]
   copied: string[]
+  /** Every `$.ui.toast` text. */
+  toasts: string[]
   opens: number
   isOpen: boolean
-  /** What `$.store` holds as the session starts: the theme tip is taken as said unless a test says otherwise. */
+  /** What `$.store` holds, from the session's start on: the theme tip is taken as said unless a test says otherwise. */
   store: Record<string, unknown>
 }
 
 export function fake(change: Partial<Fake> = {}): Fake {
-  return { runs: [], spawns: [], threads: THREADS, detail: DETAIL, watch: [{ type: 'reset', thread: ID, entries: ENTRIES }, state('working'), live()], slow: {}, fail: {}, printed: {}, publishes: true, answer: 'Keep', asked: [], copied: [], opens: 0, isOpen: false, store: { themeNotice: true }, ...change }
+  // A copy, as the mod writes the store a test reads: a fixture shared by tests would carry one's writes into the next.
+  const store = structuredClone(change.store ?? { themeNotice: true })
+  return { runs: [], spawns: [], threads: THREADS, projects: PROJECTS, detail: DETAIL, watch: [{ type: 'reset', thread: ID, entries: ENTRIES }, state('working'), live()], slow: {}, fail: {}, printed: {}, publishes: true, answer: 'Keep', asked: [], copied: [], toasts: [], opens: 0, isOpen: false, ...change, store }
 }
 
 /** `detail` with the linked preview of `port` published, or gone when `preview` is null. */
@@ -155,10 +161,15 @@ const reply = (json: unknown) => ({ value: { exitCode: 0, stdout: JSON.stringify
 /** Boots the mod over `cli`: its session, the engine's answers, and a clock that starts at T0 and moves only when told. */
 export async function boot(...[$, on, cli]: [...Body, Fake]) {
   const clock = mock.clock(on, { now: T0 })
-  mock.store(on, cli.store)
+  // The store as the mod leaves it, which a test reads back.
+  on('store.get', (_, e) => ({ value: cli.store[e.key] }))
+  on('store.set', (_, e) => {
+    cli.store[e.key] = e.value
+    return { value: undefined }
+  })
   const answers: Record<string, () => unknown> = {
     nodes: () => NODES,
-    projects: () => PROJECTS,
+    projects: () => cli.projects,
     threads: () => cli.threads,
     show: () => cli.detail,
     wake: () => null,
@@ -180,6 +191,14 @@ export async function boot(...[$, on, cli]: [...Body, Fake]) {
     if (late) await clock.sleep(late)
     const failure = cli.fail[argv[0]!]
     if (failure) return { value: { exitCode: failure.exitCode, stdout: '', stderr: `${JSON.stringify({ error: failure.error, kind: 'failed', status: 500 })}\n`, isStdoutTruncated: false, isStderrTruncated: false } }
+    if (argv[0] === 'project') {
+      // `nexus project add <id> <repo-url> --json --node=N --branch=B`, its project built from its arguments.
+      const [id, repoUrl] = argv.slice(3)
+      const flag = (name: string) => argv.find(arg => arg.startsWith(`--${name}=`))?.slice(name.length + 3)
+      const project = { id, repoUrl, defaultBranch: flag('branch') ?? 'main', defaultNode: flag('node'), resources: { cpus: 2, memoryGiB: 4, diskGiB: 10 }, allowedHosts: [], secrets: [], logins: [], preSetup: null }
+      cli.projects = [...cli.projects, project]
+      return reply(project)
+    }
     return reply(answers[argv[0]!]?.() ?? null)
   })
   on('process.spawn', async function* (_, e) {
@@ -219,6 +238,10 @@ export async function boot(...[$, on, cli]: [...Body, Fake]) {
     return { value: undefined }
   })
   on('ui.panes', () => ({ value: cli.isOpen ? [{ id: 'nexus', title: 'Nexus', isShown: true, isFocused: true, isPlaced: true }] : [] }))
+  on('ui.toast', (_, e) => {
+    cli.toasts.push(e.text)
+    return { value: undefined }
+  })
   on('ui.copy', (_, e) => {
     cli.copied.push(e.text)
     return { value: { isCopied: true } } as never

@@ -22,6 +22,7 @@ export type Command =
   | 'yank'
   | 'menu'
   | 'new'
+  | 'projects'
   | 'refresh'
   | 'help'
   | 'close'
@@ -44,6 +45,7 @@ export const KEYMAP: readonly { hotkey: string; command: Command }[] = [
   { hotkey: 'y', command: 'yank' },
   { hotkey: 'm', command: 'menu' },
   { hotkey: 'n', command: 'new' },
+  { hotkey: 'p', command: 'projects' },
   { hotkey: 'r', command: 'refresh' },
   { hotkey: 's', command: 'help' },
   { hotkey: 'q', command: 'close' },
@@ -58,6 +60,7 @@ export const HELP: readonly { title: string; keys: readonly [keys: string, what:
       ['g g · g e', 'top · bottom (the end follows the conversation again)'],
       ['d u', 'half a page down · up'],
       ['enter o', 'open or press what is under the cursor'],
+      ['p', "projects: show one project's threads, every project's, or add a project"],
       ['s', 'this help'],
       ['q', 'close what is open: the help, the menu, else the pane'],
       ['esc', 'leave the composer or the filter; else hand the keys to the prompt'],
@@ -93,6 +96,11 @@ export type Effect =
   | { kind: 'insert' }
   | { kind: 'filter' }
   | { kind: 'new' }
+  /** The project picker opened: its projects read afresh. */
+  | { kind: 'projects' }
+  /** A project chosen in the picker, null for every project. */
+  | { kind: 'scope'; project: string | null }
+  | { kind: 'new-project' }
   | { kind: 'refresh' }
   | { kind: 'close' }
 
@@ -116,6 +124,7 @@ export type Nav =
   /** `cursor` as drawn: a port that moved between Previews and Ports keeps it. */
   | { context: 'ports'; items: NavItem[]; area: number; canInsert: boolean; cursor: string | null }
   | { context: 'menu'; items: NavItem[]; area: number }
+  | { context: 'projects'; items: NavItem[]; area: number; drawn: string }
   | { context: 'help'; total: number; area: number }
   | { context: 'none' }
 
@@ -271,6 +280,18 @@ export function press(before: NexusPane, pressed: Command, nav: Nav): Step {
     if (command === 'open' || command === 'right') return apply(current?.enter, { overlay: null })
     return done()
   }
+  if (nav.context === 'projects' && pane.overlay?.kind === 'projects') {
+    if (command === 'close' || command === 'projects' || command === 'left') return done({ overlay: null })
+    // Until a key moves it, the cursor is the row drawn current.
+    const chosen = pane.overlay.cursor ?? nav.drawn
+    const current = nav.items.find(item => item.key === chosen) ?? nav.items[0]
+    if (isMotion(command)) {
+      const key = moveOver(nav.items, current?.key ?? null, command, nav.area)
+      return done({ overlay: { kind: 'projects', cursor: key ?? null } }, key ? [{ kind: 'focus', key }] : [])
+    }
+    if (command === 'open' || command === 'right') return apply(current?.enter, { overlay: null })
+    return done()
+  }
 
   // What every thread tab answers alike.
   const thread = nav.context === 'conversation' || nav.context === 'details' || nav.context === 'ports' ? nav : null
@@ -295,6 +316,8 @@ export function press(before: NexusPane, pressed: Command, nav: Nav): Step {
   switch (command) {
     case 'help':
       return done({ overlay: { kind: 'help', top: 0 } })
+    case 'projects':
+      return nav.context === 'list' || thread ? done({ overlay: { kind: 'projects', cursor: null } }, [{ kind: 'projects' }]) : done()
     case 'close':
       return done({}, [{ kind: 'close' }])
     case 'new':
@@ -361,6 +384,7 @@ export function ringMoved(pane: NexusPane, element: string): NexusPane {
   // Leaving a field by the ring is leaving its mode.
   const base: NexusPane = pane.mode === 'normal' ? pane : { ...pane, mode: 'normal' }
   if (element.startsWith('menu-') && pane.overlay?.kind === 'menu') return { ...base, overlay: { kind: 'menu', cursor: element } }
+  if (element.startsWith('scope-') && pane.overlay?.kind === 'projects') return { ...base, overlay: { kind: 'projects', cursor: element } }
   if (element.startsWith('preview-') || element.startsWith('port-')) return { ...base, portCursor: element }
   if (pane.view === 'list') return { ...base, listCursor: element }
   if (pane.view === 'start' && pane.start) return { ...base, start: { ...pane.start, focused: field } }
