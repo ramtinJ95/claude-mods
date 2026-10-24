@@ -456,7 +456,7 @@ export function ListView(draw: Draw, scene: Scene, actions: PaneActions) {
   const area = Math.max(3, scene.rows - rowsOf(header, scene.width) - rowsOf(footer, scene.width))
   const top = keepInView(Math.min(pane.listTop, Math.max(0, y - area)), items.find(item => item.key === cursor), area)
   const body: Body = isHelp
-    ? HelpBody(draw, scene, area)
+    ? HelpBody(draw, scene, actions, area)
     : {
         nav: { context: 'list', items, area },
         node: (
@@ -632,7 +632,7 @@ export function ThreadView(draw: Draw, scene: Scene, actions: PaneActions) {
   const area = Math.max(3, scene.rows - rowsOf(header, scene.width) - rowsOf(footer, scene.width))
   const body =
     pane.overlay?.kind === 'help'
-      ? HelpBody(draw, scene, area)
+      ? HelpBody(draw, scene, actions, area)
       : pane.overlay?.kind === 'menu'
         ? MenuBody(draw, scene, actions, area)
         : pane.tab === 'conversation'
@@ -664,8 +664,8 @@ export function ThreadView(draw: Draw, scene: Scene, actions: PaneActions) {
 
 type Body = { node: RenderChildren; nav: Nav }
 
-function HelpBody(draw: Draw, scene: Scene, area: number): Body {
-  const { Box, Text } = draw
+function HelpBody(draw: Draw, scene: Scene, actions: PaneActions, area: number): Body {
+  const { Box, Text, Button } = draw
   const top = scene.pane.overlay?.kind === 'help' ? scene.pane.overlay.top : 0
   const node = (
     <Box key="help" flexDirection="column" flexShrink={0} marginTop={-top}>
@@ -685,9 +685,15 @@ function HelpBody(draw: Draw, scene: Scene, area: number): Body {
       <Box marginTop={1}>
         <Text color="subtle">Claude Code gives a pane only plain letters, so vim's G, ctrl+d, ctrl+u, / and ? are g e, d, u, f and s here.</Text>
       </Box>
+      {/* The ring's home while the help covers the view, whose rows it hid: without one the keys would have nowhere to go. */}
+      <Button key="help-close" plain autoFocus onPress={() => actions.key('close', nav)}>
+        <Text color="suggestion">q</Text>
+        <Text color="subtle"> or ⏎ closes the help</Text>
+      </Button>
     </Box>
   )
-  return { nav: { context: 'help', total: rowsOf(node, scene.width) + top, area }, node }
+  const nav: Nav = { context: 'help', total: rowsOf(node, scene.width) + top, area }
+  return { nav, node }
 }
 
 function MenuBody(draw: Draw, scene: Scene, actions: PaneActions, area: number): Body {
@@ -835,6 +841,27 @@ function drawnChars(node: unknown): number {
 }
 
 /** `node` with its text cut after `room` characters in the order written, and how many it kept. */
+/**
+ * The keys a drawing holds, and where the ring belongs in it: the last element drawn with `autoFocus`, which is the
+ * view's most specific cursor (a row under the tab, an entry of the menu), else the tab itself.
+ */
+export function ringOf(tree: unknown): { keys: ReadonlySet<string>; home: string | null } {
+  const keys = new Set<string>()
+  let home: string | null = null
+  const walk = (node: unknown) => {
+    if (Array.isArray(node)) return node.forEach(walk)
+    if (!isElement(node) || node.props?.display === 'none') return
+    const key = node.props?.key
+    if (typeof key === 'string') {
+      keys.add(key)
+      if (node.props?.autoFocus === true) home = key
+    }
+    walk(node.children)
+  }
+  walk(tree)
+  return { keys, home }
+}
+
 export function cutTree(node: unknown, room: number): { node: unknown; used: number } {
   if (typeof node === 'string') return node.length <= room ? { node, used: node.length } : { node: node.slice(0, room), used: room }
   if (Array.isArray(node)) {

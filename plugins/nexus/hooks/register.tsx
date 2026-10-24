@@ -50,7 +50,7 @@ import {
 import { COMPOSE, type Effect, FILTER, type MenuAction, press, ringMoved } from './keys'
 import { StripView } from './strip'
 import { needsHuman, portFacts, TOOLS } from './tools'
-import { type Draw, ListView, type PaneActions, type Scene, StartView, ThreadView } from './view'
+import { type Draw, ListView, type PaneActions, type Scene, StartView, ThreadView, ringOf } from './view'
 
 const PANE = 'nexus'
 const POLL_MS = 5_000
@@ -120,8 +120,13 @@ let stripper: Timer | undefined
 let isStripBusy = false
 /** The pane taking the keys back after Esc left a field or an overlay, scheduled from a drawing. */
 let recovering: Timer | undefined
-/** A view change that took the ring's element away: the next drawing of the thread puts the ring on its tab. */
-let isRingWanted = false
+/**
+ * The pane's element the ring is on, as far as the mod knows: where its own focus or the engine's `ui.focus` last put
+ * it. Null for one of the engine's stops; undefined before either says.
+ */
+let ringAt: string | null | undefined
+/** The ring being taken home after a drawing left it on nothing, scheduled from that drawing. */
+let rehoming: Timer | undefined
 /** Start submissions so far, which number each form's `request`. */
 let starts = 0
 /**
@@ -500,8 +505,8 @@ async function openWorking($: EngineInterface) {
   if (working) await showThread($, working.id)
 }
 
-function setPane($: EngineInterface, change: (pane: NexusPane) => Partial<NexusPane>) {
-  return update($, paneAtom, (pane): NexusPane => ({ ...pane, notice: null, ...change(pane) }))
+async function setPane($: EngineInterface, change: (pane: NexusPane) => Partial<NexusPane>) {
+  await update($, paneAtom, pane => ({ ...pane, notice: null, ...change(pane) }))
 }
 
 /** The pane showing `thread`, keeping what the person opened, closed and chose in it when it was shown already. */
@@ -608,8 +613,31 @@ function focusRing($: EngineInterface, pane: NexusPane) {
   return key ? focusOn($, key) : Promise.resolve()
 }
 
+/**
+ * After a drawing: an element taken away while it held the ring (a port published into a preview, rows the help or
+ * a closed menu hid, a form left) leaves the keys with nothing until Tab, and the composer or filter holding it in
+ * normal mode takes letters as text. Either way the ring goes home: the view's cursor, else its tab. Insert and
+ * filter mode keep it, the field being where the person put it; a pane without the keys has none to move.
+ */
+function rehome($: EngineInterface, tree: unknown, pane: NexusPane, isFocused: boolean) {
+  if (!isFocused || pane.mode !== 'normal' || !ringAt || rehoming) return
+  const { keys, home } = ringOf(tree)
+  const isLost = !keys.has(ringAt) || ringAt === COMPOSE || ringAt === FILTER
+  if (!isLost || !home || home === ringAt) return
+  rehoming = $.clock.after(0, () => {
+    rehoming = undefined
+    void focusOn($, home)
+  })
+}
+
 /** Asks for the ring on `key`; a refusal (not drawn yet, or the pane lacks the keys) leaves it where it is. */
-const focusOn = ($: EngineInterface, key: string) => $.ui.focus({ requestId: PANE, key }).then(() => undefined, () => undefined)
+const focusOn = ($: EngineInterface, key: string) =>
+  $.ui.focus({ requestId: PANE, key }).then(
+    result => {
+      if (!result.deny) ringAt = key
+    },
+    () => undefined,
+  )
 
 
 /** What the thread just shown runs: its details polled afresh and its watch, while the pane is open. */
@@ -1074,11 +1102,7 @@ async function submitStart($: EngineInterface) {
     return { ...pane, ...threadView(pane, started.value.id) }
   })
   // `update` runs its function again when its write loses a race, so what follows reads what it wrote.
-  if (started.ok && committed.view === 'thread' && committed.selected === started.value.id) {
-    // The form's field held the ring, and the engine hands it to the composer as the form goes: the next drawing takes it back.
-    isRingWanted = true
-    await followThread($, started.value.id)
-  }
+  if (started.ok && committed.view === 'thread' && committed.selected === started.value.id) await followThread($, started.value.id)
 }
 
 const setStart = ($: EngineInterface, change: Partial<NexusStartDraft>) =>
@@ -1168,8 +1192,6 @@ function paneActions($: EngineInterface, surface: RenderSurface): PaneActions {
         return showTab(effect.tab)
       case 'focus':
         return focusOn($, effect.key)
-      case 'ring':
-        return focusRing($, await read($, paneAtom))
       case 'publish':
         return changePort($, effect.thread, effect.port, 'open')
       case 'unpublish':
@@ -1178,11 +1200,9 @@ function paneActions($: EngineInterface, surface: RenderSurface): PaneActions {
         return copy(effect.text)
       case 'say':
         return setPane($, () => ({ notice: { text: effect.text, tone: 'dim' } }))
-      case 'run': {
-        const pane = await setPane($, () => ({ overlay: null }))
-        await focusRing($, pane)
+      case 'run':
+        await setPane($, () => ({ overlay: null }))
         return runAction(effect.action)
-      }
       // The field's autoFocus takes the ring as it is drawn; this asks for it too, where it is drawn already.
       case 'insert':
         return focusOn($, COMPOSE)
@@ -1312,7 +1332,9 @@ export const register: Register = (on, options) => {
   on('ui.focus', { component: 'Pane', requestId: PANE }, async ($, e, next) => {
     const element = e.element
     if (e.origin.kind === 'person' && element) await update($, paneAtom, pane => ringMoved(pane, element))
-    return next(e)
+    const moved = await next(e)
+    if (!moved.deny) ringAt = element ?? null
+    return moved
   })
 
   on('ui.render', { component: 'Pane', requestId: PANE }, async ($, e) => {
@@ -1332,10 +1354,6 @@ export const register: Register = (on, options) => {
     ])
     // A drawing may not write: Esc out of a field or an overlay is taken up after it.
     if (!e.props.isFocused && (pane.mode !== 'normal' || pane.overlay) && !recovering) recovering = $.clock.after(0, () => void recover($))
-    if (isRingWanted && pane.view === 'thread') {
-      isRingWanted = false
-      $.clock.after(0, () => void read($, paneAtom).then(pane => focusRing($, pane)))
-    }
     const scene: Scene = {
       list,
       watch,
@@ -1351,8 +1369,8 @@ export const register: Register = (on, options) => {
       surface: e.surface,
     }
     const actions = paneActions($, e.surface)
-    if (pane.view === 'start') return StartView(draw, scene, actions)
-    if (!pane.selected || pane.view === 'list') return ListView(draw, scene, actions)
-    return ThreadView(draw, scene, actions)
+    const tree = pane.view === 'start' ? StartView(draw, scene, actions) : !pane.selected || pane.view === 'list' ? ListView(draw, scene, actions) : ThreadView(draw, scene, actions)
+    rehome($, tree, pane, e.props.isFocused)
+    return tree
   })
 }

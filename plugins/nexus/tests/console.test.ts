@@ -1,7 +1,7 @@
 import { expect, test, type TestBody } from 'claude-code/testing'
 
 import { KEYMAP } from '../hooks/keys'
-import { cutTree } from '../hooks/view'
+import { cutTree, ringOf } from '../hooks/view'
 import { DETAIL, ENTRIES, ID, OPENED, PATCH, PUBLISHED, THEME_KEYS, THREAD, THREADS, WEB_PREVIEW, boot, fake, live, state } from './fake-cli'
 
 type Ui = Awaited<ReturnType<Awaited<ReturnType<typeof boot>>['mount']>>
@@ -501,6 +501,35 @@ test('a fold of many distinct long tools keeps its line to one row and draws its
   expect(line).toMatch(/^⏺ Called 0-n+/)
   expect(line.length).toBeLessThan(140)
   await expectWhole(ui)
+})
+
+test("the ring's home in a drawing is its cursor, or the tab: where it goes when the element holding it is taken away", async ($, on) => {
+  const cli = fake({ threads: THREADS.map(thread => ({ ...thread, agentTurnRunning: false })), slow: { preview: 3_000 } })
+  const { clock, nexus, mount } = await boot($, on, cli)
+  const ring = async () => ringOf(await ui.drawn())
+  await nexus('')
+  const ui = await mount()
+  // The help hides the list's rows, the cursor's among them: its own close is home until it closes.
+  const row = await cursorOn(ui)
+  await keys(ui, 's')
+  expect(await ring()).toMatchObject({ home: 'help-close' })
+  expect((await ring()).keys.has(row!)).toBe(false)
+  await keys(ui, 'q')
+  expect((await ring()).home).toBe(row)
+  // A closed menu takes its entries away: home is the tab.
+  await nexus(`open ${ID}`)
+  await keys(ui, 'mj')
+  expect((await ring()).home).toBe('menu-archive')
+  await keys(ui, 'q')
+  expect(await ring()).toMatchObject({ home: 'tab-conversation' })
+  expect((await ring()).keys.has('menu-archive')).toBe(false)
+  // A published port's row becomes its preview's, which the cursor follows.
+  await keys(ui, 'llge')
+  expect((await ring()).home).toBe('port-5173')
+  await keys(ui, 'o')
+  await clock.advance(3_000)
+  expect(await ring()).toMatchObject({ home: 'preview-port-5173' })
+  expect((await ring()).keys.has('port-5173')).toBe(false)
 })
 
 test('a cut tree leaves out what does not fit without leaving a null in its place', () => {

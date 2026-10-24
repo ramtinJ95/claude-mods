@@ -83,8 +83,6 @@ export type Effect =
   | { kind: 'back' }
   | { kind: 'tab'; tab: NexusTab }
   | { kind: 'focus'; key: string }
-  /** The ring back on the view's cursor or tab: an overlay that held it is gone. */
-  | { kind: 'ring' }
   /** A port change names the thread it was drawn for: a press that lands after the pane moved on changes nothing. */
   | { kind: 'publish'; thread: string; port: number }
   | { kind: 'unpublish'; thread: string; port: number }
@@ -247,8 +245,7 @@ export function press(before: NexusPane, pressed: Command, nav: Nav): Step {
     return by === undefined ? done() : done({ overlay: { kind: 'help', top: clamp(pane.overlay.top + by, 0, most) } })
   }
   if (nav.context === 'menu' && pane.overlay?.kind === 'menu') {
-    // The ring may sit on an entry the close takes away, which would leave the keys with nothing: it goes back to the tab.
-    if (command === 'close' || command === 'menu' || command === 'left') return done({ overlay: null }, [{ kind: 'ring' }])
+    if (command === 'close' || command === 'menu' || command === 'left') return done({ overlay: null })
     const chosen = pane.overlay.cursor
     const current = nav.items.find(item => item.key === chosen) ?? nav.items[0]
     if (isMotion(command)) {
