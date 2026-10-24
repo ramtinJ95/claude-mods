@@ -15,6 +15,7 @@ import type {
   NexusRow,
   NexusRunState,
   NexusSession,
+  NexusStrip,
   NexusThread,
   NexusThreadRow,
   NexusWatch,
@@ -93,6 +94,12 @@ export function parsePreview(raw: unknown, command: string): NexusPreview {
   if (!isRecord(raw) || typeof raw.service !== 'string') throw contractError(command, 'a preview without its service')
   if (typeof raw.url !== 'string') throw contractError(command, `a preview (${raw.service}) without its url`)
   return { service: raw.service, httpsPort: num(raw.httpsPort), ready: raw.ready === true, url: raw.url }
+}
+
+/** `unpreview` prints a literal null; anything else is a CLI this mod does not know, so the close is not taken as done. */
+export function parseUnpreviewed(raw: unknown): null {
+  if (raw !== null) throw new Error(`nexus unpreview printed ${clip(JSON.stringify(raw), 60)} where docs/cli.md says null: the CLI and this mod disagree on the contract`)
+  return null
 }
 
 /** `ListeningPort[] | null`, as `show` and a watch `state` print it: a missing list is a contract error, not "unknown". */
@@ -709,6 +716,7 @@ export type NexusCommand =
   | { verb: 'send'; thread: string; text: string }
   | { verb: 'action'; action: Action; thread?: string }
   | { verb: 'unpublish'; port: number; thread?: string }
+  | { verb: 'strip'; isOn: boolean }
   | { verb: 'invalid'; reason: string }
 
 export const USAGE = [
@@ -718,6 +726,7 @@ export const USAGE = [
   '/nexus new <project> ["title"] <message>',
   '/nexus send <id> <message>      queued behind a running turn',
   '/nexus unpublish <port> [id]    close the preview of a port',
+  '/nexus strip on|off             show or hide the threads above the prompt',
   '/nexus archive|unarchive|abort|retry|retry-pylon|delete [id]',
   'An ID may be a unique prefix (4f2a or th-4f2a). Without one, an action takes the thread open in the pane.',
 ].join('\n')
@@ -763,6 +772,8 @@ export function parseCommand(args: string): NexusCommand {
       if (!/^\d+$/.test(port) || extra) return invalid('/nexus unpublish takes a port and at most one thread ID.')
       return { verb: 'unpublish', port: Number(port), ...(thread ? { thread } : {}) }
     }
+    case 'strip':
+      return rest === 'on' || rest === 'off' ? { verb: 'strip', isOn: rest === 'on' } : invalid('/nexus strip takes on or off.')
     default: {
       if (!Object.hasOwn(ACTIONS, verb)) return invalid(`/nexus has no ${verb}.`)
       const [thread, extra] = split(rest)
@@ -770,6 +781,27 @@ export function parseCommand(args: string): NexusCommand {
       return { verb: 'action', action: verb as Action, ...(thread ? { thread } : {}) }
     }
   }
+}
+
+/** A thread the strip shows, by what it asks of the person: most urgent first. */
+export type Chip = { thread: NexusThreadRow; kind: 'needs' | 'reply' | 'working'; note: string }
+
+const CHIP_RANK: Record<Chip['kind'], number> = { needs: 0, reply: 1, working: 2 }
+
+/**
+ * The open threads that ask for the person or are busy: a failed pylon or parked tasks (known only for the thread
+ * the pane watches, since `threads` does not carry them), an answer since the person last viewed the thread, then
+ * the agents at work with how long since the person's message started them. The rest stay out of the strip.
+ */
+export function stripChips(threads: readonly NexusThreadRow[], strip: NexusStrip, now: number, parked: ReadonlySet<string>): Chip[] {
+  const chips = threads.flatMap((thread): Chip[] => {
+    if (thread.status !== 'active' && thread.status !== 'idle') return []
+    if (thread.pylon.actualState === 'failed' || thread.pylon.failed || parked.has(thread.id)) return [{ thread, kind: 'needs', note: 'needs you' }]
+    if (thread.agentTurnRunning) return [{ thread, kind: 'working', note: `working ${span(now - thread.lastHumanActivityAt) ?? 'now'}` }]
+    if (thread.lastAgentActivityAt > (strip.seen[thread.id] ?? strip.since)) return [{ thread, kind: 'reply', note: 'new reply' }]
+    return []
+  })
+  return chips.sort((a, b) => CHIP_RANK[a.kind] - CHIP_RANK[b.kind] || b.thread.lastActivityAt - a.thread.lastActivityAt)
 }
 
 /** East Asian wide characters and emoji, which take two terminal cells. */

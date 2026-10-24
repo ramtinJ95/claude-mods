@@ -1,6 +1,7 @@
 import { expect, test, type TestBody } from 'claude-code/testing'
 
-import { cutTree } from '../hooks/view'
+import { KEYMAP } from '../hooks/keys'
+import { cutTree, ringOf } from '../hooks/view'
 import { DETAIL, ENTRIES, ID, OPENED, PATCH, PUBLISHED, THEME_KEYS, THREAD, THREADS, WEB_PREVIEW, boot, fake, live, state } from './fake-cli'
 
 type Ui = Awaited<ReturnType<Awaited<ReturnType<typeof boot>>['mount']>>
@@ -8,6 +9,16 @@ type Ui = Awaited<ReturnType<Awaited<ReturnType<typeof boot>>['mount']>>
 const texts = async (ui: Ui, type = 'Text') => (await ui.findAll({ type })).map(one => one.text)
 const shows = async (ui: Ui, text: string | RegExp, type?: string) => (await ui.find({ ...(type ? { type } : {}), text })) !== undefined
 const hotkeys = async (ui: Ui) => (await ui.findAll({ type: 'Button' })).flatMap(one => (typeof one.props.hotkey === 'string' ? [one.props.hotkey] : []))
+const LETTERS = KEYMAP.map(key => key.hotkey)
+/** Presses the letters in turn, as the person types them. */
+async function keys(ui: Ui, letters: string) {
+  for (const letter of letters) await ui.press({ key: `key-${letter}` })
+}
+/** The key of the row the cursor is on: the Button whose text starts with the cursor's mark. */
+const cursorOn = async (ui: Ui) => (await ui.findAll({ type: 'Button' })).find(one => one.text.startsWith('❯'))?.key
+/** The block under the conversation's cursor, which the pane marks. */
+const marked = async (ui: Ui) => (await ui.findAll({ type: 'Box' })).find(one => one.key?.startsWith('stop-') && one.text.startsWith('▎'))?.key
+const mode = async (ui: Ui) => (await ui.find({ type: 'Text', text: /^ (NORMAL|INSERT|FILTER) / }))?.text.trim().split(' ')[0]
 
 /** The text a drawn tree carries, as the engine counts it toward the 100000 characters it draws of one tree. */
 function carried(node: unknown): number {
@@ -27,13 +38,11 @@ function holes(node: unknown, at = ''): string[] {
 }
 
 /** The drawing stays under the engine's limit and still ends with the view's keys, which a cut would take first. */
-async function expectWhole(ui: Ui, keys: string[]) {
+async function expectWhole(ui: Ui) {
   const tree = await ui.drawn()
   expect(holes(tree)).toEqual([])
-  const size = carried(tree)
-  expect(size).toBeGreaterThan(50_000)
-  expect(size).toBeLessThan(100_000)
-  expect(await hotkeys(ui)).toEqual(expect.arrayContaining(keys))
+  expect(carried(tree)).toBeLessThan(100_000)
+  expect(await hotkeys(ui)).toEqual(LETTERS)
 }
 
 /** Every colour the drawing paints with is a theme key, so the pane follows the person's theme. */
@@ -43,60 +52,106 @@ async function expectThemeColours(ui: Ui) {
   expect(painted.filter(colour => !THEME_KEYS.has(colour))).toEqual([])
 }
 
-test('the list groups threads by project, folds the closed ones and says where each pylon runs', async ($, on) => {
+test('/nexus opens on the thread whose agent works; h goes back to the list with the cursor on it', async ($, on) => {
   const cli = fake()
   const { nexus, mount } = await boot($, on, cli)
   await nexus('')
+  expect(cli.spawns).toContainEqual(['watch', ID, '--json'])
+  const ui = await mount()
+  expect(await shows(ui, /^‹ web \/ Fix login form 500s$/)).toBe(true)
+  await keys(ui, 'h')
+  expect(await cursorOn(ui)).toBe(ID)
+  expect(await ui.find({ type: 'Markdown' })).toBeUndefined()
   expect(cli.spawns).toContainEqual(['threads', '--json', '--all'])
+})
+
+test('/nexus with no agent working opens the list, the cursor on its first row', async ($, on) => {
+  const cli = fake({ threads: THREADS.map(thread => ({ ...thread, agentTurnRunning: false })) })
+  const { nexus, mount } = await boot($, on, cli)
+  await nexus('')
+  expect(cli.spawns.some(argv => argv[0] === 'watch')).toBe(false)
+  const ui = await mount()
+  expect(await cursorOn(ui)).toBe('th-7c0000000003')
+})
+
+test('the list groups threads by project, folds the closed ones and opens the row under the cursor', async ($, on) => {
+  const cli = fake()
+  const { nexus, mount } = await boot($, on, cli)
+  await nexus('')
   expect(cli.runs).toContainEqual(['nodes', '--json'])
   const ui = await mount()
-  expect(await shows(ui, /2 open · 1 working/)).toBe(true)
-  const fix = await ui.find({ type: 'Button', key: ID })
-  expect(fix?.text).toMatch(/Fix login form 500s\s+agent working · firebat · you 2 min · turn running$/)
-  expect((await ui.find({ type: 'Button', key: 'th-7c0000000003' }))?.text).toMatch(/API docs\s+paused · testbench · you 3 h · agent 3 h$/)
+  await keys(ui, 'h')
+  expect(await shows(ui, /◆ Nexus\s+1 working · 2 open/)).toBe(true)
+  expect(await shows(ui, '1/2 nodes online')).toBe(true)
+  expect((await ui.find({ type: 'Button', key: ID }))?.text).toMatch(/^❯ ◉ Fix login form 500s\s+ working \s+now$/)
+  // The row under the cursor opens a line of its facts.
+  expect(await shows(ui, `    firebat · you 2 min · agent working · ${ID}`)).toBe(true)
+  expect((await ui.find({ type: 'Button', key: 'th-7c0000000003' }))?.text).toMatch(/^ {2}○ API docs\s+ paused \s+3 h$/)
+  expect(await shows(ui, /testbench · you 3 h/)).toBe(false)
   expect(await ui.find({ type: 'Button', key: 'th-9b0000000002' })).toBeUndefined()
-  expect((await ui.find({ type: 'Button', key: 'closed-web' }))?.text).toBe('▸ 1 archived')
-  await ui.press({ key: 'closed-web' })
-  expect((await ui.find({ type: 'Button', key: 'th-9b0000000002' }))?.text).toMatch(/Old idea\s+archived · firebat/)
-  expect(await shows(ui, /nodes\s+● firebat\s+● testbench offline/)).toBe(true)
-  expect(await hotkeys(ui)).toEqual(['1', '2', '3', 'n', 'f', 'r', 'q'])
+  expect((await ui.find({ type: 'Button', key: 'closed-web' }))?.text).toBe('    ▸ 1 archived')
+  await keys(ui, 'j')
+  expect(await cursorOn(ui)).toBe('closed-web')
+  await keys(ui, 'o')
+  expect((await ui.find({ type: 'Button', key: 'th-9b0000000002' }))?.text).toMatch(/Old idea\s+ archived /)
+  await keys(ui, 'gg')
+  expect(await cursorOn(ui)).toBe('th-7c0000000003')
+  await keys(ui, 'ge')
+  expect(await cursorOn(ui)).toBe('th-9b0000000002')
+  expect(await hotkeys(ui)).toEqual(LETTERS)
+  expect(await mode(ui)).toBe('NORMAL')
   await expectThemeColours(ui)
+  await keys(ui, 'k')
+  await keys(ui, 'k')
+  await keys(ui, 'l')
+  expect(await shows(ui, /^‹ web \/ Fix login form 500s$/)).toBe(true)
 })
 
-test('a filter opens a closed group it matches, even one the person folded again', async ($, on) => {
-  const cli = fake()
-  const { nexus, mount } = await boot($, on, cli)
-  await nexus('')
-  const ui = await mount()
-  await ui.press({ key: 'closed-web' })
-  await ui.press({ key: 'closed-web' })
-  expect(await ui.find({ type: 'Button', key: 'th-9b0000000002' })).toBeUndefined()
-  await ui.press({ key: 'key-f' })
-  await ui.input({ key: 'filter', text: 'old', kind: 'change' })
-  expect(await ui.find({ type: 'Button', key: 'th-9b0000000002' })).toBeDefined()
-})
-
-test('a pylon not yet where it is wanted says so in its row', async ($, on) => {
+test('a pylon not yet where it is wanted says so under the cursor', async ($, on) => {
   const cli = fake({ threads: [{ ...THREAD, agentTurnRunning: false, pylon: { node: 'firebat', actualState: 'running', failed: null }, desired: 'paused' }] })
   const { nexus, mount } = await boot($, on, cli)
   await nexus('')
   const ui = await mount()
-  expect((await ui.find({ type: 'Button', key: ID }))?.text).toMatch(/running · firebat · wants paused · you 2 min · agent now$/)
+  expect(await shows(ui, /^ {4}wants paused · firebat · you 2 min · agent now/)).toBe(true)
 })
 
-test('the filter keeps the titles that hold it, opens a closed fold it matches, and holds the keys while typed', async ($, on) => {
+test('f filters by title in filter mode, opens a closed group it matches, and Enter puts the cursor on the first match', async ($, on) => {
   const cli = fake()
   const { nexus, mount } = await boot($, on, cli)
   await nexus('')
   const ui = await mount()
-  await ui.press({ key: 'key-f' })
+  await keys(ui, 'h')
+  await ui.press({ key: 'closed-web' })
+  await ui.press({ key: 'closed-web' })
+  expect(await ui.find({ type: 'Button', key: 'th-9b0000000002' })).toBeUndefined()
+  await keys(ui, 'f')
   expect((await ui.find({ type: 'Input', key: 'filter' }))?.props.autoFocus).toBe(true)
-  expect(await hotkeys(ui)).toEqual([])
+  expect(await mode(ui)).toBe('FILTER')
   await ui.input({ key: 'filter', text: 'old', kind: 'change' })
-  expect((await ui.findAll({ type: 'Button' })).map(one => one.key)).toEqual(['closed-web', 'th-9b0000000002'])
+  expect((await ui.findAll({ type: 'Button' })).flatMap(one => (one.props.hotkey ? [] : [one.key]))).toEqual(['closed-web', 'th-9b0000000002'])
   await ui.input({ key: 'filter', text: 'old' })
-  expect(await hotkeys(ui)).toContain('n')
-  expect(await shows(ui, 'Filtered by "old"')).toBe(true)
+  expect(await mode(ui)).toBe('NORMAL')
+  expect(await cursorOn(ui)).toBe('th-9b0000000002')
+  expect(await shows(ui, /^⌕ old/)).toBe(true)
+})
+
+test('Esc from the filter, which hands the keys to the prompt, clears it and takes them back', async ($, on) => {
+  const cli = fake()
+  const { clock, nexus, mount } = await boot($, on, cli)
+  await nexus('')
+  const ui = await mount()
+  await keys(ui, 'h')
+  await keys(ui, 'f')
+  await ui.input({ key: 'filter', text: 'old', kind: 'change' })
+  const opens = cli.opens
+  await ui.redraw({ title: 'Nexus', isFocused: false, bodyColumns: 100, placement: 'dock', scroll: { offset: 0, bodyRows: 60 }, view: {} } as never)
+  expect(await shows(ui, /the keys are at the prompt/)).toBe(true)
+  await clock.advance(1)
+  expect(cli.opens).toBe(opens + 1)
+  await ui.redraw({ title: 'Nexus', isFocused: true, bodyColumns: 100, placement: 'dock', scroll: { offset: 0, bodyRows: 60 }, view: {} } as never)
+  expect(await mode(ui)).toBe('NORMAL')
+  expect(await ui.find({ type: 'Input', key: 'filter' })).toBeUndefined()
+  expect(await ui.find({ type: 'Button', key: 'th-7c0000000003' })).toBeDefined()
 })
 
 test('a thread draws as a Claude Code transcript: prompts, ⏺ answers in Markdown, tool calls with ⎿ results, edits as diffs', async ($, on) => {
@@ -104,16 +159,15 @@ test('a thread draws as a Claude Code transcript: prompts, ⏺ answers in Markdo
   const { nexus, mount } = await boot($, on, cli)
   await nexus(`open ${ID}`)
   const ui = await mount()
-  expect(await shows(ui, /^web \/ Fix login form 500s$/)).toBe(true)
-  expect(await shows(ui, /^● agent working · firebat · th-4f2a00000001 · started 12 min ago · claude-opus-5-5$/)).toBe(true)
+  expect(await shows(ui, /^‹ web \/ Fix login form 500s$/)).toBe(true)
+  expect(await shows(ui, /^ working 1m 12s {3}firebat {2}· {2}claude-opus-5-5 {2}· {2}started 12 min ago$/)).toBe(true)
+  expect((await ui.find({ type: 'Button', key: 'tab-conversation' }))?.props.autoFocus).toBe(true)
   expect(await shows(ui, /^❯ The login form answers 500/, 'Box')).toBe(true)
-  // As Claude Code draws its own: the prompt and the answers' marks in the text colour, the keys dim.
+  // As Claude Code draws its own: the prompt and the answers' marks in the text colour.
   expect((await ui.find({ type: 'Text', text: /^The login form answers 500/ }))?.props.color).toBe('text')
   expect((await ui.findAll({ type: 'Text', text: /^⏺\s*$/ })).filter(one => one.props.color === 'text')).toHaveLength(2)
-  expect((await ui.findAll({ type: 'Button' })).filter(one => one.key?.startsWith('key-')).every(one => one.props.dimColor === true)).toBe(true)
   expect((await ui.findAll({ type: 'Markdown' })).map(one => one.text)).toEqual(["I'll reproduce it **first**.", 'Fixed: the regex rejected plus addressing.'])
-  const failed = await ui.find({ type: 'Button', key: 'tool-b1' })
-  expect(failed?.text).toBe('⏺ Bash(npm test -- login)')
+  expect((await ui.find({ type: 'Button', key: 'tool-b1' }))?.text).toBe('⏺ Bash(npm test -- login)')
   expect(await texts(ui)).toEqual(expect.arrayContaining(['Error: exit 1', 'Command exited with code 1']))
   expect((await ui.find({ type: 'Button', key: 'tool-e1' }))?.text).toBe('⏺ Update(src/auth/email.ts)')
   expect(await shows(ui, 'Updated src/auth/email.ts with 1 addition and 1 removal')).toBe(true)
@@ -123,11 +177,12 @@ test('a thread draws as a Claude Code transcript: prompts, ⏺ answers in Markdo
   await ui.press({ key: 'tool-e1' })
   expect((await ui.find({ type: 'Code' }))?.props.wrap).toBe('wrap')
   await ui.press({ key: 'tool-e1' })
-  expect((await ui.find({ type: 'Button', key: 'fold-r-a' }))?.text).toBe('⏺ Read 4 files, ran 1 command · 1 running (5 steps, enter to fold)')
-  const spin = await ui.find({ type: 'Text', text: /Working…/ })
-  expect(spin?.text).toBe('· Working… (1m 12s · 7 tools this turn · new messages queue · x to abort)')
+  expect((await ui.find({ type: 'Button', key: 'fold-r-a' }))?.text).toBe('⏺ Read 4 files, ran 1 command · 1 running (5 steps, o to fold)')
+  expect((await ui.find({ type: 'Text', text: /Working…/ }))?.text).toBe('· Working… (1m 12s · 7 tools this turn · new messages queue · m to abort)')
   expect((await ui.find({ type: 'Text', text: /^· Working… $/ }))?.props.color).toBe('claude')
-  expect(await shows(ui, '❯ Queue a follow-up…')).toBe(true)
+  expect((await ui.find({ type: 'Input', key: 'compose' }))?.props.placeholder).toBe('Queue a follow-up…  (i to write)')
+  expect(await mode(ui)).toBe('NORMAL')
+  expect(await hotkeys(ui)).toEqual(LETTERS)
   await expectThemeColours(ui)
 })
 
@@ -199,7 +254,7 @@ test('the streaming answer keeps its key as it commits, and no drawing shows it 
   const { clock, nexus, mount } = await boot($, on, cli)
   await nexus(`open ${ID}`)
   const ui = await mount()
-  const keyOf = async () => (await ui.findAll({ type: 'Box' })).find(one => one.key !== undefined && one.text.includes('Running the suite'))?.key
+  const keyOf = async () => (await ui.findAll({ type: 'Box' })).find(one => /^row-\d+$/.test(one.key ?? '') && one.text.includes('Running the suite'))?.key
   const streamed = new Set<string | undefined>()
   for (let tick = 0; tick < 32; tick += 1) {
     await clock.advance(100)
@@ -213,26 +268,33 @@ test('the streaming answer keeps its key as it commits, and no drawing shows it 
   expect([...streamed]).toEqual([committed])
 })
 
-test('older blocks stay drawn as an answer streams and the clock ticks, so the drawing above holds still', async ($, on) => {
+
+test('k scrolls back a block at a time and the view holds still as an answer streams below; g e follows the end again', async ($, on) => {
   const cli = fake()
-  const said = (id: number) => ({ entry: { id, model: [{ role: 'assistant', content: [{ type: 'text', text: `${id} ${'z'.repeat(296)}` }] }] }, text: '' })
+  const said = (id: number) => ({ entry: { id, model: [{ role: 'assistant', content: [{ type: 'text', text: `answer ${id} ${'z'.repeat(296)}` }] }] }, text: '' })
   const grown = (chars: number) => live({ partial: 'p'.repeat(chars) })
   cli.watch = [
-    { type: 'reset', thread: ID, entries: [ENTRIES[0], ...Array.from({ length: 399 }, (_, n) => said(n + 2))] },
+    { type: 'reset', thread: ID, entries: [ENTRIES[0], ...Array.from({ length: 40 }, (_, n) => said(n + 2))] },
     state('working'),
-    ...[100, 900, 1_700, 2_500, 3_300, 4_100].flatMap(chars => [{ delay: 1_000 }, grown(chars)]),
+    ...[100, 900, 1_700, 2_500].flatMap(chars => [{ delay: 1_000 }, grown(chars)]),
   ]
   const { clock, nexus, mount } = await boot($, on, cli)
   await nexus(`open ${ID}`)
   const ui = await mount()
-  const omitted = new Set<string | undefined>()
-  for (let second = 0; second < 6; second += 1) {
+  await keys(ui, 'kkk')
+  const held = await marked(ui)
+  expect(held).toMatch(/^stop-row-/)
+  const shown = await texts(ui, 'Markdown')
+  for (let second = 0; second < 4; second += 1) {
     await clock.advance(1_000)
-    omitted.add((await ui.find({ type: 'Text', text: /earlier blocks? left out of the pane$/ }))?.text)
+    expect(await marked(ui)).toBe(held)
+    expect(await texts(ui, 'Markdown')).toEqual(shown)
   }
-  expect([...omitted]).toHaveLength(1)
-  expect([...omitted][0]).toMatch(/^… \d+ earlier blocks left out of the pane$/)
-  await expectWhole(ui, ['b', 'x', 'q'])
+  await keys(ui, 'gg')
+  expect(await shows(ui, /^❯ The login form answers 500/, 'Box')).toBe(true)
+  await keys(ui, 'ge')
+  expect(await marked(ui)).not.toBe(held)
+  expect((await ui.findAll({ type: 'Markdown' })).at(-1)?.text).toBe('p'.repeat(2_500))
 })
 
 test('the run clock and spinner tick each second while the run works', async ($, on) => {
@@ -245,7 +307,7 @@ test('the run clock and spinner tick each second while the run works', async ($,
   expect(await shows(ui, /^✢ Working… \(1m 13s/)).toBe(true)
 })
 
-test('a tool row opens on enter: its other arguments and all its output', async ($, on) => {
+test('a tool row opens when pressed: its other arguments and all its output', async ($, on) => {
   const cli = fake()
   const { nexus, mount } = await boot($, on, cli)
   await nexus(`open ${ID}`)
@@ -258,58 +320,78 @@ test('a tool row opens on enter: its other arguments and all its output', async 
   expect((await texts(ui)).filter(text => text === 'line')).toHaveLength(10)
 })
 
-test('a fold of four steps opens itself while one runs, and stays as the person leaves it', async ($, on) => {
+test('o and Enter on the tab open the block under the cursor, k moves it up, and y copies it', async ($, on) => {
   const cli = fake()
   cli.watch = [{ type: 'reset', thread: ID, entries: ENTRIES.slice(0, -1) }, state('idle'), live()]
   const { nexus, mount } = await boot($, on, cli)
   await nexus(`open ${ID}`)
   const ui = await mount()
-  expect((await ui.find({ type: 'Button', key: 'fold-r-a' }))?.text).toBe('⏺ Read 4 files (4 steps, enter to expand)')
-  expect(await ui.find({ type: 'Button', key: 'tool-r-a' })).toBeUndefined()
-  await ui.press({ key: 'fold-r-a' })
+  expect((await ui.find({ type: 'Button', key: 'fold-r-a' }))?.text).toBe('⏺ Read 4 files (4 steps, o to expand)')
+  expect(await marked(ui)).toBe('stop-fold-r-a')
+  await keys(ui, 'o')
   expect(await ui.find({ type: 'Button', key: 'tool-r-a' })).toBeDefined()
-  await ui.press({ key: 'fold-r-a' })
-  expect(await ui.find({ type: 'Button', key: 'tool-r-a' })).toBeUndefined()
+  // The newest block is now the fold's last step; Enter presses the ring's element, the tab, which acts as o.
+  expect(await marked(ui)).toBe('stop-tool-r-d')
+  await ui.press({ key: 'tab-conversation' })
+  expect((await texts(ui)).filter(text => text === 'line')).toHaveLength(13)
+  await keys(ui, 'kkkkk')
+  expect(await marked(ui)).toMatch(/^stop-row-/)
+  await keys(ui, 'y')
+  expect(cli.copied).toEqual(['Fixed: the regex rejected plus addressing.'])
 })
 
-test('the composer sends while the run is idle, keeps the keys while typed, and an empty Enter hands them back', async ($, on) => {
+test('i writes in insert mode: the composer sends while the run is idle, and an empty Enter is back to normal mode', async ($, on) => {
   const cli = fake()
   cli.watch = [{ type: 'reset', thread: ID, entries: ENTRIES.slice(0, -1) }, state('idle'), live()]
   const { nexus, mount } = await boot($, on, cli)
   await nexus(`open ${ID}`)
   const ui = await mount()
-  expect(await shows(ui, '❯ Message the agent…')).toBe(true)
-  await ui.press({ key: 'key-m' })
-  expect((await ui.find({ type: 'Input', key: 'compose' }))?.props).toMatchObject({ placeholder: 'Message the agent…', submitLabel: 'send', autoFocus: true })
-  expect(await hotkeys(ui)).toEqual([])
+  expect((await ui.find({ type: 'Input', key: 'compose' }))?.props).toMatchObject({ placeholder: 'Message the agent…  (i to write)', submitLabel: 'send' })
+  await keys(ui, 'i')
+  expect((await ui.find({ type: 'Input', key: 'compose' }))?.props).toMatchObject({ placeholder: 'Message the agent…', autoFocus: true })
+  expect(await mode(ui)).toBe('INSERT')
   await ui.input({ key: 'compose', text: '-n add a test' })
   expect(cli.runs).toContainEqual(['send', '--json', ID, '--', '-n add a test'])
-  expect(await ui.find({ type: 'Input', key: 'compose' })).toBeDefined()
+  expect(await mode(ui)).toBe('INSERT')
   await ui.input({ key: 'compose', text: '' })
-  expect(await ui.find({ type: 'Input', key: 'compose' })).toBeUndefined()
-  expect(await hotkeys(ui)).toContain('m')
+  expect(await mode(ui)).toBe('NORMAL')
+  expect(await ui.find({ type: 'Input', key: 'compose' })).toBeDefined()
 })
 
-test("a composer the thread's change hides gives the keys back, and a key pressed then leaves it closed", async ($, on) => {
+test('Esc from the composer, which hands the keys to the prompt, is back to normal mode with the keys taken back', async ($, on) => {
   const cli = fake()
-  const idle = { type: 'reset', thread: ID, entries: ENTRIES.slice(0, -1) }
-  cli.watch = [idle, state('idle'), live(), { delay: 5_000 }, state('idle', { status: 'archived', pylon: 'paused' }), { delay: 5_000 }, state('idle')]
   const { clock, nexus, mount } = await boot($, on, cli)
   await nexus(`open ${ID}`)
   const ui = await mount()
-  await ui.press({ key: 'key-m' })
-  expect(await hotkeys(ui)).toEqual([])
-  await clock.advance(5_000)
-  expect(await ui.find({ type: 'Input', key: 'compose' })).toBeUndefined()
-  expect(await hotkeys(ui)).toEqual(expect.arrayContaining(['b', 'u', 'd', 'q']))
-  await ui.press({ key: 'key-u' })
-  expect(cli.runs).toContainEqual(['unarchive', '--json', ID])
-  await clock.advance(5_000)
-  expect(await ui.find({ type: 'Input', key: 'compose' })).toBeUndefined()
-  expect(await hotkeys(ui)).toContain('m')
+  await keys(ui, 'a')
+  expect(await mode(ui)).toBe('INSERT')
+  const opens = cli.opens
+  const props = { title: 'Nexus', bodyColumns: 100, placement: 'dock', scroll: { offset: 0, bodyRows: 60 }, view: {} }
+  await ui.redraw({ ...props, isFocused: false } as never)
+  await clock.advance(1)
+  expect(cli.opens).toBe(opens + 1)
+  await ui.redraw({ ...props, isFocused: true } as never)
+  expect(await mode(ui)).toBe('NORMAL')
 })
 
-test('a conversation too big to draw drops its oldest steps, says so, and keeps the keys', async ($, on) => {
+test("a composer the thread's change takes away leaves the letters to the keys: m then Unarchive", async ($, on) => {
+  const cli = fake()
+  const idle = { type: 'reset', thread: ID, entries: ENTRIES.slice(0, -1) }
+  cli.watch = [idle, state('idle'), live(), { delay: 5_000 }, state('idle', { status: 'archived', pylon: 'paused' })]
+  const { clock, nexus, mount } = await boot($, on, cli)
+  await nexus(`open ${ID}`)
+  const ui = await mount()
+  await keys(ui, 'i')
+  await clock.advance(5_000)
+  expect(await ui.find({ type: 'Input', key: 'compose' })).toBeUndefined()
+  expect(await shows(ui, /^An archived thread takes no messages/)).toBe(true)
+  expect(await mode(ui)).toBe('NORMAL')
+  await keys(ui, 'm')
+  await ui.press({ key: 'menu-unarchive' })
+  expect(cli.runs).toContainEqual(['unarchive', '--json', ID])
+})
+
+test('a conversation too big to draw drops its oldest steps, says so at the top, and keeps the keys', async ($, on) => {
   const ids = ['e1', 'e2', 'e3', 'e4', 'e5', 'e6']
   // Each patch is under the row's bound, and six of them are past what one drawing takes.
   const patch = (n: number) => ['@@ -1,340 +1,340 @@', ...Array.from({ length: 340 }, (_, line) => ` line ${n}-${line} ${'x'.repeat(40)}`)].join('\n')
@@ -331,10 +413,13 @@ test('a conversation too big to draw drops its oldest steps, says so, and keeps 
   await nexus(`open ${ID}`)
   const ui = await mount()
   await ui.press({ key: 'fold-e1' })
+  for (const id of ids) if (await ui.find({ type: 'Button', key: `tool-${id}` })) await ui.press({ key: `tool-${id}` })
   expect(await ui.find({ type: 'Button', key: 'tool-e6' })).toBeDefined()
+  await expectWhole(ui)
+  await keys(ui, 'gg')
+  expect(await shows(ui, /^… \d+ earlier blocks? left out of the pane$/)).toBe(true)
   expect(await ui.find({ type: 'Button', key: 'tool-e1' })).toBeUndefined()
-  expect(await shows(ui, /^… 1 earlier block and [12] earlier steps left out of the pane$/)).toBe(true)
-  await expectWhole(ui, ['b', 'm', 'q'])
+  await expectWhole(ui)
 })
 
 test("running calls' live output counts toward what the conversation draws", async ($, on) => {
@@ -349,12 +434,12 @@ test("running calls' live output counts toward what the conversation draws", asy
   const { nexus, mount } = await boot($, on, cli)
   await nexus(`open ${ID}`)
   const ui = await mount()
-  const drawn = (await ui.findAll({ type: 'Button' })).filter(one => one.key?.startsWith('tool-')).length
-  expect(drawn).toBeLessThan(50)
   expect(await ui.find({ type: 'Button', key: 'tool-call_b59|fc_59' })).toBeDefined()
   expect(await shows(ui, 'Running…')).toBe(true)
-  expect(await shows(ui, `… 1 earlier block and ${60 - drawn} earlier steps left out of the pane`)).toBe(true)
-  await expectWhole(ui, ['b', 'x', 'q'])
+  await expectWhole(ui)
+  await keys(ui, 'gg')
+  expect(await shows(ui, /^… \d+ earlier blocks left out of the pane$/)).toBe(true)
+  expect(await ui.find({ type: 'Button', key: 'tool-call_b0|fc_0' })).toBeUndefined()
 })
 
 test('a hostile mix of tool names, live output, big diffs and long answers stays under the cap, measured as drawn', async ($, on) => {
@@ -388,13 +473,18 @@ test('a hostile mix of tool names, live output, big diffs and long answers stays
   const { nexus, mount } = await boot($, on, cli)
   await nexus(`open ${ID}`)
   const ui = await mount()
-  await expectWhole(ui, ['b', 'x', 'q'])
-  // Opening every fold and row drawn only moves what is left out.
+  await expectWhole(ui)
+  // Opening every fold and row drawn, at each page up, only moves what is left out.
   const pressable = async (prefix: string) => (await ui.findAll({ type: 'Button' })).flatMap(one => (one.key?.startsWith(prefix) ? [one.key] : []))
-  for (const key of await pressable('fold-')) await ui.press({ key })
-  for (const key of await pressable('tool-')) if (await ui.find({ type: 'Button', key })) await ui.press({ key })
-  await expectWhole(ui, ['b', 'x', 'q'])
+  for (let page = 0; page < 6; page += 1) {
+    for (const key of await pressable('fold-')) await ui.press({ key })
+    for (const key of await pressable('tool-')) if (await ui.find({ type: 'Button', key })) await ui.press({ key })
+    await expectWhole(ui)
+    await keys(ui, 'u')
+  }
+  await keys(ui, 'gg')
   expect(await shows(ui, /left out of the pane$/)).toBe(true)
+  await expectWhole(ui)
 })
 
 test('a fold of many distinct long tools keeps its line to one row and draws its steps', async ($, on) => {
@@ -405,12 +495,41 @@ test('a fold of many distinct long tools keeps its line to one row and draws its
   const { nexus, mount } = await boot($, on, cli)
   await nexus(`open ${ID}`)
   const ui = await mount()
+  expect(await ui.find({ type: 'Button', key: 'tool-c149' })).toBeDefined()
+  await keys(ui, 'gg')
   const line = (await ui.find({ type: 'Button', key: 'fold-c0' }))?.text ?? ''
   expect(line).toMatch(/^⏺ Called 0-n+/)
   expect(line.length).toBeLessThan(140)
-  expect(await ui.find({ type: 'Button', key: 'tool-c149' })).toBeDefined()
-  expect(carried(await ui.drawn())).toBeLessThan(100_000)
-  expect(await hotkeys(ui)).toEqual(expect.arrayContaining(['b', 'x', 'q']))
+  await expectWhole(ui)
+})
+
+test("the ring's home in a drawing is its cursor, or the tab: where it goes when the element holding it is taken away", async ($, on) => {
+  const cli = fake({ threads: THREADS.map(thread => ({ ...thread, agentTurnRunning: false })), slow: { preview: 3_000 } })
+  const { clock, nexus, mount } = await boot($, on, cli)
+  const ring = async () => ringOf(await ui.drawn())
+  await nexus('')
+  const ui = await mount()
+  // The help hides the list's rows, the cursor's among them: its own close is home until it closes.
+  const row = await cursorOn(ui)
+  await keys(ui, 's')
+  expect(await ring()).toMatchObject({ home: 'help-close' })
+  expect((await ring()).keys.has(row!)).toBe(false)
+  await keys(ui, 'q')
+  expect((await ring()).home).toBe(row)
+  // A closed menu takes its entries away: home is the tab.
+  await nexus(`open ${ID}`)
+  await keys(ui, 'mj')
+  expect((await ring()).home).toBe('menu-archive')
+  await keys(ui, 'q')
+  expect(await ring()).toMatchObject({ home: 'tab-conversation' })
+  expect((await ring()).keys.has('menu-archive')).toBe(false)
+  // A published port's row becomes its preview's, which the cursor follows.
+  await keys(ui, 'llge')
+  expect((await ring()).home).toBe('port-5173')
+  await keys(ui, 'o')
+  await clock.advance(3_000)
+  expect(await ring()).toMatchObject({ home: 'preview-port-5173' })
+  expect((await ring()).keys.has('port-5173')).toBe(false)
 })
 
 test('a cut tree leaves out what does not fit without leaving a null in its place', () => {
@@ -441,8 +560,9 @@ test('a newest answer bigger than a drawing is cut with a note, the keys kept', 
   await nexus(`open ${ID}`)
   const ui = await mount()
   expect(await shows(ui, /^… \d+ more characters of this step left out of the pane$/)).toBe(true)
+  await expectWhole(ui)
+  await keys(ui, 'gg')
   expect(await shows(ui, /^… 1 earlier block left out of the pane$/)).toBe(true)
-  await expectWhole(ui, ['b', 'm', 'q'])
 })
 
 test('a newest step opened past what a drawing takes is cut with a note', async ($, on) => {
@@ -452,10 +572,9 @@ test('a newest step opened past what a drawing takes is cut with a note', async 
   const { nexus, mount } = await boot($, on, cli)
   await nexus(`open ${ID}`)
   const ui = await mount()
-  await ui.press({ key: 'tool-big' })
-  expect(await ui.find({ type: 'Button', key: 'tool-big' })).toBeDefined()
+  await keys(ui, 'o')
   expect(await shows(ui, /^… \d+ more characters of this step left out of the pane$/)).toBe(true)
-  await expectWhole(ui, ['b', 'x', 'q'])
+  await expectWhole(ui)
 })
 
 test('an edit whose call holds more replacements than a drawing takes says how many it left out', async ($, on) => {
@@ -481,32 +600,45 @@ test('an edit whose call holds more replacements than a drawing takes says how m
   expect(await shows(ui, /12 more replacements left out of the pane/)).toBe(true)
 })
 
-test('a busy run queues what is sent; x aborts it', async ($, on) => {
+/** The Actions menu's entries, in order. */
+const menu = async (ui: Ui) => (await ui.findAll({ type: 'Button' })).flatMap(one => (one.key?.startsWith('menu-') ? [one.key.slice(5)] : []))
+
+test('m opens the Actions menu: j and k move its cursor, o runs the entry, q closes it; a busy run queues and aborts', async ($, on) => {
   const cli = fake()
   const { nexus, mount } = await boot($, on, cli)
   await nexus(`open ${ID}`)
   const ui = await mount()
-  await ui.press({ key: 'key-m' })
+  await keys(ui, 'i')
   expect((await ui.find({ type: 'Input', key: 'compose' }))?.props).toMatchObject({ placeholder: 'Queue a follow-up…', submitLabel: 'queue' })
   await ui.input({ key: 'compose', text: '' })
-  await ui.press({ key: 'key-x' })
+  await keys(ui, 'm')
+  expect(await menu(ui)).toEqual(['abort', 'archive', 'copy-attach', 'rewatch', 'delete'])
+  expect(await cursorOn(ui)).toBe('menu-abort')
+  await keys(ui, 'jj')
+  expect(await cursorOn(ui)).toBe('menu-copy-attach')
+  await keys(ui, 'q')
+  expect(await menu(ui)).toEqual([])
+  expect(await ui.find({ type: 'Markdown' })).toBeDefined()
+  await keys(ui, 'mo')
   expect(cli.runs).toContainEqual(['abort', '--json', ID])
+  expect(await menu(ui)).toEqual([])
 })
 
-test('parked tasks hold the run: the line says so and t retries them', async ($, on) => {
+test('parked tasks hold the run: the line says so and the menu retries them', async ($, on) => {
   const cli = fake()
   cli.watch = [{ type: 'reset', thread: ID, entries: ENTRIES.slice(0, -1) }, state('parked', { parkedTasks: 2 }), live()]
   const { nexus, mount } = await boot($, on, cli)
   await nexus(`open ${ID}`)
   const ui = await mount()
   expect((await ui.find({ type: 'Text', text: /restart limit/ }))?.props).toMatchObject({ color: 'warning' })
-  expect(await shows(ui, '⚠ 2 tasks hit the restart limit and hold the run. t retries them.')).toBe(true)
-  expect(await hotkeys(ui)).not.toContain('x')
-  await ui.press({ key: 'key-t' })
+  expect(await shows(ui, '⚠ 2 tasks hit the restart limit and hold the run. m then Retry the parked tasks.')).toBe(true)
+  await keys(ui, 'm')
+  expect(await menu(ui)).not.toContain('abort')
+  await ui.press({ key: 'menu-retry' })
   expect(cli.runs).toContainEqual(['retry', '--json', ID])
 })
 
-test('a failed pylon replaces the composer: p retries it, s starts again from its project and title', async ($, on) => {
+test('a failed pylon replaces the composer; the menu retries it or starts again from its project and title', async ($, on) => {
   const failure = 'setup failed: git clone exited 128'
   const cli = fake({ detail: { ...DETAIL, pylon: { ...DETAIL.pylon, actualState: 'failed', failed: failure } } })
   cli.watch = [{ type: 'reset', thread: ID, entries: ENTRIES.slice(0, -1) }, state('idle', { pylon: 'failed', failed: failure }), live()]
@@ -515,18 +647,21 @@ test('a failed pylon replaces the composer: p retries it, s starts again from it
   const ui = await mount()
   expect(await shows(ui, /^The planner gave up on this thread's pylon/)).toBe(true)
   expect((await ui.find({ type: 'Code', text: failure }))?.text).toBe(failure)
-  expect(await ui.find({ type: 'Text', text: /Message the agent/ })).toBeUndefined()
-  expect(await hotkeys(ui)).toEqual(expect.arrayContaining(['p', 's']))
-  expect(await hotkeys(ui)).not.toContain('m')
-  await ui.press({ key: 'key-p' })
+  expect(await ui.find({ type: 'Input', key: 'compose' })).toBeUndefined()
+  await keys(ui, 'i')
+  expect(await mode(ui)).toBe('NORMAL')
+  await keys(ui, 'm')
+  expect(await menu(ui)).toEqual(expect.arrayContaining(['retry-pylon', 'start-again']))
+  await ui.press({ key: 'menu-retry-pylon' })
   expect(cli.runs).toContainEqual(['retry-pylon', '--json', ID])
-  await ui.press({ key: 'key-s' })
+  await keys(ui, 'm')
+  await ui.press({ key: 'menu-start-again' })
   expect(cli.runs).toContainEqual(['projects', '--json'])
   expect((await ui.find({ type: 'Input', key: 'start-title' }))?.props.value).toBe('Fix login form 500s')
   expect((await ui.find({ type: 'Select', key: 'start-project' }))?.props.value).toBe('web')
 })
 
-test("a pylon whose node says a retry cannot help offers no retry, and says why", async ($, on) => {
+test('a pylon whose node says a retry cannot help offers no retry, and says why', async ($, on) => {
   const cli = fake({ detail: { ...DETAIL, pylon: { ...DETAIL.pylon, actualState: 'failed', failed: 'disk lost', retryRefused: 'The pylon has no disk to resume from' } } })
   cli.watch = [{ type: 'reset', thread: ID, entries: ENTRIES.slice(0, -1) }, state('idle', { pylon: 'failed', failed: 'disk lost' }), live()]
   const { clock, nexus, mount } = await boot($, on, cli)
@@ -534,20 +669,22 @@ test("a pylon whose node says a retry cannot help offers no retry, and says why"
   await clock.settle()
   const ui = await mount()
   expect(await shows(ui, 'The pylon has no disk to resume from.')).toBe(true)
-  expect(await hotkeys(ui)).not.toContain('p')
-  expect(await hotkeys(ui)).toContain('s')
+  await keys(ui, 'm')
+  expect(await menu(ui)).not.toContain('retry-pylon')
+  expect(await menu(ui)).toContain('start-again')
 })
 
-test('a takes an open thread to the archive', async ($, on) => {
+test('the menu archives an open thread', async ($, on) => {
   const cli = fake()
   const { nexus, mount } = await boot($, on, cli)
   await nexus(`open ${ID}`)
   const ui = await mount()
-  await ui.press({ key: 'key-a' })
+  await keys(ui, 'm')
+  await ui.press({ key: 'menu-archive' })
   expect(cli.runs).toContainEqual(['archive', '--json', ID])
 })
 
-test('an archived thread says why it takes no messages, records no visit, and u unarchives it', async ($, on) => {
+test('an archived thread says why it takes no messages, records no visit, and the menu unarchives it', async ($, on) => {
   const archived = { ...THREAD, status: 'archived', agentTurnRunning: false }
   const cli = fake({ threads: [archived], detail: { ...DETAIL, thread: archived } })
   cli.watch = [{ type: 'reset', thread: ID, entries: ENTRIES.slice(0, -1) }, state('idle', { status: 'archived', pylon: 'paused' }), live()]
@@ -555,11 +692,11 @@ test('an archived thread says why it takes no messages, records no visit, and u 
   await nexus(`open ${ID}`)
   const ui = await mount()
   expect(await shows(ui, /^An archived thread takes no messages/)).toBe(true)
-  expect(await hotkeys(ui)).toContain('u')
-  expect(await hotkeys(ui)).not.toContain('a')
   // An archived thread's visit is not human activity: its pylon stays paused.
   expect(cli.runs.some(argv => argv[0] === 'wake')).toBe(false)
-  await ui.press({ key: 'key-u' })
+  await keys(ui, 'm')
+  expect(await menu(ui)).not.toContain('archive')
+  await ui.press({ key: 'menu-unarchive' })
   expect(cli.runs).toContainEqual(['unarchive', '--json', ID])
 })
 
@@ -569,13 +706,57 @@ test('delete names the thread and asks first, Keep being the default', async ($,
   await nexus('')
   await nexus(`open ${ID}`)
   const ui = await mount()
-  await ui.press({ key: 'key-d' })
+  await keys(ui, 'm')
+  await ui.press({ key: 'menu-delete' })
   expect(cli.asked).toEqual(['"Fix login form 500s" (th-4f2a00000001) and its pylon and conversation will be removed. Delete it?'])
   expect(cli.runs.some(argv => argv[0] === 'delete')).toBe(false)
   expect(await shows(ui, `Kept ${ID}.`)).toBe(true)
   cli.answer = 'Delete'
-  await ui.press({ key: 'key-d' })
+  await keys(ui, 'm')
+  await ui.press({ key: 'menu-delete' })
   expect(cli.runs).toContainEqual(['delete', '--json', ID])
+})
+
+test('s shows the keys over the view, and q, s or h closes them', async ($, on) => {
+  const cli = fake()
+  const { nexus, mount } = await boot($, on, cli)
+  await nexus(`open ${ID}`)
+  const ui = await mount()
+  await keys(ui, 's')
+  expect(await shows(ui, /^ {2}g g · g e\s+top · bottom/)).toBe(true)
+  expect(await shows(ui, /vim's G, ctrl\+d, ctrl\+u, \/ and \? are g e, d, u, f and s here/)).toBe(true)
+  expect(await ui.find({ type: 'Markdown' })).toBeUndefined()
+  // A key the help does not take does nothing under it.
+  await keys(ui, 'm')
+  expect(await shows(ui, /^ {2}g g · g e/)).toBe(true)
+  await keys(ui, 'q')
+  expect(await ui.find({ type: 'Markdown' })).toBeDefined()
+  await keys(ui, 'sh')
+  expect(await ui.find({ type: 'Markdown' })).toBeDefined()
+  expect(await shows(ui, /^‹ web \/ Fix login form 500s$/)).toBe(true)
+})
+
+test('the help shows over the list too, and scrolls when the pane is too short for it', async ($, on) => {
+  const cli = fake({ threads: THREADS.map(thread => ({ ...thread, agentTurnRunning: false })) })
+  const { nexus, mount } = await boot($, on, cli)
+  await nexus('')
+  const ui = await mount(80, 16)
+  const first = await cursorOn(ui)
+  /** How far the help is scrolled: the rows it hides above the body. */
+  const scrolled = async () => -((await ui.find({ type: 'Box', key: 'help' }))?.props.marginTop as number) || 0
+  await keys(ui, 's')
+  expect(await shows(ui, /^ {2}g g · g e\s+top · bottom/)).toBe(true)
+  expect(await scrolled()).toBe(0)
+  await keys(ui, 'jj')
+  expect(await scrolled()).toBe(2)
+  await keys(ui, 'ge')
+  const most = await scrolled()
+  expect(most).toBeGreaterThan(2)
+  await keys(ui, 'j')
+  expect(await scrolled()).toBe(most)
+  await keys(ui, 'q')
+  expect(await ui.find({ type: 'Box', key: 'help' })).toBeUndefined()
+  expect(await cursorOn(ui)).toBe(first)
 })
 
 test("opening a thread records one visit, and its show poll stands in for the list's", async ($, on) => {
@@ -590,35 +771,52 @@ test("opening a thread records one visit, and its show poll stands in for the li
   expect(cli.runs.filter(argv => argv[0] === 'wake')).toHaveLength(1)
 })
 
-test('details: the pylon, previews linked by their own URL, ports, outputs, sessions and the attach command to copy', async ($, on) => {
+test('l walks the tabs: Details shows the pylon, outputs, sessions and the attach command y copies; h walks back to the list', async ($, on) => {
   const cli = fake()
   const { nexus, mount } = await boot($, on, cli)
   await nexus(`open ${ID}`)
   const ui = await mount()
-  await ui.press({ key: 'key-i' })
+  await keys(ui, 'l')
   const rows = await texts(ui, 'Box')
   expect(rows).toEqual(expect.arrayContaining(['Desired    ● running', 'Observed   ● running', 'Node       firebat', 'Last seen  just now', 'Human      2 min ago', 'Agent      turn running']))
-  // Text queries join a row's parts without the gaps the layout puts between them.
-  const links = await ui.findAll({ type: 'Link' })
-  expect(links.map(link => [link.props.href, link.text])).toEqual([[WEB_PREVIEW.url, WEB_PREVIEW.url]])
-  expect(await shows(ui, /^●webport 3000ready/, 'Box')).toBe(true)
-  expect(await shows(ui, /^●apistartinghttps:\/\/rj-firebat\.example\.ts\.net:10202\/$/, 'Box')).toBe(true)
-  // Each port once: 3000 has its preview above, so Ports lists the other two.
-  expect(await shows(ui, /^Ports 2$/)).toBe(true)
-  expect((await ui.find({ type: 'Button', key: 'port-5173' }))?.text).toBe('● 5173 no preview yet; press to open one')
-  expect(await shows(ui, /^●9229worker, a service with no preview$/, 'Box')).toBe(true)
-  expect(await ui.find({ type: 'Button', key: 'port-9229' })).toBeUndefined()
-  expect(await ui.find({ key: 'port-3000' })).toBeUndefined()
-  // The preview output is the preview listed above, so the outputs leave it out.
-  expect(await shows(ui, /^Outputs 1$/)).toBe(true)
+  // The preview output is the preview Ports lists, so the outputs leave it out.
+  expect(await shows(ui, /^OUTPUTS 1 ─/, 'Box')).toBe(true)
   expect(await shows(ui, /^branch\s+fix\/login-plus$/, 'Box')).toBe(true)
-  expect(await shows(ui, /^Claude Code● workingnexus:1\.2session 9c1e$/, 'Box')).toBe(true)
-  await ui.press({ key: 'key-c' })
+  expect(await shows(ui, /^Claude Code◉ workingnexus:1\.2session 9c1e$/, 'Box')).toBe(true)
+  expect(await ui.find({ type: 'Link' })).toBeUndefined()
+  await keys(ui, 'y')
   expect(cli.copied).toEqual(['herdr --session nexus-7f3a'])
   expect(await shows(ui, 'Copied: herdr --session nexus-7f3a')).toBe(true)
   await expectThemeColours(ui)
-  await ui.press({ key: 'key-b' })
+  await keys(ui, 'h')
   expect(await ui.find({ type: 'Markdown' })).toBeDefined()
+  await keys(ui, 'h')
+  expect(await cursorOn(ui)).toBe(ID)
+})
+
+/** The Ports tab: l twice from the conversation. */
+const toPorts = (ui: Ui) => keys(ui, 'll')
+
+test('Ports lists the previews linked by their own URL and the ports with none, each once, under a cursor', async ($, on) => {
+  const cli = fake()
+  const { nexus, mount } = await boot($, on, cli)
+  await nexus(`open ${ID}`)
+  const ui = await mount()
+  await toPorts(ui)
+  expect((await ui.findAll({ type: 'Link' })).map(link => [link.props.href, link.text])).toEqual([[WEB_PREVIEW.url, WEB_PREVIEW.url]])
+  expect((await ui.find({ type: 'Button', key: 'preview-web' }))?.text).toBe('❯ ● web :3000  ready ')
+  expect(await shows(ui, /^ {4}⏎ or y copies the URL$/)).toBe(true)
+  expect(await shows(ui, /^ {2}◐ api {2}starting https:\/\/rj-firebat\.example\.ts\.net:10202\/$/, 'Box')).toBe(true)
+  // Each port once: 3000 has its preview above, so Ports lists the other two.
+  expect(await shows(ui, /^PORTS 2 ─/, 'Box')).toBe(true)
+  expect((await ui.find({ type: 'Button', key: 'port-5173' }))?.text).toBe('  ◌ 5173 not published')
+  expect(await shows(ui, /^ {2}◌ 9229 {2}worker, a service with no preview$/, 'Box')).toBe(true)
+  expect(await ui.find({ type: 'Button', key: 'port-9229' })).toBeUndefined()
+  expect(await ui.find({ key: 'port-3000' })).toBeUndefined()
+  await keys(ui, 'jj')
+  expect(await cursorOn(ui)).toBe('port-5173')
+  expect((await ui.find({ type: 'Button', key: 'port-5173' }))?.text).toBe('❯ ◌ 5173 not published; ⏎ publishes it')
+  await expectThemeColours(ui)
 })
 
 test("a preview's link is the CLI's URL, with or without the nodes", async ($, on) => {
@@ -626,35 +824,35 @@ test("a preview's link is the CLI's URL, with or without the nodes", async ($, o
   const { nexus, mount } = await boot($, on, cli)
   await nexus(`open ${ID}`)
   const ui = await mount()
-  await ui.press({ key: 'key-i' })
+  await toPorts(ui)
   expect((await ui.findAll({ type: 'Link' })).map(link => link.props.href)).toEqual([WEB_PREVIEW.url])
 })
 
-test('a port opens on its digit: progress while the CLI waits, then Previews lists it with its link, before the details do', async ($, on) => {
+test('o on a port publishes it: progress while the CLI waits, then Previews lists it with its link, before the details do', async ($, on) => {
   const cli = fake({ slow: { preview: 3_000 } })
   const { clock, nexus, mount } = await boot($, on, cli)
   await nexus(`open ${ID}`)
   const ui = await mount()
-  await ui.press({ key: 'key-i' })
-  expect((await ui.find({ type: 'Button', key: 'port-5173' }))?.props.hotkey).toBe('1')
-  await ui.press({ key: 'port-5173' })
+  await toPorts(ui)
+  await keys(ui, 'ge')
+  expect(await cursorOn(ui)).toBe('port-5173')
+  await keys(ui, 'o')
   expect(cli.spawns).toContainEqual(['preview', '--json', ID, '5173', '--wait'])
-  expect((await ui.find({ type: 'Button', key: 'port-5173' }))?.text).toBe('● 5173 opening: publishing it and waiting for the node to serve its URL…')
+  expect((await ui.find({ type: 'Button', key: 'port-5173' }))?.text).toBe('❯ ◐ 5173 opening: publishing it and waiting for the node to serve its URL…')
   await ui.press({ key: 'port-5173' })
   expect(cli.spawns.filter(argv => argv[0] === 'preview')).toHaveLength(1)
   const polled = cli.spawns.filter(argv => argv[0] === 'show').length
   await clock.advance(3_000)
   expect((await ui.find({ type: 'Link', text: OPENED.url }))?.props.href).toBe(OPENED.url)
   expect(await ui.find({ key: 'port-5173' })).toBeUndefined()
-  expect(await shows(ui, new RegExp(`^●port-5173ready${OPENED.url}$`), 'Box')).toBe(true)
+  expect((await ui.find({ type: 'Button', key: 'preview-port-5173' }))?.text).toMatch(/● port-5173 {2}ready $/)
   expect(cli.spawns.filter(argv => argv[0] === 'show').length).toBeGreaterThan(polled)
   // The next details list it too, once.
-  const opened = { ...OPENED, pylon: 'pylon-7f3a' }
-  cli.detail = { ...DETAIL, previews: [...DETAIL.previews, opened], ports: DETAIL.ports.map(one => (one.port === 5173 ? { ...one, preview: opened } : one)) }
+  cli.detail = PUBLISHED
   await clock.advance(5_000)
   expect(await ui.find({ key: 'port-5173' })).toBeUndefined()
-  expect(await shows(ui, /^Ports 1$/)).toBe(true)
-  expect(await shows(ui, new RegExp(`^●port-5173ready${OPENED.url}$`), 'Box')).toBe(true)
+  expect(await shows(ui, /^PORTS 1 ─/, 'Box')).toBe(true)
+  expect(await ui.findAll({ type: 'Button', key: 'preview-port-5173' })).toHaveLength(1)
 })
 
 test('a port that does not open says why, and opens again when pressed', async ($, on) => {
@@ -662,9 +860,9 @@ test('a port that does not open says why, and opens again when pressed', async (
   const { nexus, mount } = await boot($, on, cli)
   await nexus(`open ${ID}`)
   const ui = await mount()
-  await ui.press({ key: 'key-i' })
+  await toPorts(ui)
   await ui.press({ key: 'port-5173' })
-  expect((await ui.find({ type: 'Button', key: 'port-5173' }))?.text).toBe('● 5173 did not open; press again to retry')
+  expect((await ui.find({ type: 'Button', key: 'port-5173' }))?.text).toBe('  ✕ 5173 did not open; ⏎ tries again')
   expect((await ui.find({ type: 'Text', text: /the pylon is not running/ }))?.props).toMatchObject({ color: 'error' })
   delete cli.fail.preview
   await ui.press({ key: 'port-5173' })
@@ -672,42 +870,39 @@ test('a port that does not open says why, and opens again when pressed', async (
   expect(await ui.find({ type: 'Link', text: OPENED.url })).toBeDefined()
 })
 
-const closeKeys = async (ui: Ui) => (await ui.findAll({ type: 'Button' })).flatMap(one => (one.key?.startsWith('close-') ? [[one.key, one.props.hotkey]] : []))
+/** Moves the Ports cursor down to `key`. */
+async function cursorTo(ui: Ui, key: string) {
+  for (let step = 0; step < 8 && (await cursorOn(ui)) !== key; step += 1) await keys(ui, 'j')
+  expect(await cursorOn(ui)).toBe(key)
+}
 
-test("x then a preview's digit unpublishes a linked port: closing… while the CLI runs, then the port is back under Ports", async ($, on) => {
+test("x unpublishes the linked preview under the cursor: closing… while the CLI runs, then the port is back under Ports", async ($, on) => {
   const cli = fake({ detail: PUBLISHED, slow: { unpreview: 3_000 } })
   const { clock, nexus, mount } = await boot($, on, cli)
   await nexus(`open ${ID}`)
   const ui = await mount()
-  await ui.press({ key: 'key-i' })
-  expect(await shows(ui, /^Previews 3$/)).toBe(true)
-  expect((await ui.find({ type: 'Button', key: 'key-x' }))?.props.label).toBe('unpublish a preview')
-  expect(await closeKeys(ui)).toEqual([])
-  await ui.press({ key: 'key-x' })
-  // Only the linked port's preview can be closed; the digits leave Ports meanwhile.
-  expect(await closeKeys(ui)).toEqual([['close-5173', '1']])
-  expect(await hotkeys(ui)).not.toContain('2')
-  expect((await ui.find({ type: 'Button', key: 'key-x' }))?.props.label).toBe('cancel unpublish')
-  expect(await shows(ui, "A preview's digit unpublishes it. Publishing the port again may give it a new URL.")).toBe(true)
-  await ui.press({ key: 'close-5173' })
+  await toPorts(ui)
+  expect(await shows(ui, /^PREVIEWS 3 ─/, 'Box')).toBe(true)
+  await cursorTo(ui, 'preview-port-5173')
+  expect(await shows(ui, /^ {4}⏎ or y copies the URL · x unpublishes it \(a new publish may get a new URL\)$/)).toBe(true)
+  await keys(ui, 'x')
   expect(cli.spawns).toContainEqual(['unpreview', '--json', ID, '5173'])
-  expect(await shows(ui, new RegExp(`^●port-5173closing…${OPENED.url}$`), 'Box')).toBe(true)
+  expect((await ui.find({ type: 'Button', key: 'preview-port-5173' }))?.text).toMatch(/closing… $/)
   expect(await ui.find({ type: 'Link', text: OPENED.url })).toBeUndefined()
-  expect(await closeKeys(ui)).toEqual([])
-  // Nothing else to unpublish while it closes.
-  expect(await ui.find({ type: 'Button', key: 'key-x' })).toBeUndefined()
+  // Nothing else starts on the port while it closes.
+  await keys(ui, 'x')
+  expect(cli.spawns.filter(argv => argv[0] === 'unpreview')).toHaveLength(1)
+  expect(await shows(ui, 'It is closing already.')).toBe(true)
   const polled = cli.spawns.filter(argv => argv[0] === 'show').length
   await clock.advance(3_000)
   expect(cli.spawns.filter(argv => argv[0] === 'show').length).toBeGreaterThan(polled)
-  // Closed: Ports lists it again, publishable on its digit, before the details catch up.
-  expect(await shows(ui, /^Previews 2$/)).toBe(true)
-  expect(await shows(ui, /^Ports 2$/)).toBe(true)
-  expect((await ui.find({ type: 'Button', key: 'port-5173' }))?.props).toMatchObject({ hotkey: '1' })
-  expect((await ui.find({ type: 'Button', key: 'port-5173' }))?.text).toBe('● 5173 no preview yet; press to open one')
-  expect(await ui.find({ type: 'Button', key: 'key-x' })).toBeUndefined()
+  // Closed: Ports lists it again, publishable, before the details catch up.
+  expect(await shows(ui, /^PREVIEWS 2 ─/, 'Box')).toBe(true)
+  expect(await shows(ui, /^PORTS 2 ─/, 'Box')).toBe(true)
+  expect((await ui.find({ type: 'Button', key: 'port-5173' }))?.text).toMatch(/◌ 5173 not published/)
   cli.detail = DETAIL
   await clock.advance(5_000)
-  expect((await ui.find({ type: 'Button', key: 'port-5173' }))?.text).toBe('● 5173 no preview yet; press to open one')
+  expect((await ui.find({ type: 'Button', key: 'port-5173' }))?.text).toMatch(/◌ 5173 not published/)
   expect(cli.spawns.filter(argv => argv[0] === 'unpreview')).toHaveLength(1)
 })
 
@@ -716,14 +911,13 @@ test('a preview that does not close says why on its row and keeps its link; an o
   const { nexus, mount } = await boot($, on, cli)
   await nexus(`open ${ID}`)
   const ui = await mount()
-  await ui.press({ key: 'key-i' })
-  await ui.press({ key: 'key-x' })
-  await ui.press({ key: 'close-5173' })
+  await toPorts(ui)
+  await cursorTo(ui, 'preview-port-5173')
+  await keys(ui, 'x')
   expect((await ui.find({ type: 'Text', text: /the node firebat cannot be reached\.$/ }))?.props).toMatchObject({ color: 'error' })
   expect(await ui.find({ type: 'Link', text: OPENED.url })).toBeDefined()
   cli.fail.unpreview = { exitCode: 64, error: 'unknown command unpreview' }
-  await ui.press({ key: 'key-x' })
-  await ui.press({ key: 'close-5173' })
+  await keys(ui, 'x')
   expect(await shows(ui, /nexus has no unpreview command: unpublishing a preview needs Nexus CLI 0.3.0 or later \(nexus --version\)\.$/)).toBe(true)
 })
 
@@ -732,18 +926,22 @@ test('a publish still waiting is not offered for unpublishing, even once the det
   const { clock, nexus, mount } = await boot($, on, cli)
   await nexus(`open ${ID}`)
   const ui = await mount()
-  await ui.press({ key: 'key-i' })
+  await toPorts(ui)
   await ui.press({ key: 'port-5173' })
   // The control plane allocates the preview while `preview --wait` still waits for the node to serve it.
   const allocated = { ...OPENED, ready: false }
   cli.detail = { ...DETAIL, previews: [...DETAIL.previews, allocated], ports: DETAIL.ports.map(one => (one.port === 5173 ? { ...one, preview: allocated } : one)) }
   await clock.advance(5_000)
-  expect(await hotkeys(ui)).not.toContain('x')
-  expect(await shows(ui, new RegExp(`^●port-5173opening…${OPENED.url}$`), 'Box')).toBe(true)
+  expect((await ui.find({ type: 'Button', key: 'preview-port-5173' }))?.text).toMatch(/opening… $/)
+  await cursorTo(ui, 'preview-port-5173')
+  await keys(ui, 'x')
+  expect(cli.spawns.some(argv => argv[0] === 'unpreview')).toBe(false)
+  expect(await shows(ui, 'Its publish is still under way.')).toBe(true)
   cli.detail = PUBLISHED
   await clock.advance(5_000)
   expect(await ui.find({ type: 'Link', text: OPENED.url })).toBeDefined()
-  expect(await hotkeys(ui)).toContain('x')
+  await keys(ui, 'x')
+  expect(cli.spawns).toContainEqual(['unpreview', '--json', ID, '5173'])
 })
 
 test('a publish under way is still known after leaving the thread and opening it again, and nothing else starts on its port', async ($, on) => {
@@ -751,20 +949,20 @@ test('a publish under way is still known after leaving the thread and opening it
   const { clock, nexus, mount } = await boot($, on, cli)
   await nexus(`open ${ID}`)
   const ui = await mount()
-  await ui.press({ key: 'key-i' })
+  await toPorts(ui)
   await ui.press({ key: 'port-5173' })
-  await ui.press({ key: 'key-b' })
-  await ui.press({ key: 'key-b' })
+  await keys(ui, 'hhh')
   expect(await ui.find({ type: 'Markdown' })).toBeUndefined()
   await nexus(`open ${ID}`)
-  await ui.press({ key: 'key-i' })
-  expect((await ui.find({ type: 'Button', key: 'port-5173' }))?.text).toBe('● 5173 opening: publishing it and waiting for the node to serve its URL…')
+  await toPorts(ui)
+  expect((await ui.find({ type: 'Button', key: 'port-5173' }))?.text).toMatch(/◐ 5173 opening: publishing it and waiting for the node to serve its URL…$/)
   // The control plane lists the allocated preview while `preview --wait` still waits.
   const allocated = { ...OPENED, ready: false }
   cli.detail = { ...DETAIL, previews: [...DETAIL.previews, allocated], ports: DETAIL.ports.map(one => (one.port === 5173 ? { ...one, preview: allocated } : one)) }
   await clock.advance(5_000)
-  expect(await hotkeys(ui)).not.toContain('x')
-  expect(await shows(ui, new RegExp(`^●port-5173opening…${OPENED.url}$`), 'Box')).toBe(true)
+  await cursorTo(ui, 'preview-port-5173')
+  await keys(ui, 'x')
+  expect((await ui.find({ type: 'Button', key: 'preview-port-5173' }))?.text).toMatch(/opening… $/)
   await clock.advance(15_000)
   expect(await ui.find({ type: 'Link', text: OPENED.url })).toBeDefined()
   expect(cli.spawns.filter(argv => argv[0] === 'preview' || argv[0] === 'unpreview')).toHaveLength(1)
@@ -775,13 +973,13 @@ test('the details asked for right after a publish ends count, even in the same m
   const { clock, nexus, mount } = await boot($, on, cli)
   await nexus(`open ${ID}`)
   const ui = await mount()
-  await ui.press({ key: 'key-i' })
+  await toPorts(ui)
   await ui.press({ key: 'port-5173' })
   const polled = cli.spawns.filter(argv => argv[0] === 'show').length
   await clock.advance(3_000)
   expect(cli.spawns.filter(argv => argv[0] === 'show').length).toBe(polled + 1)
   expect(await ui.find({ type: 'Link', text: OPENED.url })).toBeUndefined()
-  expect((await ui.find({ type: 'Button', key: 'port-5173' }))?.text).toBe('● 5173 no preview yet; press to open one')
+  expect((await ui.find({ type: 'Button', key: 'port-5173' }))?.text).toMatch(/◌ 5173 not published/)
 })
 
 test('a port unpublished then published again before the details catch up stays under Ports, and says why the publish failed', async ($, on) => {
@@ -789,37 +987,41 @@ test('a port unpublished then published again before the details catch up stays 
   const { clock, nexus, mount } = await boot($, on, cli)
   await nexus(`open ${ID}`)
   const ui = await mount()
-  await ui.press({ key: 'key-i' })
+  await toPorts(ui)
   // From here the details lag: every `show` hangs, so the pane keeps the snapshot that lists the preview.
   cli.slow.show = 600_000
-  await ui.press({ key: 'key-x' })
-  await ui.press({ key: 'close-5173' })
-  expect(await shows(ui, /^Previews 2$/)).toBe(true)
+  await cursorTo(ui, 'preview-port-5173')
+  await keys(ui, 'x')
+  expect(await shows(ui, /^PREVIEWS 2 ─/, 'Box')).toBe(true)
   cli.slow.preview = 3_000
   cli.fail.preview = { exitCode: 1, error: 'the node did not serve the preview within 120 s' }
   await ui.press({ key: 'port-5173' })
-  expect(await shows(ui, /^Previews 2$/)).toBe(true)
-  expect((await ui.find({ type: 'Button', key: 'port-5173' }))?.text).toBe('● 5173 opening: publishing it and waiting for the node to serve its URL…')
+  expect(await shows(ui, /^PREVIEWS 2 ─/, 'Box')).toBe(true)
+  expect((await ui.find({ type: 'Button', key: 'port-5173' }))?.text).toMatch(/◐ 5173 opening: publishing it and waiting for the node to serve its URL…$/)
   await clock.advance(3_000)
-  expect(await shows(ui, /^Previews 2$/)).toBe(true)
+  expect(await shows(ui, /^PREVIEWS 2 ─/, 'Box')).toBe(true)
   expect(await ui.find({ type: 'Link', text: OPENED.url })).toBeUndefined()
-  expect((await ui.find({ type: 'Button', key: 'port-5173' }))?.text).toBe('● 5173 did not open; press again to retry')
+  expect((await ui.find({ type: 'Button', key: 'port-5173' }))?.text).toMatch(/✕ 5173 did not open; ⏎ tries again$/)
   expect((await ui.find({ type: 'Text', text: /the node did not serve the preview within 120 s\.$/ }))?.props).toMatchObject({ color: 'error' })
 })
 
-test("no unpublish is offered for a service's preview, nor for an archived thread's", async ($, on) => {
+test("x says why a service's preview, or an archived thread's, cannot be unpublished", async ($, on) => {
   const cli = fake()
   const { clock, nexus, mount } = await boot($, on, cli)
   await nexus(`open ${ID}`)
   const ui = await mount()
-  await ui.press({ key: 'key-i' })
-  expect(await hotkeys(ui)).not.toContain('x')
+  await toPorts(ui)
+  await keys(ui, 'x')
+  expect(await shows(ui, "web is a declared service's preview, which can't be unpublished.")).toBe(true)
   const archived = { ...THREAD, status: 'archived', agentTurnRunning: false }
   cli.detail = { ...PUBLISHED, thread: archived }
   await clock.advance(5_000)
   expect(await ui.find({ type: 'Link', text: OPENED.url })).toBeUndefined()
-  expect(await shows(ui, /^●port-5173paused/, 'Box')).toBe(true)
-  expect(await hotkeys(ui)).not.toContain('x')
+  expect((await ui.find({ type: 'Button', key: 'preview-port-5173' }))?.text).toMatch(/ paused $/)
+  await cursorTo(ui, 'preview-port-5173')
+  await keys(ui, 'x')
+  expect(await shows(ui, "An archived thread's previews can't be unpublished.")).toBe(true)
+  expect(cli.spawns.some(argv => argv[0] === 'unpreview')).toBe(false)
 })
 
 test('with no port to open, Ports says why: nothing listens and the ::1 hint, a pylon not running, or ports unknown', async ($, on) => {
@@ -828,7 +1030,7 @@ test('with no port to open, Ports says why: nothing listens and the ::1 hint, a 
   const { clock, nexus, mount } = await boot($, on, cli)
   await nexus(`open ${ID}`)
   const ui = await mount()
-  await ui.press({ key: 'key-i' })
+  await toPorts(ui)
   expect(await shows(ui, `Nothing listens yet. ${hint}`)).toBe(true)
   cli.detail = { ...DETAIL, ports: [DETAIL.ports[0]] }
   await clock.advance(5_000)
@@ -846,7 +1048,7 @@ test('the start form offers the projects and nodes, starts with every field it w
   const { nexus, mount } = await boot($, on, cli)
   await nexus('')
   const ui = await mount()
-  await ui.press({ key: 'key-n' })
+  await keys(ui, 'n')
   const project = await ui.find({ type: 'Select', key: 'start-project' })
   expect(project?.props).toMatchObject({ value: 'web', options: [{ value: 'web', label: 'web  git@github.com:me/web.git' }, { value: 'api', label: 'api  git@github.com:me/api.git' }] })
   expect((await ui.find({ type: 'Select', key: 'start-node' }))?.props.options).toEqual([
@@ -871,7 +1073,8 @@ test('a start the person left while it ran only says how it went', async ($, on)
   const { clock, nexus, mount } = await boot($, on, cli)
   await nexus('')
   const ui = await mount()
-  await ui.press({ key: 'key-n' })
+  await keys(ui, 'h')
+  await keys(ui, 'n')
   await ui.input({ key: 'start-title', text: 'New one' })
   await ui.press({ key: 'start-cancel' })
   await clock.advance(5_000)
@@ -886,17 +1089,18 @@ test('a start the person left for another form does not take that form over', as
   const { clock, nexus, mount } = await boot($, on, cli)
   await nexus('')
   const ui = await mount()
-  await ui.press({ key: 'key-n' })
+  await keys(ui, 'h')
+  await keys(ui, 'n')
   await ui.input({ key: 'start-title', text: 'First' })
   await clock.advance(2_000)
   await ui.press({ key: 'start-cancel' })
-  await ui.press({ key: 'key-n' })
+  await keys(ui, 'n')
   await ui.input({ key: 'start-title', text: 'Second' })
   await clock.advance(3_000)
   // The first start ended: the second form stays, still starting.
   expect((await ui.find({ type: 'Button', key: 'start-submit' }))?.props.label).toBe('Starting…')
   expect(await shows(ui, 'Started New one.')).toBe(true)
-  expect(cli.spawns.some(argv => argv[0] === 'watch')).toBe(false)
+  expect(cli.spawns.some(argv => argv[1] === 'th-123456789abc')).toBe(false)
   await clock.advance(2_000)
   expect(cli.runs.filter(argv => argv[0] === 'start')).toHaveLength(2)
   expect(cli.spawns).toContainEqual(['watch', 'th-123456789abc', '--json'])
@@ -915,7 +1119,8 @@ test('a start whose switch to the thread loses a race to a new form follows noth
   const { clock, nexus, mount } = await boot($, on, cli)
   await nexus('')
   const ui = await mount()
-  await ui.press({ key: 'key-n' })
+  await keys(ui, 'h')
+  await keys(ui, 'n')
   await ui.input({ key: 'start-title', text: 'New one' })
   await clock.advance(5_000)
   expect(isRaced).toBe(true)
@@ -929,12 +1134,14 @@ test('a start that ends after the pane closed watches nothing until the pane ope
   const { clock, nexus, mount } = await boot($, on, cli)
   await nexus('')
   const ui = await mount()
-  await ui.press({ key: 'key-n' })
+  await keys(ui, 'h')
+  await keys(ui, 'n')
   await ui.input({ key: 'start-title', text: 'New one' })
   await nexus('close')
+  const watches = cli.spawns.filter(argv => argv[0] === 'watch').length
   await clock.advance(5_000)
   expect(cli.runs).toContainEqual(['start', '--json', '--project=web', '--title=New one'])
-  expect(cli.spawns.some(argv => argv[0] === 'watch')).toBe(false)
+  expect(cli.spawns.filter(argv => argv[0] === 'watch')).toHaveLength(watches)
   await nexus('')
   expect(cli.spawns).toContainEqual(['watch', 'th-123456789abc', '--json'])
 })
@@ -944,7 +1151,7 @@ test('a start the control plane refuses stays on the form with its reason', asyn
   const { nexus, mount } = await boot($, on, cli)
   await nexus('')
   const ui = await mount()
-  await ui.press({ key: 'key-n' })
+  await keys(ui, 'n')
   await ui.press({ key: 'start-submit' })
   expect(await shows(ui, 'Give the thread a title or a first message.')).toBe(true)
   await ui.input({ key: 'start-title', text: 'Try it' })
@@ -962,4 +1169,26 @@ test('a row or a show without a field docs/cli.md requires is a contract error, 
   expect(await shows(ui, /a row \(th-4f2a00000001\) without its pylon, which docs\/cli\.md requires: the CLI and this mod disagree/)).toBe(true)
   await nexus(`open ${ID}`)
   expect(await shows(ui, /^The thread's details did not load: .*printed no attach, which docs\/cli\.md requires/)).toBe(true)
+})
+
+test('the first open says once how to draw the pane on the terminal background', async ($, on) => {
+  const cli = fake({ store: {} })
+  const { nexus, mount } = await boot($, on, cli)
+  await nexus(`open ${ID}`)
+  const ui = await mount()
+  expect(await shows(ui, 'Tip: pick "Dark (ANSI), Nexus pane on the terminal background" in /theme to draw this pane on your terminal\'s background.')).toBe(true)
+  await nexus('close')
+  await nexus(`open ${ID}`)
+  expect(await shows(ui, /^Tip: pick/)).toBe(false)
+})
+
+test('the dock paints its body and title bar; above the prompt it paints nothing of its own', async ($, on) => {
+  const cli = fake()
+  const { nexus, mount } = await boot($, on, cli)
+  await nexus(`open ${ID}`)
+  const ui = await mount()
+  const painted = async () => (await ui.findAll({ type: 'Box' })).flatMap(one => (typeof one.props.backgroundColor === 'string' ? [one.props.backgroundColor] : []))
+  expect(await painted()).toEqual(expect.arrayContaining(['bashMessageBackgroundColor', 'userMessageBackground']))
+  await ui.redraw({ title: 'Nexus', isFocused: true, bodyColumns: 100, placement: 'inline', scroll: { offset: 0, bodyRows: 60 }, view: {} } as never)
+  expect(await painted()).toEqual(['userMessageBackground'])
 })

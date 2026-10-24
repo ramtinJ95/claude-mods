@@ -121,3 +121,49 @@ test("unpublish closes a linked port's preview from the tool and /nexus, says wh
   expect(await call(5173)).toMatchObject({ deny: `nexus (invalid): ${needs}` })
   expect(await nexus('unpublish 5173')).toEqual({ text: `N${needs.slice(1)}.` })
 })
+
+test('one operation at a time holds a port, whichever of the pane, /nexus or a tool started it; a second is refused, not queued', async ($, on) => {
+  const cli = fake({ slow: { preview: 3_000, unpreview: 3_000 } })
+  const { clock, nexus, mount } = await boot($, on, cli)
+  const busy = `Port 5173 on ${ID} is already being published or unpublished. Try again when it finishes.`
+  const unpublish = () => $.tool.call({ tool: 'mcp__nexus__unpublish', thread: ID, port: 5173 } as never)
+  const publish = () => $.tool.call({ tool: 'mcp__nexus__preview', thread: ID, port: 5173 } as never)
+  const ops = () => cli.spawns.filter(argv => argv[0] === 'preview' || argv[0] === 'unpreview')
+  await nexus(`open ${ID}`)
+  const ui = await mount()
+  const keys = async (letters: string) => {
+    for (const letter of letters) await ui.press({ key: `key-${letter}` })
+  }
+  await keys('ll')
+  // A tool publishes: the pane's press on the same port is refused and says why.
+  const opening = publish()
+  await clock.advance(0)
+  await ui.press({ key: 'port-5173' })
+  expect(await ui.find({ type: 'Text', text: busy })).toBeDefined()
+  expect(ops()).toHaveLength(1)
+  await clock.advance(3_000)
+  expect(JSON.parse(String((await opening).result))).toMatchObject({ port: 5173, url: OPENED.url })
+  // The pane unpublishes: the tool and /nexus are refused until it ends.
+  await clock.advance(5_000)
+  await keys('ggjjx')
+  expect(ops()).toHaveLength(2)
+  expect(ops()[1]).toEqual(['unpreview', '--json', ID, '5173'])
+  expect(await unpublish()).toMatchObject({ deny: busy })
+  expect(await publish()).toMatchObject({ deny: busy })
+  expect(await nexus('unpublish 5173')).toEqual({ text: busy })
+  expect(ops()).toHaveLength(2)
+  await clock.advance(3_000)
+  // Once free, the port takes an operation again.
+  const again = publish()
+  await clock.advance(3_000)
+  expect(JSON.parse(String((await again).result))).toMatchObject({ port: 5173 })
+  expect(ops()).toHaveLength(3)
+})
+
+test('unpublish takes only the null docs/cli.md promises as done; any other answer is a CLI this mod does not know', async ($, on) => {
+  const cli = fake({ printed: { unpreview: { closed: true } } })
+  const { nexus } = await boot($, on, cli)
+  const wrong = 'nexus unpreview printed {"closed":true} where docs/cli.md says null: the CLI and this mod disagree on the contract'
+  expect(await $.tool.call({ tool: 'mcp__nexus__unpublish', thread: ID, port: 5173 } as never)).toMatchObject({ deny: `nexus (failed): ${wrong}` })
+  expect(await nexus(`unpublish 5173 ${ID}`)).toEqual({ text: `N${wrong.slice(1)}.` })
+})

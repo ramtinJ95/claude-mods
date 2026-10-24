@@ -1,0 +1,5 @@
+{
+  "name": "Dark (ANSI), Nexus pane on the terminal background",
+  "base": "dark-ansi",
+  "overrides": { "composerSidebarBackground": "ansi:black" }
+}
