@@ -64,7 +64,6 @@ import {
   sentence,
   sessionName,
   settleSessions,
-  shellQuote,
   stripChips,
   transcript,
 } from './model'
@@ -1087,7 +1086,7 @@ async function askSession($: EngineInterface, thread: string): Promise<Outcome<{
 
 /** How to attach a terminal on this Mac to the thread's sessions: Claude Code cannot hand its own terminal over. */
 const attachHow = (thread: string) =>
-  `Claude Code cannot give its terminal to the attach, so run this in a terminal or a Herdr tab:\n\n  ${attachCommand(thread)}\n\nEach session is a workspace in the pylon's Herdr: pick one there, and detach from Herdr to come back. ${SSH_HINT}`
+  `Claude Code cannot give its terminal to the attach, so run this in a terminal or a Herdr tab:\n\n  ${attachCommand(cli, thread)}\n\nEach session is a workspace in the pylon's Herdr: pick one there, and detach from Herdr to come back. ${SSH_HINT}`
 
 /**
  * `nexus attach` in a new tab of the Herdr workspace Claude Code runs in, put in front: Claude Code cannot hand its
@@ -1102,7 +1101,7 @@ async function attachInHerdr($: EngineInterface, workspace: string, thread: stri
   if (!created.ok) return created
   const pane = parseHerdrTab(created.value)
   if (!pane) return failed('herdr tab create printed no pane')
-  const ran = await herdr($, ['pane', 'run', pane, `${shellQuote(cli)} attach ${shellQuote(thread)}`])
+  const ran = await herdr($, ['pane', 'run', pane, attachCommand(cli, thread)])
   return ran.ok ? { ok: true, value: label } : ran
 }
 
@@ -1727,7 +1726,7 @@ function paneActions($: EngineInterface, surface: RenderSurface): PaneActions {
     const opened = !isCopy && herdrWorkspace ? await attachInHerdr($, herdrWorkspace, thread) : null
     if (opened?.ok) return setPane($, () => ({ notice: { text: tabOpened(opened.value), tone: 'dim' } }))
     const why = opened ? `The Herdr tab did not open: ${sentence(opened.failure.message)} ` : ''
-    const command = attachCommand(thread)
+    const command = attachCommand(cli, thread)
     const copied = await $.ui.copy({ text: command, surface })
     const how = "run it in a terminal or a Herdr tab, pick the session's workspace in Herdr, and detach from Herdr to come back."
     await setPane($, () => ({
@@ -1993,6 +1992,7 @@ export const register: Register = (on, options) => {
       isFocused: e.props.isFocused,
       surface: e.surface,
       inHerdr: herdrWorkspace !== null,
+      cli,
     }
     const actions = paneActions($, e.surface)
     const tree =

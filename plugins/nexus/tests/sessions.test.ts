@@ -179,7 +179,7 @@ test(
     expect(await shows(ui, TAB_OPENED)).toBe(true)
     expect(cli.copied).toEqual([])
     await keys(ui, 'y')
-    expect(cli.copied).toEqual([`nexus attach ${ID}`])
+    expect(cli.copied).toEqual([attaching[1]![3]])
     expect(cli.herdr).toHaveLength(2)
     await keys(ui, 'm')
     await ui.press({ key: 'menu-attach' })
@@ -214,6 +214,20 @@ test('outside Herdr, or with no workspace to open the tab in, nothing runs herdr
   expect((await nexus(`session attach ${ID}`)).text).toContain(`run this in a terminal or a Herdr tab:\n\n  nexus attach ${ID}\n\n`)
   expect(cli.herdr).toEqual([])
   expect(cli.copied).toEqual([`nexus attach ${ID}`])
+})
+
+test('a CLI set by path is the one the copied and shown attach command names, quoted for a shell', { options: { cli: "/Users/me/My Tools/it's/nexus" } }, async ($, on) => {
+  const command = `'/Users/me/My Tools/it'\\''s/nexus' attach ${ID}`
+  const cli = fake({ detail: { ...DETAIL, sessions: [CLAUDE] } })
+  const { nexus, mount } = await boot($, on, cli)
+  await nexus(`open ${ID}`)
+  const ui = await mount()
+  await toSessions(ui)
+  expect(await shows(ui, `  ${command}`)).toBe(true)
+  await keys(ui, 'y')
+  expect(cli.copied).toEqual([command])
+  expect(await shows(ui, `Copied ${command}: run it in a terminal or a Herdr tab, pick the session's workspace in Herdr, and detach from Herdr to come back.`)).toBe(true)
+  expect((await nexus(`session attach ${ID}`)).text).toContain(`\n\n  ${command}\n\n`)
 })
 
 test('a CLI before 0.5.0 says which version opening and closing a session need', async ($, on) => {

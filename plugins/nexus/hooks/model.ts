@@ -591,8 +591,8 @@ export function previewLook(detail: Pick<NexusDetail, 'thread' | 'pylon'>, previ
 export const HARNESS_LABEL: Record<NexusSession['harness'], string> = { 'claude-code': 'Claude Code', pi: 'pi', shell: 'Shell' }
 export const SESSION_TONE: Record<ShownSession['status'], Tone> = { working: 'work', idle: 'idle', blocked: 'bad', done: 'ok', unknown: 'muted', opened: 'muted' }
 
-/** The command that attaches a terminal on this Mac to the thread's pylon. */
-export const attachCommand = (thread: string) => `nexus attach ${thread}`
+/** The command that attaches a terminal on this Mac to the thread's pylon, through the CLI `cli` names, as a shell takes it. */
+export const attachCommand = (cli: string, thread: string) => `${shellQuote(cli)} attach ${shellQuote(thread)}`
 /** `word` as one word to a POSIX shell or zsh: bare when nothing in it is special, else single-quoted. */
 export const shellQuote = (word: string) => (/^[\w@%+=:,./-]+$/.test(word) ? word : `'${word.replaceAll("'", `'\\''`)}'`)
 
@@ -899,8 +899,10 @@ export function parseCommand(args: string): NexusCommand {
       if (after) return invalid('/nexus project takes one project ID, all, or add.')
       return first ? { verb: 'scope', project: first === 'all' ? null : first } : { verb: 'scope' }
     }
-    case 'session':
-      return session(words(rest), invalid)
+    case 'session': {
+      const parts = words(rest)
+      return parts ? session(parts, invalid) : invalid('/nexus session has a quote it does not close.')
+    }
     default: {
       if (!Object.hasOwn(ACTIONS, verb)) return invalid(`/nexus has no ${verb}.`)
       const [thread, extra] = split(rest)
@@ -910,9 +912,33 @@ export function parseCommand(args: string): NexusCommand {
   }
 }
 
-/** `text` split at whitespace, a part in double or single quotes kept whole without them, such as a title with spaces. */
-function words(text: string): string[] {
-  return [...text.matchAll(/"([^"]*)"|'([^']*)'|(\S+)/g)].map(match => match[1] ?? match[2] ?? match[3]!)
+/**
+ * `text` split into words as a shell splits them, so a title can hold spaces: at whitespace outside quotes, a quote
+ * anywhere in a word quoting up to its close (`--title="two words"`), and a backslash outside single quotes taking the
+ * next character as it is. Null for a quote left open.
+ */
+function words(text: string): string[] | null {
+  const found: string[] = []
+  let word: string | null = null
+  let quote: '"' | "'" | null = null
+  for (let at = 0; at < text.length; at++) {
+    const char = text[at]!
+    if (quote) {
+      if (char === quote) quote = null
+      else if (char === '\\' && quote === '"' && (text[at + 1] === '"' || text[at + 1] === '\\')) word = `${word ?? ''}${text[++at]}`
+      else word = `${word ?? ''}${char}`
+    } else if (/\s/.test(char)) {
+      if (word !== null) found.push(word)
+      word = null
+    } else if (char === '"' || char === "'") {
+      quote = char
+      word ??= ''
+    } else if (char === '\\' && at + 1 < text.length) word = `${word ?? ''}${text[++at]}`
+    else word = `${word ?? ''}${char}`
+  }
+  if (quote) return null
+  if (word !== null) found.push(word)
+  return found
 }
 
 /** `/nexus session open|close|attach` and their arguments. */

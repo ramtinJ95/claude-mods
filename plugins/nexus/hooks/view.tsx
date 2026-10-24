@@ -117,6 +117,8 @@ export type Scene = {
   surface: RenderSurface
   /** Claude Code runs inside Herdr, where Enter's attach opens a tab rather than copying the command. */
   inHerdr: boolean
+  /** The CLI the `cli` option names, which the attach command shown runs. */
+  cli: string
 }
 
 export type PaneActions = {
@@ -1655,7 +1657,7 @@ function SessionsBody(draw: Draw, scene: Scene, actions: PaneActions, area: numb
     )
   }
   place(SectionRule(draw, scene, 'Attach from this Mac', '', 'attach-mac'))
-  place(<Text key="attach-command">{`  ${attachCommand(detail.thread.id)}`}</Text>)
+  place(<Text key="attach-command">{`  ${attachCommand(scene.cli, detail.thread.id)}`}</Text>)
   place(
     <Text key="attach-how" color="subtle">
       {scene.inHerdr
