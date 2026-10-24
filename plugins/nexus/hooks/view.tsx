@@ -300,7 +300,8 @@ const FIELD_ROWS = 6
  */
 export function editorRows(text: string, columns: number): number {
   const width = columns - 1
-  return text.split('\n').reduce((sum, line) => {
+  // The wrap reads a pasted `\r\n` as one line break.
+  return text.replace(/\r\n/g, '\n').split('\n').reduce((sum, line) => {
     let rows = 1
     let used = 0
     for (const [index, word] of line.split(' ').entries()) {

@@ -422,6 +422,9 @@ test("a field's rows are the rows the engine wraps its text to, a cell short of 
     [`${'x'.repeat(28)} ${'z'.repeat(40)}`, 31, 3],
     ['one\n\ntwo', 31, 3],
     ['漢字'.repeat(8), 31, 2],
+    ['⌚'.repeat(15), 31, 1],
+    ['✅'.repeat(16), 31, 2],
+    [`${'x'.repeat(30)}\r\ny`, 31, 2],
   ]
   expect(wraps.map(([text, columns]) => editorRows(text, columns))).toEqual(wraps.map(([, , rows]) => rows))
   // At 60 columns the composer's hint leaves 31: 61 letters take three rows of 30.
