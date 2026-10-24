@@ -3,6 +3,7 @@ import { expect, mock, test, type TestBody } from 'claude-code/testing'
 /** The pane over a CLI whose `threads` poll answers after a minute, counting opens, polls and how each poll ended. */
 async function pane(...[$, on]: Parameters<TestBody>) {
   const clock = mock.clock(on)
+  mock.store(on, { themeNotice: true })
   const seen = { opens: 0, polls: 0, answered: 0, ended: 0 }
   let isOpen = false
   on('command.register', () => ({ value: { command: 'nexus' } }))

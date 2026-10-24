@@ -1,5 +1,5 @@
 import { atom, read, update } from 'claude-code'
-import type { EngineInterface, Register, Timer } from 'claude-code'
+import type { EngineInterface, Register, RenderSurface, Timer } from 'claude-code'
 
 import type {
   NexusCatalog,
@@ -11,6 +11,8 @@ import type {
   NexusRunState,
   NexusShown,
   NexusStartDraft,
+  NexusStrip,
+  NexusTab,
   NexusThread,
   NexusThreadRow,
   NexusWatch,
@@ -41,13 +43,18 @@ import {
   parseThreads,
   parseWatchEvent,
   sentence,
+  stripChips,
   transcript,
 } from './model'
+import { COMPOSE, type Effect, FILTER, type MenuAction, press, ringMoved } from './keys'
+import { StripView } from './strip'
 import { needsHuman, portFacts, TOOLS } from './tools'
-import { COMPOSE, type Draw, FILTER, ListView, type PaneActions, type Scene, StartView, ThreadView } from './view'
+import { type Draw, ListView, type PaneActions, type Scene, StartView, ThreadView } from './view'
 
 const PANE = 'nexus'
 const POLL_MS = 5_000
+/** How often the strip reads the list while the pane does not. */
+const STRIP_MS = 10_000
 /** How often the run clock ticks while the thread shown is working. */
 const TICK_MS = 1_000
 /** A `$.process.run` of the CLI: its own requests give up after 30 s without data, and `start` makes two. */
@@ -72,16 +79,28 @@ const NOW = { plugin: 'nexus', key: 'now' } as const
 const nowAtom = atom(NOW, 0)
 const paneAtom = atom({ plugin: 'nexus', key: 'pane' } as const, {
   view: 'list',
+  tab: 'conversation',
   selected: null,
-  field: 'none',
+  mode: 'normal',
+  overlay: null,
+  pending: null,
+  listCursor: null,
+  listTop: 0,
+  scroll: null,
+  detailsTop: 0,
+  portCursor: null,
   toggled: {},
   filter: '',
   draft: '',
   start: null,
   notice: null,
   portChanges: {},
-  isPickingPreview: false,
 })
+const STRIP = { plugin: 'nexus', key: 'strip' } as const
+/** What `$.store` keeps under `strip`, mirrored here so a change draws the strip again. */
+const stripAtom = atom(STRIP, { isOn: true, seen: {}, since: 0 })
+const STRIP_CURSOR = { plugin: 'nexus', key: 'stripCursor' } as const
+const stripCursorAtom = atom(STRIP_CURSOR, null)
 
 /** The CLI to run, from the `cli` option. */
 let cli = 'nexus'
@@ -95,6 +114,11 @@ let refocus: Timer | undefined
 let watcher: { thread: string; stop: () => void } | undefined
 /** The thread whose visit is still to be recorded, once its first `show` says whether it is open. */
 let visit: string | undefined
+/** The strip's poll of the list, which runs while the pane is closed or shows a thread. */
+let stripper: Timer | undefined
+let isStripBusy = false
+/** The pane taking the keys back after Esc left a field or an overlay, scheduled from a drawing. */
+let recovering: Timer | undefined
 /** Start submissions so far, which number each form's `request`. */
 let starts = 0
 /**
@@ -358,6 +382,8 @@ async function poll($: EngineInterface) {
     const detail = parsed(got, parseDetail)
     if ((await read($, paneAtom)).selected !== thread) return
     if (detail.ok) void recordVisit($, detail.value.thread)
+    // A reply the person sees in the pane is not news on the strip.
+    if (detail.ok && pane.isShown) void markSeen($, thread, detail.value.thread.lastAgentActivityAt)
     await update($, shownAtom, (shown): NexusShown =>
       detail.ok
         ? { thread, detail: detail.value, askedSeq, failure: null }
@@ -428,6 +454,7 @@ async function openPane($: EngineInterface): Promise<string> {
   const opened = await $.ui.open(OPEN)
   await startPane($)
   if (!opened.isPlaced) return ` It is not shown yet: ${opened.reason}.`
+  await themeNotice($)
   // `focus` is only granted over an empty composer, which an immediate command may still be clearing. Asking once
   // more is refused in turn if the person has started typing, so it never takes keys they are using.
   const pane = (await $.ui.panes()).find(one => one.id === PANE)
@@ -437,26 +464,150 @@ async function openPane($: EngineInterface): Promise<string> {
   return ''
 }
 
+/** Says once, the first time the pane opens, how to draw it on the terminal's own background. */
+async function themeNotice($: EngineInterface) {
+  if (await $.store.get('themeNotice')) return
+  await $.store.set('themeNotice', true)
+  await update($, paneAtom, (pane): NexusPane => ({
+    ...pane,
+    notice: { text: `Tip: pick "${THEME_NAME}" in /theme to draw this pane on your terminal's background.`, tone: 'dim' },
+  }))
+}
+
+const THEME_NAME = 'Dark (ANSI), Nexus pane on the terminal background'
+
+/**
+ * The pane opened by `/nexus` with nothing shown opens on the thread whose agent works, the newest when several do,
+ * reading the list first when no poll has.
+ */
+async function openWorking($: EngineInterface) {
+  const pane = await read($, paneAtom)
+  if (pane.selected || pane.view !== 'list') return
+  let threads = (await read($, listAtom)).threads
+  if (!threads) {
+    const got = threadsFrom(await nexus($, ['threads', '--all']))
+    if (!got.ok) return
+    const now = await $.clock.now()
+    await update($, listAtom, (): NexusList => ({ threads: got.value, failure: null, polledAt: now }))
+    threads = got.value
+  }
+  const working = threads
+    .filter(thread => thread.agentTurnRunning && (thread.status === 'active' || thread.status === 'idle'))
+    .sort((a, b) => b.lastActivityAt - a.lastActivityAt)[0]
+  if (working) await showThread($, working.id)
+}
+
 async function setPane($: EngineInterface, change: (pane: NexusPane) => Partial<NexusPane>) {
   await update($, paneAtom, pane => ({ ...pane, notice: null, ...change(pane) }))
 }
 
-/** The pane showing `thread`, keeping what the person opened and closed in it when it was shown already. */
-const threadView = (pane: NexusPane, thread: string): Partial<NexusPane> => ({
-  view: 'thread',
-  selected: thread,
-  field: 'none',
-  draft: '',
-  start: null,
-  notice: null,
-  toggled: pane.selected === thread ? pane.toggled : {},
-})
+/** The pane showing `thread`, keeping what the person opened, closed and chose in it when it was shown already. */
+const threadView = (pane: NexusPane, thread: string): Partial<NexusPane> => {
+  const isSame = pane.selected === thread
+  return {
+    view: 'thread',
+    selected: thread,
+    tab: isSame ? pane.tab : 'conversation',
+    mode: 'normal',
+    overlay: null,
+    pending: null,
+    scroll: isSame ? pane.scroll : null,
+    detailsTop: isSame ? pane.detailsTop : 0,
+    portCursor: isSame ? pane.portCursor : null,
+    listCursor: thread,
+    draft: '',
+    start: null,
+    notice: null,
+    toggled: isSame ? pane.toggled : {},
+  }
+}
 
 /** Shows a thread: its watch, and its details polled, the first of which records the visit as the dashboard's page does. */
 async function showThread($: EngineInterface, thread: string) {
   await setPane($, pane => threadView(pane, thread))
+  void markSeen($, thread)
   await followThread($, thread)
 }
+
+/** The strip's state as `$.store` kept it, and its start the first time: replies before then are not news. */
+async function loadStrip($: EngineInterface) {
+  const stored = (await $.store.get('strip')) as Partial<NexusStrip> | undefined
+  const strip: NexusStrip = { isOn: stored?.isOn ?? true, seen: stored?.seen ?? {}, since: stored?.since ?? (await $.clock.now()) }
+  await $.state.set(STRIP, strip)
+  if (stored?.since === undefined) await $.store.set('strip', strip)
+}
+
+async function saveStrip($: EngineInterface, change: (strip: NexusStrip) => NexusStrip) {
+  await $.store.set('strip', await update($, stripAtom, change))
+}
+
+/**
+ * Records that the person saw `thread` now, so the strip shows no new reply for it. Given the thread's last reply, it
+ * writes only when that is news, so a poll of the thread shown writes once a reply. The threads the list no longer
+ * has are dropped, so the store does not grow.
+ */
+async function markSeen($: EngineInterface, thread: string, reply?: number) {
+  const strip = await read($, stripAtom)
+  if (reply !== undefined && reply <= (strip.seen[thread] ?? strip.since)) return
+  const now = await $.clock.now()
+  const { threads } = await read($, listAtom)
+  const kept = new Set(threads?.map(one => one.id) ?? Object.keys(strip.seen))
+  await saveStrip($, was => ({ ...was, seen: { ...Object.fromEntries(Object.entries(was.seen).filter(([id]) => kept.has(id))), [thread]: Math.max(now, reply ?? 0) } }))
+}
+
+/**
+ * The strip's poll of the list, one `threads --all` at a time, while the strip is on. Skipped while the pane polls the
+ * list itself, so the two never both run.
+ */
+async function pollStrip($: EngineInterface) {
+  if (isStripBusy || !(await read($, stripAtom)).isOn) return
+  if (poller && (await read($, paneAtom)).view === 'list' && (await $.ui.panes()).some(one => one.id === PANE && one.isShown)) return
+  isStripBusy = true
+  try {
+    const asked = await $.clock.now()
+    const threads = threadsFrom(await nexus($, ['threads', '--all']))
+    // The pane may have read the list while this poll ran, or the strip been turned off: then this answer is stale.
+    if (!(await read($, stripAtom)).isOn) return
+    await update($, listAtom, (list): NexusList => (list.polledAt !== null && list.polledAt >= asked ? list : threads.ok ? { threads: threads.value, failure: null, polledAt: asked } : { ...list, failure: threads.failure }))
+  } finally {
+    isStripBusy = false
+  }
+}
+
+/**
+ * A chip pressed: the pane opens on that thread. The band holds the keys during the press, so the open's focus is
+ * refused (live test, 2.1.310) and the pane's mode line says how to hand it the keys.
+ */
+async function openFromStrip($: EngineInterface, id: string) {
+  await showThread($, id)
+  await openPane($)
+}
+
+/**
+ * Esc in a field or an overlay hands the keys to the prompt and raises no event, so a drawing that finds the pane
+ * unfocused in insert mode, filter mode or under an overlay sends it here: back to normal mode, the filter cleared,
+ * and the keys asked back. The prompt refuses them while it holds a draft; the mode line then says how to take them.
+ */
+async function recover($: EngineInterface) {
+  recovering = undefined
+  const pane = await update($, paneAtom, (was): NexusPane =>
+    was.mode === 'normal' && !was.overlay ? was : { ...was, mode: 'normal', overlay: null, pending: null, ...(was.mode === 'filter' ? { filter: '' } : {}) },
+  )
+  // A pane closed since stays closed; asking for the keys it holds already changes nothing.
+  if (!(await $.ui.panes()).some(one => one.id === PANE)) return
+  await $.ui.open(OPEN)
+  await focusRing($, pane)
+}
+
+/** Puts the ring where normal mode wants it: the list's cursor row, or the thread's tab, whose Enter acts as o. */
+function focusRing($: EngineInterface, pane: NexusPane) {
+  const key = pane.view === 'list' ? pane.listCursor : pane.view === 'thread' ? `tab-${pane.tab}` : null
+  return key ? focusOn($, key) : Promise.resolve()
+}
+
+/** Asks for the ring on `key`; a refusal (not drawn yet, or the pane lacks the keys) leaves it where it is. */
+const focusOn = ($: EngineInterface, key: string) => $.ui.focus({ requestId: PANE, key }).then(() => undefined, () => undefined)
+
 
 /** What the thread just shown runs: its details polled afresh and its watch, while the pane is open. */
 async function followThread($: EngineInterface, thread: string) {
@@ -534,10 +685,9 @@ async function unpreviewPort($: EngineInterface, thread: string, port: number, s
  * details show it, or why it failed. A port with an operation under way takes no other: the pane offers none.
  * Closing the pane kills the CLI; the port changes or is refused all the same.
  */
-async function changePort($: EngineInterface, port: number, action: 'open' | 'close') {
+async function changePort($: EngineInterface, selected: string, port: number, action: 'open' | 'close') {
   const current = poller
-  const { selected } = await read($, paneAtom)
-  if (!current || !selected) return
+  if (!current || (await read($, paneAtom)).selected !== selected) return
   const key = String(port)
   const write = (change: (was: NexusPortChange) => NexusPortChange) =>
     update($, paneAtom, (pane): NexusPane => {
@@ -611,7 +761,12 @@ async function runCommand($: EngineInterface, args: string): Promise<string> {
     case 'help':
       return USAGE
     case 'pane':
+      if (!(await $.ui.panes()).some(one => one.id === PANE)) await openWorking($)
       return `Nexus pane open.${await openPane($)}`
+    case 'strip':
+      await saveStrip($, strip => ({ ...strip, isOn: command.isOn }))
+      if (command.isOn) void pollStrip($)
+      return command.isOn ? 'The Nexus strip above the prompt is on.' : 'The Nexus strip above the prompt is off. /nexus strip on shows it again.'
     case 'close':
       stopPane()
       await $.ui.close({ id: PANE })
@@ -857,7 +1012,7 @@ const emptyStart = (project = '', title = ''): NexusStartDraft => ({ title, proj
 
 /** Opens the start form, its project and title given for Start again, and reads the projects and nodes it offers. */
 async function openStart($: EngineInterface, project?: string, title?: string) {
-  await setPane($, () => ({ view: 'start', field: 'none', start: emptyStart(project, title) }))
+  await setPane($, () => ({ view: 'start', mode: 'normal', overlay: null, start: emptyStart(project, title) }))
   await loadCatalog($, { projects: true })
   const { projects } = await read($, catalogAtom)
   await update($, paneAtom, pane => {
@@ -899,8 +1054,8 @@ async function submitStart($: EngineInterface) {
 const setStart = ($: EngineInterface, change: Partial<NexusStartDraft>) =>
   update($, paneAtom, pane => (pane.start ? { ...pane, start: { ...pane.start, ...change } } : pane))
 
-/** The handlers the pane's buttons and fields run, each with the render hook's `$`. */
-function paneActions($: EngineInterface): PaneActions {
+/** The handlers the pane's keys, buttons and fields run, each with the render hook's `$`. */
+function paneActions($: EngineInterface, surface: RenderSurface): PaneActions {
   const notify = (outcome: Outcome<string>) =>
     setPane($, () => ({ notice: outcome.ok ? { text: outcome.value, tone: 'dim' } : { text: sentence(outcome.failure.message), tone: 'error' } }))
   const onShown = async (fn: (id: string) => Promise<Outcome<string>>) => {
@@ -908,36 +1063,124 @@ function paneActions($: EngineInterface): PaneActions {
     if (selected) await notify(await fn(selected))
   }
   const run = (fn: () => Promise<unknown>) => void fn()
-  return {
-    open: id => run(() => showThread($, id)),
-    back: () =>
-      run(async () => {
-        const { view, selected } = await read($, paneAtom)
-        if (view === 'details' || (view === 'start' && selected)) return setPane($, () => ({ view: 'thread', field: 'none', start: null }))
-        watcher?.stop()
-        await setPane($, () => ({ view: 'list', selected: null, field: 'none', draft: '', start: null, toggled: {} }))
-        await Promise.all([$.state.set(WATCH, null), $.state.set(LIVE, null), $.state.set(SHOWN, null)])
-        void poll($)
-      }),
-    refresh: () =>
-      run(async () => {
-        const { selected, view } = await read($, paneAtom)
-        await setPane($, () => ({}))
-        if (selected && view !== 'list') watchInPane($, selected)
-        await Promise.all([poll($), loadCatalog($, { projects: false })])
-      }),
-    close: () =>
-      run(async () => {
+  const copy = async (text: string) => {
+    const copied = await $.ui.copy({ text, surface })
+    await setPane($, () => ({
+      notice: copied.isCopied ? { text: `Copied: ${text}`, tone: 'dim' } : { text: `Not copied (${copied.reason}); select it by hand.`, tone: 'error' },
+    }))
+  }
+  const back = async () => {
+    const { view, selected } = await read($, paneAtom)
+    if (view === 'start' && selected) {
+      await setPane($, () => ({ view: 'thread', mode: 'normal', start: null }))
+      return focusRing($, await read($, paneAtom))
+    }
+    watcher?.stop()
+    if (selected) void markSeen($, selected)
+    // The cursor goes back to the thread just left.
+    const pane = await update($, paneAtom, (was): NexusPane => ({
+      ...was,
+      view: 'list',
+      selected: null,
+      mode: 'normal',
+      overlay: null,
+      pending: null,
+      notice: null,
+      draft: '',
+      start: null,
+      toggled: {},
+      scroll: null,
+      detailsTop: 0,
+      portCursor: null,
+      listCursor: selected ?? was.listCursor,
+    }))
+    await Promise.all([$.state.set(WATCH, null), $.state.set(LIVE, null), $.state.set(SHOWN, null)])
+    void poll($)
+    await focusRing($, pane)
+  }
+  const refresh = async () => {
+    const { selected, view } = await read($, paneAtom)
+    if (selected && view !== 'list') watchInPane($, selected)
+    await Promise.all([poll($), loadCatalog($, { projects: false })])
+  }
+  const startAgain = async () => {
+    const { selected } = await read($, paneAtom)
+    const thread = (await read($, shownAtom))?.detail?.thread ?? (await read($, listAtom)).threads?.find(one => one.id === selected)
+    await openStart($, thread?.project, thread?.title)
+  }
+  const runAction = async (action: MenuAction) => {
+    switch (action) {
+      case 'start-again':
+        return startAgain()
+      case 'copy-attach': {
+        const detail = (await read($, shownAtom))?.detail
+        return detail ? copy(detail.attach) : setPane($, () => ({ notice: { text: "The thread's details have not loaded yet.", tone: 'error' } }))
+      }
+      case 'rewatch':
+        return refresh()
+      case 'delete':
+        return onShown(id => confirmDelete($, id))
+      default:
+        return onShown(id => act($, action, id))
+    }
+  }
+  const showTab = async (tab: NexusTab) => {
+    await focusOn($, `tab-${tab}`)
+    if (tab !== 'conversation') await Promise.all([poll($), loadCatalog($, { projects: false })])
+  }
+  const perform = async (effect: Effect): Promise<unknown> => {
+    switch (effect.kind) {
+      case 'open':
+        return showThread($, effect.thread)
+      case 'back':
+        return back()
+      case 'tab':
+        return showTab(effect.tab)
+      case 'focus':
+        return focusOn($, effect.key)
+      case 'publish':
+        return changePort($, effect.thread, effect.port, 'open')
+      case 'unpublish':
+        return changePort($, effect.thread, effect.port, 'close')
+      case 'copy':
+        return copy(effect.text)
+      case 'say':
+        return setPane($, () => ({ notice: { text: effect.text, tone: 'dim' } }))
+      case 'run':
+        await setPane($, () => ({ overlay: null }))
+        return runAction(effect.action)
+      // The field's autoFocus takes the ring as it is drawn; this asks for it too, where it is drawn already.
+      case 'insert':
+        return focusOn($, COMPOSE)
+      case 'filter':
+        return focusOn($, FILTER)
+      case 'new':
+        return openStart($)
+      case 'refresh':
+        return refresh()
+      case 'close':
         stopPane()
-        await $.ui.close({ id: PANE })
-      }),
-    toggle: (key, isOpen) => run(() => update($, paneAtom, pane => ({ ...pane, toggled: { ...pane.toggled, [key]: !isOpen } }))),
-    field: field =>
+        return $.ui.close({ id: PANE })
+    }
+  }
+  return {
+    key: (command, nav) =>
       run(async () => {
-        await setPane($, () => ({ field }))
-        // The field's autoFocus takes the ring as it is drawn; this asks for it too, where a pane already holds the
-        // keyboard. A refused ask leaves the field drawn for a click or Tab, so it is not an error.
-        if (field !== 'none') await $.ui.focus({ requestId: PANE, key: field === 'compose' ? COMPOSE : FILTER }).catch(() => undefined)
+        let effects: Effect[] = []
+        // `update` runs its function again when its write loses a race: the effects are those of the write that won.
+        await update($, paneAtom, pane => {
+          const step = press(pane, command, nav)
+          effects = step.effects
+          return step.pane
+        })
+        for (const effect of effects) await perform(effect)
+      }),
+    effect: effect => run(() => perform(effect)),
+    toggle: (key, isOpen) => run(() => update($, paneAtom, pane => ({ ...pane, toggled: { ...pane.toggled, [key]: !isOpen } }))),
+    tab: tab =>
+      run(async () => {
+        await setPane($, () => ({ tab, mode: 'normal', overlay: null, pending: null }))
+        await showTab(tab)
       }),
     // Each change of the filter opens the closed groups it matches afresh, as the dashboard's does, so a group the
     // person folded or opened before follows the new filter.
@@ -945,68 +1188,47 @@ function paneActions($: EngineInterface): PaneActions {
       run(() =>
         update($, paneAtom, pane => ({ ...pane, filter: text, toggled: Object.fromEntries(Object.entries(pane.toggled).filter(([key]) => !key.startsWith(closedKey('')))) })),
       ),
+    filterDone: first =>
+      run(async () => {
+        const pane = await update($, paneAtom, (was): NexusPane => ({ ...was, mode: 'normal', listCursor: first ?? was.listCursor, listTop: 0 }))
+        await focusRing($, pane)
+      }),
     draft: text => run(() => update($, paneAtom, pane => ({ ...pane, draft: text }))),
     submit: text =>
       run(async () => {
-        // An empty Enter hands the keys back; a sent message keeps the composer, as Claude Code's prompt does.
-        if (!text.trim()) return setPane($, () => ({ field: 'none' }))
+        // An empty Enter is back to normal mode; a sent message keeps the composer, as Claude Code's prompt does.
+        if (!text.trim()) {
+          await setPane($, () => ({ mode: 'normal' }))
+          return focusRing($, await read($, paneAtom))
+        }
         await setPane($, () => ({ draft: '' }))
         await onShown(id => send($, id, text.trim()))
       }),
-    // A key pressed means no field has the keys, so a composer the thread's change hid stays let go of after it.
-    act: action =>
-      run(async () => {
-        await setPane($, () => ({ field: 'none' }))
-        await onShown(id => act($, action, id))
-      }),
-    remove: () =>
-      run(async () => {
-        await setPane($, () => ({ field: 'none' }))
-        await onShown(id => confirmDelete($, id))
-      }),
-    details: () =>
-      run(async () => {
-        await setPane($, pane => ({ view: pane.view === 'details' ? 'thread' : 'details', isPickingPreview: false }))
-        await Promise.all([poll($), loadCatalog($, { projects: false })])
-      }),
-    openPort: port => run(() => changePort($, port, 'open')),
-    pickPreview: () => run(() => setPane($, pane => ({ isPickingPreview: !pane.isPickingPreview }))),
-    closePort: port =>
-      run(async () => {
-        await setPane($, () => ({ isPickingPreview: false }))
-        await changePort($, port, 'close')
-      }),
-    newThread: () => run(() => openStart($)),
-    startAgain: () =>
-      run(async () => {
-        const { selected } = await read($, paneAtom)
-        const thread = (await read($, shownAtom))?.detail?.thread ?? (await read($, listAtom)).threads?.find(one => one.id === selected)
-        await openStart($, thread?.project, thread?.title)
-      }),
+    back: () => run(back),
     startDraft: change => run(() => setStart($, { ...change, error: null })),
     startSubmit: change =>
       run(async () => {
         if (change) await setStart($, change)
         await submitStart($)
       }),
-    copy: (text, surface) =>
-      run(async () => {
-        const copied = await $.ui.copy({ text, surface })
-        await setPane($, () => ({
-          notice: copied.isCopied ? { text: `Copied: ${text}`, tone: 'dim' } : { text: `Not copied (${copied.reason}); select it by hand.`, tone: 'error' },
-        }))
-      }),
   }
 }
+
+/** Rows an inline pane takes at most: above the prompt it shares the screen with the transcript. */
+const INLINE_ROWS = 24
 
 export const register: Register = (on, options) => {
   if (typeof options.cli === 'string' && options.cli.trim()) cli = options.cli.trim()
 
   on('session.start', async ($, e, next) => {
     await Promise.all([
-      $.command.register({ name: 'nexus', description: 'Drive Nexus threads: the pane, new, send, open, unpublish, archive, abort, retry, delete', argumentHint: '[help]', immediate: true }),
+      $.command.register({ name: 'nexus', description: 'Drive Nexus threads: the pane, new, send, open, unpublish, archive, abort, retry, delete, strip', argumentHint: '[help]', immediate: true }),
       ...Object.values(TOOLS).map(spec => $.tool.register(spec)),
+      loadStrip($),
     ])
+    stripper?.cancel()
+    stripper = $.clock.every(STRIP_MS, () => void pollStrip($))
+    void pollStrip($)
     // A reload ended the pane's processes while the pane stayed open.
     if ((await $.ui.panes()).some(pane => pane.id === PANE)) await startPane($)
     return next(e)
@@ -1029,6 +1251,36 @@ export const register: Register = (on, options) => {
   on('tool.call', { tool: 'mcp__nexus__unpublish' }, ($, e, next) => callTool($, 'unpublish', input(e), next.signal)).catch(failedTool)
   on('tool.call', { tool: 'mcp__nexus__archive' }, ($, e, next) => callTool($, 'archive', input(e), next.signal)).catch(failedTool)
 
+  on('ui.render', { component: 'AbovePrompt' }, async ($, e, next) => {
+    if (e.props.hasSurvey) return next(e)
+    const [strip, list, watch, shown, now, cursor] = await Promise.all([
+      read($, stripAtom),
+      read($, listAtom),
+      read($, watchAtom),
+      read($, shownAtom),
+      read($, nowAtom),
+      read($, stripCursorAtom),
+    ])
+    if (!strip.isOn) return next(e)
+    // The list has no parked tasks: only the thread the pane watches is known to hold them.
+    const parked = new Set([...(watch?.state?.run === 'parked' ? [watch.thread] : []), ...(shown?.detail?.agent?.parkedTasks ? [shown.thread] : [])])
+    const chips = stripChips(list.threads ?? [], strip, Math.max(now, list.polledAt ?? 0), parked)
+    if (chips.length === 0 && !(list.failure && !list.threads)) return next(e)
+    return StripView($.ui.resolve(e), list, chips, e.props.bodyColumns, cursor, id => void openFromStrip($, id))
+  })
+
+  on('ui.focus', { component: 'AbovePrompt' }, async ($, e, next) => {
+    await $.state.set(STRIP_CURSOR, e.plugin === 'nexus' ? (e.element ?? null) : null)
+    return next(e)
+  })
+
+  // The arrows, Tab and a click move the ring themselves: the cursor and the mode follow it.
+  on('ui.focus', { component: 'Pane', requestId: PANE }, async ($, e, next) => {
+    const element = e.element
+    if (e.origin.kind === 'person' && element) await update($, paneAtom, pane => ringMoved(pane, element))
+    return next(e)
+  })
+
   on('ui.render', { component: 'Pane', requestId: PANE }, async ($, e) => {
     if (e.surface === 'mobile') {
       const { Text } = $.ui.resolve(e)
@@ -1044,6 +1296,8 @@ export const register: Register = (on, options) => {
       read($, paneAtom),
       read($, nowAtom),
     ])
+    // A drawing may not write: Esc out of a field or an overlay is taken up after it.
+    if (!e.props.isFocused && (pane.mode !== 'normal' || pane.overlay) && !recovering) recovering = $.clock.after(0, () => void recover($))
     const scene: Scene = {
       list,
       watch,
@@ -1053,10 +1307,12 @@ export const register: Register = (on, options) => {
       pane,
       now: Math.max(now, list.polledAt ?? 0),
       width: Math.max(24, e.props.bodyColumns),
+      rows: e.props.placement === 'dock' ? e.props.scroll.bodyRows : Math.min(e.props.scroll.bodyRows, INLINE_ROWS),
+      placement: e.props.placement,
       isFocused: e.props.isFocused,
       surface: e.surface,
     }
-    const actions = paneActions($)
+    const actions = paneActions($, e.surface)
     if (pane.view === 'start') return StartView(draw, scene, actions)
     if (!pane.selected || pane.view === 'list') return ListView(draw, scene, actions)
     return ThreadView(draw, scene, actions)

@@ -172,7 +172,25 @@ export type NexusStartDraft = {
   request: number
 }
 
-export type NexusView = 'list' | 'thread' | 'details' | 'start'
+export type NexusView = 'list' | 'thread' | 'start'
+
+/** The thread view's tabs, in the order h and l walk them. */
+export type NexusTab = 'conversation' | 'details' | 'ports'
+
+/**
+ * Where typed letters go: to the hotkeys (`normal`), the composer (`insert`) or the list's filter (`filter`). The
+ * pane's own record of it, since the engine says nothing when Esc hands the keys back from a field.
+ */
+export type NexusMode = 'normal' | 'insert' | 'filter'
+
+/** What covers the view's body: the Actions menu with the key of the entry under its cursor, the key help, or nothing. */
+export type NexusOverlay = { kind: 'menu'; cursor: string | null } | { kind: 'help'; top: number } | null
+
+/**
+ * How far the conversation is scrolled back: null follows its end; else the body's bottom edge stands `rows` above
+ * the bottom of the block keyed `anchor`, so what arrives below moves nothing on screen.
+ */
+export type NexusScroll = { anchor: string; rows: number } | null
 
 /**
  * A port the person published or unpublished from the pane. The three are apart, so an operation that starts or
@@ -189,10 +207,22 @@ export type NexusPortChange = {
 
 export type NexusPane = {
   view: NexusView
+  tab: NexusTab
   /** The thread shown, or null for the list. */
   selected: string | null
-  /** Whether the composer, the filter or no field has the keys: Buttons with hotkeys are drawn only with none. */
-  field: 'none' | 'compose' | 'filter'
+  mode: NexusMode
+  overlay: NexusOverlay
+  /** The first key of a two-key motion, `g`, waiting for its second. */
+  pending: 'g' | null
+  /** The list's row under the cursor: a thread's ID or a closed group's key. Back from a thread puts it there. */
+  listCursor: string | null
+  /** The list's first row shown, as last scrolled; each drawing clamps it so the cursor shows. */
+  listTop: number
+  scroll: NexusScroll
+  /** The details' first row shown. */
+  detailsTop: number
+  /** The Ports tab's row under the cursor: `preview-<service>` or `port-<port>`. */
+  portCursor: string | null
   /** The folds, tool rows and closed-thread groups the person opened or closed, by key; the rest follow the defaults. */
   toggled: Record<string, boolean>
   filter: string
@@ -206,8 +236,15 @@ export type NexusPane = {
    * the CLI runs on; cleared when the pane's processes start afresh, as no older one is under way then.
    */
   portChanges: Record<string, Record<string, NexusPortChange>>
-  /** `x` in the details: the digits pick a preview to unpublish instead of a port to publish. */
-  isPickingPreview: boolean
+}
+
+/** What the strip above the prompt reads besides the list: whether it shows, and when each thread was last viewed. */
+export type NexusStrip = {
+  isOn: boolean
+  /** When the person last viewed each thread, Unix milliseconds; a thread not in it counts from `since`. */
+  seen: Record<string, number>
+  /** When the strip first ran: a reply before it is not news. */
+  since: number
 }
 
 declare module 'claude-code' {
@@ -219,6 +256,9 @@ declare module 'claude-code' {
       shown: NexusShown | null
       catalog: NexusCatalog
       pane: NexusPane
+      strip: NexusStrip
+      /** The strip's chip under the focus ring, a thread's ID, drawn highlighted. */
+      stripCursor: string | null
       /** The run clock, ticked each second while a shown run works. */
       now: number
     }

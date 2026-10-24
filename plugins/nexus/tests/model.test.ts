@@ -66,6 +66,9 @@ describe('/nexus arguments', () => {
     expect(parseCommand('unpublish').verb).toBe('invalid')
     expect(parseCommand('unpublish 4f2a 5173').verb).toBe('invalid')
     expect(parseCommand('unpublish 5173 4f2a extra').verb).toBe('invalid')
+    expect(parseCommand('strip off')).toEqual({ verb: 'strip', isOn: false })
+    expect(parseCommand('strip on')).toEqual({ verb: 'strip', isOn: true })
+    expect(parseCommand('strip').verb).toBe('invalid')
   })
 
   test('a prefix names the one thread it starts', () => {

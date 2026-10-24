@@ -127,10 +127,12 @@ export type Fake = {
   copied: string[]
   opens: number
   isOpen: boolean
+  /** What `$.store` holds as the session starts: the theme tip is taken as said unless a test says otherwise. */
+  store: Record<string, unknown>
 }
 
 export function fake(change: Partial<Fake> = {}): Fake {
-  return { runs: [], spawns: [], threads: THREADS, detail: DETAIL, watch: [{ type: 'reset', thread: ID, entries: ENTRIES }, state('working'), live()], slow: {}, fail: {}, publishes: true, answer: 'Keep', asked: [], copied: [], opens: 0, isOpen: false, ...change }
+  return { runs: [], spawns: [], threads: THREADS, detail: DETAIL, watch: [{ type: 'reset', thread: ID, entries: ENTRIES }, state('working'), live()], slow: {}, fail: {}, publishes: true, answer: 'Keep', asked: [], copied: [], opens: 0, isOpen: false, store: { themeNotice: true }, ...change }
 }
 
 /** `detail` with the linked preview of `port` published, or gone when `preview` is null. */
@@ -149,6 +151,7 @@ const reply = (json: unknown) => ({ value: { exitCode: 0, stdout: JSON.stringify
 /** Boots the mod over `cli`: its session, the engine's answers, and a clock that starts at T0 and moves only when told. */
 export async function boot(...[$, on, cli]: [...Body, Fake]) {
   const clock = mock.clock(on, { now: T0 })
+  mock.store(on, cli.store)
   const answers: Record<string, () => unknown> = {
     nodes: () => NODES,
     projects: () => PROJECTS,
@@ -229,19 +232,26 @@ export async function boot(...[$, on, cli]: [...Body, Fake]) {
     await clock.advance(100)
     return done
   }
-  const mount = (columns = 100) =>
+  const mount = (columns = 100, rows = 60) =>
     $.ui.mount({
       plugin: 'nexus',
       surface: 'terminal',
       component: 'Pane',
       requestId: 'nexus',
-      props: { title: 'Nexus', isFocused: true, bodyColumns: columns, placement: 'dock', scroll: { offset: 0, bodyRows: 60 }, view: {} },
+      props: { title: 'Nexus', isFocused: true, bodyColumns: columns, placement: 'dock', scroll: { offset: 0, bodyRows: rows }, view: {} },
     })
-  return { clock, nexus, mount }
+  const strip = (columns = 120) =>
+    $.ui.mount({ plugin: 'nexus', surface: 'terminal', component: 'AbovePrompt', requestId: 'above-prompt', props: { hasSurvey: false, isWorking: false, maxRows: 20, bodyColumns: columns, scroll: { offset: 0, bodyRows: 20 }, view: {} } } as never)
+  return { clock, nexus, mount, strip }
 }
 
-/** Every theme key Claude Code names: a colour outside them would not follow the person's theme. */
+/**
+ * Every theme key Claude Code names: a colour outside them would not follow the person's theme. Two more are the
+ * dock's paint: the bash message's background, ANSI black under dark-ansi, under the body, and the user message's
+ * band under the title bar, both keys every theme holds.
+ */
 export const THEME_KEYS = new Set([
   'text', 'inverseText', 'inactive', 'subtle', 'suggestion', 'remember', 'success', 'error', 'warning', 'merged', 'claude', 'permission',
   'planMode', 'autoAccept', 'promptBorder', 'bashBorder', 'ide', 'diffAdded', 'diffRemoved', 'diffAddedDimmed', 'diffRemovedDimmed', 'diffAddedWord', 'diffRemovedWord',
+  'bashMessageBackgroundColor', 'userMessageBackground',
 ])
