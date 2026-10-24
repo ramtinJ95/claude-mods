@@ -124,7 +124,8 @@ describe('the menu and the help', () => {
     expect(moved.pane.overlay).toEqual({ kind: 'menu', cursor: 'menu-archive' })
     expect(moved.effects).toEqual([{ kind: 'focus', key: 'menu-archive' }])
     expect(press(moved.pane, 'open', menu)).toMatchObject({ pane: { overlay: null }, effects: [{ kind: 'run', action: 'archive' }] })
-    expect(press(moved.pane, 'close', menu).pane.overlay).toBeNull()
+    // The ring sat on an entry the close takes away: it goes back to the tab, or the keys would have nowhere to go.
+    expect(press(moved.pane, 'close', menu)).toMatchObject({ pane: { overlay: null }, effects: [{ kind: 'ring' }] })
   })
 
   test('s opens the help, which scrolls when taller than the body and takes no other key but those that close it', () => {

@@ -120,6 +120,8 @@ let stripper: Timer | undefined
 let isStripBusy = false
 /** The pane taking the keys back after Esc left a field or an overlay, scheduled from a drawing. */
 let recovering: Timer | undefined
+/** A view change that took the ring's element away: the next drawing of the thread puts the ring on its tab. */
+let isRingWanted = false
 /** Start submissions so far, which number each form's `request`. */
 let starts = 0
 /**
@@ -498,8 +500,8 @@ async function openWorking($: EngineInterface) {
   if (working) await showThread($, working.id)
 }
 
-async function setPane($: EngineInterface, change: (pane: NexusPane) => Partial<NexusPane>) {
-  await update($, paneAtom, pane => ({ ...pane, notice: null, ...change(pane) }))
+function setPane($: EngineInterface, change: (pane: NexusPane) => Partial<NexusPane>) {
+  return update($, paneAtom, (pane): NexusPane => ({ ...pane, notice: null, ...change(pane) }))
 }
 
 /** The pane showing `thread`, keeping what the person opened, closed and chose in it when it was shown already. */
@@ -1072,7 +1074,11 @@ async function submitStart($: EngineInterface) {
     return { ...pane, ...threadView(pane, started.value.id) }
   })
   // `update` runs its function again when its write loses a race, so what follows reads what it wrote.
-  if (started.ok && committed.view === 'thread' && committed.selected === started.value.id) await followThread($, started.value.id)
+  if (started.ok && committed.view === 'thread' && committed.selected === started.value.id) {
+    // The form's field held the ring, and the engine hands it to the composer as the form goes: the next drawing takes it back.
+    isRingWanted = true
+    await followThread($, started.value.id)
+  }
 }
 
 const setStart = ($: EngineInterface, change: Partial<NexusStartDraft>) =>
@@ -1162,6 +1168,8 @@ function paneActions($: EngineInterface, surface: RenderSurface): PaneActions {
         return showTab(effect.tab)
       case 'focus':
         return focusOn($, effect.key)
+      case 'ring':
+        return focusRing($, await read($, paneAtom))
       case 'publish':
         return changePort($, effect.thread, effect.port, 'open')
       case 'unpublish':
@@ -1170,9 +1178,11 @@ function paneActions($: EngineInterface, surface: RenderSurface): PaneActions {
         return copy(effect.text)
       case 'say':
         return setPane($, () => ({ notice: { text: effect.text, tone: 'dim' } }))
-      case 'run':
-        await setPane($, () => ({ overlay: null }))
+      case 'run': {
+        const pane = await setPane($, () => ({ overlay: null }))
+        await focusRing($, pane)
         return runAction(effect.action)
+      }
       // The field's autoFocus takes the ring as it is drawn; this asks for it too, where it is drawn already.
       case 'insert':
         return focusOn($, COMPOSE)
@@ -1322,6 +1332,10 @@ export const register: Register = (on, options) => {
     ])
     // A drawing may not write: Esc out of a field or an overlay is taken up after it.
     if (!e.props.isFocused && (pane.mode !== 'normal' || pane.overlay) && !recovering) recovering = $.clock.after(0, () => void recover($))
+    if (isRingWanted && pane.view === 'thread') {
+      isRingWanted = false
+      $.clock.after(0, () => void read($, paneAtom).then(pane => focusRing($, pane)))
+    }
     const scene: Scene = {
       list,
       watch,
