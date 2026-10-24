@@ -435,7 +435,7 @@ async function tick($: EngineInterface) {
 
 /** `projects` and `nodes` for the start form, the project picker, the list's nodes line and the previews' links. */
 async function loadCatalog($: EngineInterface, wanted: { projects: boolean }) {
-  const asked = await read($, scopeAtom)
+  const asked = scopeRevision
   const [nodes, projects] = await Promise.all([
     nexus($, ['nodes']).then(got => parsed(got, parseNodes)),
     wanted.projects ? nexus($, ['projects']).then(got => parsed(got, parseProjects)) : undefined,
@@ -450,44 +450,59 @@ async function loadCatalog($: EngineInterface, wanted: { projects: boolean }) {
 
 /** The scope as `$.store` kept it, and a check that its project still exists. */
 async function loadScope($: EngineInterface) {
+  const asked = scopeRevision
   const stored = await $.store.get('project')
-  await $.state.set(SCOPE, typeof stored === 'string' ? stored : null)
-  if (typeof stored === 'string') void loadCatalog($, { projects: true })
+  if (typeof stored !== 'string') return
+  if ((await setScope($, stored, asked)).isSet) void loadCatalog($, { projects: true })
 }
 
-/** Shows `project`'s threads, or every project's for null, in this session and later ones. */
-async function setScope($: EngineInterface, project: string | null) {
-  await $.state.set(SCOPE, project)
-  await $.store.set('project', project)
+/** Counts the scope's writes, so a write decided on an older scope can tell that another came between. */
+let scopeRevision = 0
+let scopeTurn: Promise<unknown> = Promise.resolve()
+
+/**
+ * Shows `project`'s threads, or every project's for null, in this session and later ones. Every write of the scope
+ * comes here and runs in turn, the atom and then `$.store`, so the store never ends on an older scope than the pane
+ * shows. With `asked`, the revision its caller read, it writes only if no other write came since: comparing projects
+ * would miss a choice undone, as api and then All again while an add asked from All ran. Says what the pane shows.
+ */
+function setScope($: EngineInterface, project: string | null, asked?: number): Promise<{ isSet: boolean; shown: string | null }> {
+  const turn = scopeTurn.then(async () => {
+    if (asked !== undefined && asked !== scopeRevision) return { isSet: false, shown: await read($, scopeAtom) }
+    scopeRevision += 1
+    await $.state.set(SCOPE, project)
+    await $.store.set('project', project)
+    return { isSet: true, shown: project }
+  })
+  scopeTurn = turn.catch(() => undefined)
+  return turn
 }
 
 /**
  * Goes back to every project, saying so once, when the project shown is not among `projects`, as after it was
- * deleted; saving that keeps the notice from coming back. `asked` is the scope when the list was asked for: a list read
- * before another project was chosen, or added, cannot tell whether that one exists.
+ * deleted; saving that keeps the notice from coming back. `asked` is the scope's revision when the list was asked for:
+ * a list read before another project was chosen, or added, cannot tell whether that one exists.
  */
-async function checkScope($: EngineInterface, projects: readonly NexusProject[], asked: string | null) {
+async function checkScope($: EngineInterface, projects: readonly NexusProject[], asked: number) {
   const gone = await read($, scopeAtom)
-  if (gone === null || gone !== asked || projects.some(project => project.id === gone)) return
-  await setScope($, null)
-  await $.ui.toast(`The project ${gone} no longer exists, so Nexus shows every project again.`)
+  if (gone === null || projects.some(project => project.id === gone)) return
+  if ((await setScope($, null, asked)).isSet) await $.ui.toast(`The project ${gone} no longer exists, so Nexus shows every project again.`)
+}
+
+/**
+ * Shows the project just added, unless the scope changed while the CLI added it, from `asked`, its revision then:
+ * that choice is the newer one. Says which the pane shows.
+ */
+async function showAdded($: EngineInterface, asked: number, id: string) {
+  const { isSet, shown } = await setScope($, id, asked)
+  if (isSet) return 'Nexus shows its threads.'
+  return `Nexus still shows ${shown === null ? 'every project' : `the project ${shown}`}, chosen while it was added.`
 }
 
 /**
  * `nexus project add`: the project added, its list read again. A CLI before 0.4.0 says only that it does not know the
  * command.
  */
-/**
- * Shows the project just added, unless another was chosen while the CLI added it, from `asked`: that choice is the
- * newer one. Says which the pane shows.
- */
-async function showAdded($: EngineInterface, asked: string | null, id: string) {
-  const shown = await update($, scopeAtom, now => (now === asked ? id : now))
-  if (shown !== id) return `Nexus still shows ${shown === null ? 'every project' : `the project ${shown}`}, chosen while it was added.`
-  await $.store.set('project', id)
-  return 'Nexus shows its threads.'
-}
-
 async function addProject($: EngineInterface, add: { id: string; repoUrl: string; node: string; branch: string }): Promise<Outcome<NexusProject>> {
   // After `--` the CLI's parseArgs reads the ID and URL as given, though one starts with dashes.
   const got = await nexus($, ['project', 'add', `--node=${add.node}`, `--branch=${add.branch}`, '--', add.id, add.repoUrl])
@@ -946,7 +961,7 @@ async function runCommand($: EngineInterface, args: string): Promise<string> {
       return say(await scopeCommand($, command.project))
     case 'add-project': {
       const { verb: _, ...add } = command
-      const asked = await read($, scopeAtom)
+      const asked = scopeRevision
       const added = await addProject($, { ...add, branch: add.branch ?? 'main' })
       // The transcript heads a reply with the plugin's name: a failure reads `nexus: <the CLI's message>`.
       if (!added.ok) return added.failure.message
@@ -1308,7 +1323,7 @@ async function submitProject($: EngineInterface, draft: NexusProjectDraft | null
   adds += 1
   const request = adds
   await setProjectDraft($, { isAdding: true, error: null, request })
-  const asked = await read($, scopeAtom)
+  const asked = scopeRevision
   const added = await addProject($, add)
   const where = added.ok ? await showAdded($, asked, added.value.id) : ''
   let left: string | null | undefined

@@ -322,6 +322,47 @@ test('an add that ends after another project was chosen leaves that choice and s
   expect(await shows(ui, 'Added the project docs. Nexus still shows the project api, chosen while it was added.')).toBe(true)
 })
 
+test('an add that ends after the person chose another project and then the first again leaves the scope as it is', async ($, on) => {
+  const cli = fake({ slow: { project: 5_000 } })
+  const { clock, nexus, mount } = await boot($, on, cli)
+  await nexus('')
+  const ui = await mount()
+  await keys(ui, 'hpgeo')
+  const fields = typing(ui)
+  await fields.type('project-id', 'docs')
+  await fields.type('project-url', DOCS)
+  await ui.press({ key: 'project-submit' })
+  await ui.press({ key: 'project-cancel' })
+  await ui.press({ key: 'scope-project-api' })
+  await nexus('project all')
+  await clock.advance(5_000)
+  expect(cli.store.project).toBe(null)
+  expect(await title(ui)).toMatch(/^◆ Nexus threads · All projects/)
+  expect(await shows(ui, 'Added the project docs. Nexus still shows every project, chosen while it was added.')).toBe(true)
+})
+
+test('a project chosen while an add saves its own leaves the store on the choice the pane shows', async ($, on) => {
+  const cli = fake()
+  let choosing: Promise<unknown> = Promise.resolve()
+  // The add's save of docs waits until a choice of api, made right then, has had its chance to save first.
+  cli.saving = async (key, value) => {
+    if (key !== 'project' || value !== 'docs') return
+    choosing = nexus('project api')
+    for (let turn = 0; turn < 1_000 && cli.store.project !== 'api'; turn++) await Promise.resolve()
+  }
+  const { nexus, mount } = await boot($, on, cli)
+  await nexus('')
+  const ui = await mount()
+  await keys(ui, 'hpgeo')
+  const fields = typing(ui)
+  await fields.type('project-id', 'docs')
+  await fields.type('project-url', DOCS)
+  await ui.press({ key: 'project-submit' })
+  await choosing
+  expect(await title(ui)).toMatch(/^◆ Nexus threads · api/)
+  expect(cli.store.project).toBe('api')
+})
+
 test("the picker scrolls New project… into view below a load error that wraps", async ($, on) => {
   const cli = fake({ fail: { projects: { exitCode: 1, error: 'connect ECONNREFUSED 100.64.0.1:7470 (the control plane is down)' } } })
   const { nexus, mount } = await boot($, on, cli)

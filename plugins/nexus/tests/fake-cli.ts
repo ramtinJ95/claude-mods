@@ -137,6 +137,8 @@ export type Fake = {
   isOpen: boolean
   /** What `$.store` holds, from the session's start on: the theme tip is taken as said unless a test says otherwise. */
   store: Record<string, unknown>
+  /** Runs before each `$.store.set` lands, to hold one while the test does something else. */
+  saving?: (key: string, value: unknown) => Promise<void>
 }
 
 /**
@@ -190,7 +192,8 @@ export async function boot(...[$, on, cli]: [...Body, Fake]) {
   const clock = mock.clock(on, { now: T0 })
   // The store as the mod leaves it, which a test reads back.
   on('store.get', (_, e) => ({ value: cli.store[e.key] }))
-  on('store.set', (_, e) => {
+  on('store.set', async (_, e) => {
+    await cli.saving?.(e.key, e.value)
     cli.store[e.key] = e.value
     return { value: undefined }
   })
