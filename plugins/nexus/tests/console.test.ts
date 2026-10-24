@@ -128,12 +128,16 @@ test('f filters by title in filter mode, opens a closed group it matches, and En
   await keys(ui, 'f')
   expect((await ui.find({ type: 'Input', key: await field(ui, 'filter') }))?.props.autoFocus).toBe(true)
   expect(await mode(ui)).toBe('FILTER')
-  await ui.input({ key: await field(ui, 'filter'), text: 'old', kind: 'change' })
+  const fields = typing(ui)
+  await fields.type('filter', 'old')
   expect((await ui.findAll({ type: 'Button' })).flatMap(one => (one.props.hotkey ? [] : [one.key]))).toEqual(['closed-web', 'th-9b0000000002'])
-  await ui.input({ key: await field(ui, 'filter'), text: 'old' })
+  await fields.submit('filter')
   expect(await mode(ui)).toBe('NORMAL')
   expect(await cursorOn(ui)).toBe('th-9b0000000002')
   expect(await shows(ui, /^⌕ old/)).toBe(true)
+  // f edits the filter kept, though Enter emptied its field.
+  await keys(ui, 'f')
+  expect(await fields.shows('filter')).toBe('old')
 })
 
 test('Esc from the filter, which hands the keys to the prompt, clears it and takes them back', async ($, on) => {
@@ -1296,9 +1300,12 @@ test('a start the control plane refuses stays on the form with its reason', asyn
   await keys(ui, 'n')
   await ui.press({ key: 'start-submit' })
   expect(await shows(ui, 'Give the thread a title or a first message.')).toBe(true)
-  await ui.input({ key: await field(ui, 'start-title'), text: 'Try it' })
+  const fields = typing(ui)
+  await fields.type('start-title', 'Try it')
+  await fields.submit('start-title')
   expect(await shows(ui, 'no image is current.')).toBe(true)
-  expect(await ui.find({ type: 'Input', key: await field(ui, 'start-title') })).toBeDefined()
+  // Enter emptied the title, which the form puts back so the next try sends what it shows.
+  expect(await fields.shows('start-title')).toBe('Try it')
 })
 
 test('a row or a show without a field docs/cli.md requires is a contract error, not a guess', async ($, on) => {

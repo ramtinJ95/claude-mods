@@ -256,7 +256,8 @@ export const field = async (ui: Ui, name: string) => (await ui.findAll({ type: '
 
 /**
  * What the fields of a mounted pane show, as 2.1.310's field store keeps it (read from its renderer): the typing, by
- * key, until a drawing gives that key a `value` other than the one this mount last drew, then that `value`. The kit
+ * key, until a drawing gives that key a `value` other than the one this mount last drew, then that `value`; Enter empties
+ * the field it submits. The kit
  * draws no fields, so this reads each drawing the test takes as the engine reads every drawing. A pane closed loses its
  * store, so a pane opened again is a new mount with a new `typing`.
  */
@@ -278,6 +279,14 @@ export function typing(ui: Ui) {
       const key = await field(ui, name)
       typed.set(key, text)
       await ui.input({ key, text, kind: 'change' })
+    },
+    /** Enter in the field `name`: the engine delivers its text and empties it. */
+    async submit(name: string) {
+      await read()
+      const key = await field(ui, name)
+      const text = typed.get(key) ?? ((await ui.find({ type: 'Input', key }))?.props.value as string | undefined) ?? ''
+      typed.set(key, '')
+      await ui.input({ key, text, kind: 'submit' })
     },
     /** What the field `name` shows, or undefined when it is not drawn. */
     async shows(name: string) {

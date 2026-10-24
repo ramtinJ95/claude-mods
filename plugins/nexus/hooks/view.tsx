@@ -121,7 +121,7 @@ export type PaneActions = {
   /** Picks the form's project, which clears the node and branch chosen for the one before. */
   startProject: (project: string) => void
   /** Starts the thread, the field Enter was pressed in carrying its text: it may not have reported it yet. */
-  startSubmit: (change?: Partial<NexusStartDraft>) => void
+  startSubmit: (change?: Partial<Pick<NexusStartDraft, 'title' | 'branch' | 'message'>>) => void
 }
 
 

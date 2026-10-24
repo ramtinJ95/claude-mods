@@ -626,10 +626,24 @@ function rehome($: EngineInterface, tree: unknown, pane: NexusPane, isFocused: b
   const { keys, home } = ringOf(tree)
   const isLost = !keys.has(ringAt) || fieldOf(ringAt) === COMPOSE || fieldOf(ringAt) === FILTER
   if (!isLost || !home || home === ringAt) return
+  const lost = ringAt
   rehoming = $.clock.after(0, () => {
     rehoming = undefined
-    void focusOn($, home)
+    // The mod may have put the ring somewhere since (a form's field put back under a new key): that stands.
+    if (ringAt === lost) void focusOn($, home)
   })
+}
+
+/**
+ * Enter in a form's field: the engine empties the field whose submit it delivered, but a form that stays (a refusal,
+ * a field missing) must still show what it would send. So the field is put again with its text, under a new key, and
+ * the ring follows it there.
+ */
+async function putBack<Field extends string>($: EngineInterface, keys: Record<Field, string>, change: Partial<Record<Field, string>>) {
+  const texts = Object.fromEntries(Object.entries(change).map(([field, text]) => [keys[field as Field], text as string]))
+  const pane = await update($, paneAtom, was => ({ ...was, fields: putFields(was.fields, texts) }))
+  const [name] = Object.keys(texts)
+  if (name) await focusOn($, fieldKey(pane.fields, name))
 }
 
 /** Asks for the ring on `key`; a refusal (not drawn yet, or the pane lacks the keys) leaves it where it is. */
@@ -1258,7 +1272,8 @@ function paneActions($: EngineInterface, surface: RenderSurface): PaneActions {
       ),
     filterDone: first =>
       run(async () => {
-        const pane = await update($, paneAtom, (was): NexusPane => ({ ...was, mode: 'normal', listCursor: first ?? was.listCursor, listTop: 0 }))
+        // Enter emptied the field, so f would edit nothing: it is put again with the filter kept.
+        const pane = await update($, paneAtom, (was): NexusPane => ({ ...was, mode: 'normal', listCursor: first ?? was.listCursor, listTop: 0, fields: putFields(was.fields, { [FILTER]: was.filter }) }))
         await focusRing($, pane)
       }),
     draft: text => run(() => update($, paneAtom, pane => ({ ...pane, draft: text }))),
@@ -1282,7 +1297,10 @@ function paneActions($: EngineInterface, surface: RenderSurface): PaneActions {
       ),
     startSubmit: change =>
       run(async () => {
-        if (change) await setStart($, change)
+        if (change) {
+          await setStart($, change)
+          await putBack($, START_KEYS, change)
+        }
         await submitStart($)
       }),
   }
