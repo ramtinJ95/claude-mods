@@ -83,6 +83,9 @@ test("read and wait report the ports the pylon listens on with their preview's U
   const listening = { ...healthy, ports: [{ port: 3000, service: 'web', preview }, { port: 5173, service: null, preview: null }] }
   const { result } = await readOn(asked, listening)
   expect(JSON.parse(String(result)).ports).toEqual([{ port: 3000, service: 'web', url: 'https://node.example.ts.net:10201/', ready: true }, { port: 5173 }])
+  // A service the node reports failed says why.
+  const failed = { ...listening, ports: [{ port: 3000, service: 'web', preview: { ...preview, ready: false, failed: 'web exited with code 1' } }] }
+  expect(JSON.parse(String((await readOn(asked, failed)).result)).ports).toEqual([{ port: 3000, service: 'web', url: 'https://node.example.ts.net:10201/', ready: false, failed: 'web exited with code 1' }])
   expect(await waitOn(asked, said, { ...healthy, ports: null })).toMatchObject({ settled: true, ports: null })
   // A CLI older than the contract prints no ports: the call says the two disagree rather than guess.
   const { ports: _, ...old } = healthy

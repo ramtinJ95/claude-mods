@@ -192,7 +192,9 @@ describe('the console', () => {
 
   test("previews keep the CLI's url and ports their preview; either missing is a contract error, and null ports mean unknown", () => {
     const detail = parseDetail(DETAIL)
-    expect(detail.previews[0]).toEqual({ service: 'web', httpsPort: 10201, ready: true, url: 'https://rj-firebat.example.ts.net:10201/' })
+    // A control plane older than Preview.failed sends none: not failed.
+    expect(detail.previews[0]).toEqual({ service: 'web', httpsPort: 10201, ready: true, failed: null, url: 'https://rj-firebat.example.ts.net:10201/' })
+    expect(parseDetail({ ...DETAIL, previews: [{ ...WEB_PREVIEW, ready: false, failed: 'web exited' }] }).previews[0]).toMatchObject({ ready: false, failed: 'web exited' })
     expect(detail.ports).toEqual([
       { port: 3000, service: 'web', preview: detail.previews[0] },
       { port: 5173, service: null, preview: null },

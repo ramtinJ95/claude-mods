@@ -1486,7 +1486,7 @@ function PortsBody(draw: Draw, scene: Scene, actions: PaneActions, area: number,
         </Box>
         <Box flexDirection="column" paddingLeft={4}>
           {isCursor && <Text color="subtle">{`⏎ or y copies the URL${isClosable ? ' · x unpublishes it (a new publish may get a new URL)' : ''}`}</Text>}
-          {look.hint && <Text color="subtle">{look.hint}</Text>}
+          {look.hint && <Text color={look.tone === 'bad' ? 'error' : 'subtle'}>{look.hint}</Text>}
           {change.failure && <Text color="error">{change.failure.message}</Text>}
         </Box>
       </Box>,

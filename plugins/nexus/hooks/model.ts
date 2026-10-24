@@ -93,7 +93,7 @@ export function parseStarted(json: unknown): NexusThread {
 export function parsePreview(raw: unknown, command: string): NexusPreview {
   if (!isRecord(raw) || typeof raw.service !== 'string') throw contractError(command, 'a preview without its service')
   if (typeof raw.url !== 'string') throw contractError(command, `a preview (${raw.service}) without its url`)
-  return { service: raw.service, httpsPort: num(raw.httpsPort), ready: raw.ready === true, url: raw.url }
+  return { service: raw.service, httpsPort: num(raw.httpsPort), ready: raw.ready === true, failed: strOrNull(raw.failed), url: raw.url }
 }
 
 /** `unpreview` prints a literal null; anything else is a CLI this mod does not know, so the close is not taken as done. */
@@ -561,6 +561,8 @@ export function clock(ms: number): string {
 export function previewLook(detail: Pick<NexusDetail, 'thread' | 'pylon'>, preview: NexusPreview) {
   if (detail.thread.status === 'archived') return { linked: false, label: 'paused', tone: 'idle' as Tone, hint: 'Unarchive the thread to open it.' }
   if (detail.pylon.actualState === 'paused') return { linked: true, label: 'paused', tone: 'idle' as Tone, hint: 'Opening it wakes the pylon.' }
+  // A failed service's URL answers 502 until the service runs again, so it is no link; the reason is the node's.
+  if (preview.failed !== null) return { linked: false, label: 'failed', tone: 'bad' as Tone, hint: preview.failed }
   return preview.ready ? { linked: true, label: 'ready', tone: 'ok' as Tone, hint: null } : { linked: false, label: 'starting', tone: 'busy' as Tone, hint: null }
 }
 

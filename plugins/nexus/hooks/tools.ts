@@ -72,7 +72,7 @@ export const TOOLS = {
 export const portFacts = (port: NexusPort) => ({
   port: port.port,
   ...(port.service ? { service: port.service } : {}),
-  ...(port.preview ? { url: port.preview.url, ready: port.preview.ready } : {}),
+  ...(port.preview ? { url: port.preview.url, ready: port.preview.ready, ...(port.preview.failed !== null ? { failed: port.preview.failed } : {}) } : {}),
 })
 
 /** What only a person can do for a thread, so the model says so rather than waiting again. pi-nexus words it the same. */
