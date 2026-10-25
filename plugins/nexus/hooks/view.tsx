@@ -1946,17 +1946,26 @@ function PylonBody(draw: Draw, scene: Scene, actions: PaneActions, area: number,
     const attachHint = scene.inHerdr ? '⏎ attaches in a new Herdr tab, y copies nexus attach' : '⏎ or y copies nexus attach'
     // A paused row has no close; attaching wakes its pylon, except an archived thread's, which the CLI refuses.
     const keysHint = session.state !== 'paused' ? `${attachHint}, x closes the session` : status === 'archived' ? attachHint : `${attachHint}, which wakes the pylon`
+    const line = (
+      <Text wrap="truncate-end">
+        {Pointer(draw, isCursor)}
+        <Text>{HARNESS_LABEL[session.harness].padEnd(12)}</Text>
+        <Text bold>{`${session.title ?? ''}${' '.repeat(titled - cells(session.title ?? ''))}`}</Text>
+        {Dot(draw, tone)}
+        <Text>{` ${label}  `}</Text>
+        {/* A failed session in no pane goes by the ID /nexus session close takes. */}
+        <Text color="subtle">{session.herdrPane ?? session.id}</Text>
+        <Text color="subtle">{session.harnessSessionId ? `  session ${session.harnessSessionId}` : ''}</Text>
+      </Text>
+    )
+    // A Button ignores its Text child's wrap. Clip by cells, then keep that many characters of the styled spans.
+    // rowsOf measures the same clipped text, leaving only the failure and cursor hint to wrap.
+    const text = inlineText(line)
+    const clipped = clip(text, scene.width)
     place(
       <Box key={`row-${key}`} flexDirection="column">
         <Button key={key} plain autoFocus={isCursor ? true : undefined} onPress={() => actions.effect(attach)}>
-          {Pointer(draw, isCursor)}
-          <Text>{HARNESS_LABEL[session.harness].padEnd(12)}</Text>
-          <Text bold>{`${session.title ?? ''}${' '.repeat(titled - cells(session.title ?? ''))}`}</Text>
-          {Dot(draw, tone)}
-          <Text>{` ${label}  `}</Text>
-          {/* A failed session in no pane goes by the ID /nexus session close takes. */}
-          <Text color="subtle">{session.herdrPane ?? session.id}</Text>
-          <Text color="subtle">{session.harnessSessionId ? `  session ${session.harnessSessionId}` : ''}</Text>
+          {clipped === text ? line : [cutTree(line, clipped.length - 1).node as RenderChildren, '…']}
         </Button>
         {session.state === 'failed' && (
           <Box paddingLeft={4}>

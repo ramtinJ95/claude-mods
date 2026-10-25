@@ -1,6 +1,7 @@
 import { expect, test } from 'claude-code/testing'
 
-import { SSH_HINT } from '../hooks/model'
+import { SSH_HINT, cells } from '../hooks/model'
+import { rowsOf } from '../hooks/view'
 import { TOOLS } from '../hooks/tools'
 import { DETAIL, ID, THEME_KEYS, THREAD, boot, fake, field, state, typing } from './fake-cli'
 
@@ -280,6 +281,30 @@ const FAILED = {
   message: 'herdr agent start: the agent did not start.',
 }
 const RUNNING = { ...SHELL, id: 'nexus:3.1', state: 'running', message: null }
+
+test('long session rows stay one measured row with an ellipsis; the failure reason still wraps', async ($, on) => {
+  const message = 'The agent did not start. '.repeat(8).trim()
+  const cli = fake({ detail: { ...DETAIL, sessions: [{ ...FAILED, message }, { ...RUNNING, title: '計画🧪', harnessSessionId: '計画🧪'.repeat(30) }] } })
+  const { nexus, mount } = await boot($, on, cli)
+  await nexus(`open ${ID}`)
+  const width = 72
+  const ui = await mount(width)
+  await toSessions(ui)
+  for (const id of [FAILED.id, RUNNING.id]) {
+    const button = await ui.find({ type: 'Button', key: `session-${id}` })
+    expect(button?.text).toMatch(/…$/)
+    expect(button?.text).not.toContain('\n')
+    expect(cells(button!.text)).toBeLessThanOrEqual(width)
+    expect(rowsOf(button, width)).toBe(1)
+  }
+  expect(await row(ui, FAILED.id)).toContain('session /home/')
+  const failure = await ui.find({ type: 'Text', text: message })
+  expect(failure?.props.color).toBe('error')
+  expect(failure?.props.wrap).toBeUndefined()
+  expect(rowsOf(failure, width - 4)).toBeGreaterThan(1)
+  await keys(ui, 'j')
+  expect(await cursorOn(ui)).toBe(`session-${RUNNING.id}`)
+})
 
 test('a paused session reads paused, resumes on wake; a failed one says failed with its message, by its ID when it has no pane', async ($, on) => {
   const cli = fake({ detail: { ...DETAIL, sessions: [PAUSED, FAILED, RUNNING] } })
