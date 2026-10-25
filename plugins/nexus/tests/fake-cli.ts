@@ -108,6 +108,43 @@ export const ENTRIES = [
 export const state = (run: string, extra: Record<string, unknown> = {}) => ({ type: 'state', thread: ID, status: 'active', run, parkedTasks: 0, queued: 0, pylon: 'running', failed: null, ports: PORTS, ...extra })
 export const live = (extra: Record<string, unknown> = {}) => ({ type: 'live', thread: ID, queued: [], tools: [], partial: null, retry: null, ...extra })
 
+/** `changes --json` since the pylon booted: a nested folder, a rename, a deletion, a binary file and a file at the root. */
+export const CHANGES = {
+  base: { kind: 'start', commit: 'a1b2c3d' },
+  files: [
+    { path: 'src/auth/login.ts', oldPath: null, status: 'modified', additions: 12, deletions: 3 },
+    { path: 'src/auth/session.ts', oldPath: 'src/auth/old-session.ts', status: 'renamed', additions: 2, deletions: 2 },
+    { path: 'src/ui/logo.png', oldPath: null, status: 'added', additions: null, deletions: null },
+    { path: 'src/ui/Form.tsx', oldPath: null, status: 'deleted', additions: 0, deletions: 40 },
+    { path: 'README.md', oldPath: null, status: 'modified', additions: 1, deletions: 0 },
+  ],
+  truncated: false,
+}
+
+/** `diff --json` of src/auth/login.ts: two hunks, the second further down the file. */
+export const DIFF = {
+  base: { kind: 'start', commit: 'a1b2c3d' },
+  diff: [
+    'diff --git a/src/auth/login.ts b/src/auth/login.ts',
+    'index 3f2a1b0..9c8d7e6 100644',
+    '--- a/src/auth/login.ts',
+    '+++ b/src/auth/login.ts',
+    '@@ -10,4 +10,5 @@ export async function login(form: FormData) {',
+    "   const email = form.get('email')",
+    '-  const user = await db.find(email)',
+    '+  const user = await db.users.find(email)',
+    "+  if (!user) throw new HttpError(401, 'unknown user')",
+    '   return session(user)',
+    ' }',
+    '@@ -40,2 +41,2 @@ function session(user: User) {',
+    '-  return sign(user.id)',
+    '+  return sign(user.id, { ttl: HOUR })',
+    ' }',
+    '',
+  ].join('\n'),
+  truncated: false,
+}
+
 export type Fake = {
   /** Every `$.process.run` argv, the CLI's name dropped. */
   runs: string[][]
@@ -117,6 +154,10 @@ export type Fake = {
   /** What `projects` lists; `project add` adds to it, as the control plane does. */
   projects: unknown[]
   detail: unknown
+  /** What `changes` answers; `--uncommitted` gets the same files against HEAD. */
+  changes: unknown
+  /** What `diff` answers, for any file. */
+  diff: unknown
   /** The watch's lines in order; a `{ delay }` holds the stream that long on the test's clock first. */
   watch: unknown[]
   /** A verb whose answer comes that many milliseconds late on the test's clock. */
@@ -183,7 +224,7 @@ function parseProjectAdd(args: readonly string[]): { values: Record<string, stri
 export function fake(change: Partial<Fake> = {}): Fake {
   // A copy, as the mod writes the store a test reads: a fixture shared by tests would carry one's writes into the next.
   const store = structuredClone(change.store ?? { themeNotice: true })
-  return { runs: [], spawns: [], threads: THREADS, projects: PROJECTS, detail: DETAIL, watch: [{ type: 'reset', thread: ID, entries: ENTRIES }, state('working'), live()], slow: {}, fail: {}, printed: {}, publishes: true, answer: 'Keep', asked: [], offered: [], copied: [], toasts: [], opens: 0, isOpen: false, nextPane: 'nexus:2.1', version: '0.8.0', herdr: [], herdrFail: {}, env: {}, ...change, store }
+  return { runs: [], spawns: [], threads: THREADS, projects: PROJECTS, detail: DETAIL, changes: CHANGES, diff: DIFF, watch: [{ type: 'reset', thread: ID, entries: ENTRIES }, state('working'), live()], slow: {}, fail: {}, printed: {}, publishes: true, answer: 'Keep', asked: [], offered: [], copied: [], toasts: [], opens: 0, isOpen: false, nextPane: 'nexus:2.1', version: '0.8.0', herdr: [], herdrFail: {}, env: {}, ...change, store }
 }
 
 /** `detail` with the linked preview of `port` published, or gone when `preview` is null. */
@@ -226,6 +267,8 @@ export async function boot(...[$, on, cli]: [...Body, Fake]) {
     start: () => ({ ...THREAD, id: 'th-123456789abc', title: 'New one', agentTurnRunning: false }),
     preview: () => OPENED,
     unpreview: () => null,
+    changes: () => cli.changes,
+    diff: () => cli.diff,
   }
   on('process.run', async (_, e) => {
     const argv = e.argv.slice(1)
@@ -281,6 +324,12 @@ export async function boot(...[$, on, cli]: [...Body, Fake]) {
       }
       if (cli.publishes && (argv[0] === 'preview' || argv[0] === 'unpreview')) {
         cli.detail = withPreview(cli.detail, Number(argv[3]), argv[0] === 'preview' ? OPENED : null)
+      }
+      // `--uncommitted` compares with HEAD instead of the commit the pylon booted on.
+      if ((argv[0] === 'changes' || argv[0] === 'diff') && argv.includes('--uncommitted') && !(argv[0] in cli.printed)) {
+        const answer = answers[argv[0]]!() as { base: unknown }
+        yield { stream: 'stdout' as const, text: JSON.stringify({ ...answer, base: { kind: 'head', commit: 'f00d123' } }) }
+        return { value: { code: 0, signal: null } }
       }
       yield { stream: 'stdout' as const, text: JSON.stringify(argv[0]! in cli.printed ? cli.printed[argv[0]!] : (answers[argv[0]!]?.() ?? null)) }
     }

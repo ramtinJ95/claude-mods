@@ -12,23 +12,24 @@ async function keys(ui: Ui, letters: string) {
 }
 const cursorOn = async (ui: Ui) => (await ui.findAll({ type: 'Button' })).find(one => one.text.startsWith('❯'))?.key
 const row = async (ui: Ui, pane: string) => (await ui.find({ type: 'Button', key: `session-${pane}` }))?.text
-/** The Sessions tab: l three times from the conversation. */
-const toSessions = (ui: Ui) => keys(ui, 'lll')
+/** The Pylon tab, l three times from the conversation, and j past its three blocks of details onto the first session. */
+const toSessions = (ui: Ui) => keys(ui, 'llljjj')
 
 const CLAUDE = { herdrPane: 'nexus:1.2', harness: 'claude-code', harnessSessionId: '9c1e', status: 'working', title: 'claude', pylon: 'pylon-7f3a' }
 const SHELL = { herdrPane: 'nexus:3.1', harness: 'shell', harnessSessionId: null, status: 'idle', title: null, pylon: 'pylon-7f3a' }
 /** What `show` lists once the node reports the shell `session open` answered with `nexus:2.1`. */
 const REPORTED = { herdrPane: 'nexus:2.1', harness: 'shell', harnessSessionId: null, status: 'idle', title: 'probe', pylon: 'pylon-7f3a' }
 
-test('Sessions lists each session with its harness, title, state, pane and session ID, then how to attach from this Mac', async ($, on) => {
+test('Pylon lists each session with its harness, title, state, pane and session ID, then how to attach from this Mac', async ($, on) => {
   const cli = fake({ detail: { ...DETAIL, sessions: [CLAUDE, SHELL] } })
   const { nexus, mount } = await boot($, on, cli)
   await nexus(`open ${ID}`)
   const ui = await mount()
-  expect((await ui.find({ type: 'Button', key: 'tab-sessions' }))?.text).toBe('Sessions 2')
+  expect((await ui.find({ type: 'Button', key: 'tab-pylon' }))?.text).toBe('Pylon')
   await toSessions(ui)
+  expect(await shows(ui, /^SESSIONS 2 ─/)).toBe(true)
   expect(await row(ui, 'nexus:1.2')).toMatch(/^❯ Claude Code claude {2}◉ working {2}nexus:1\.2 {2}session 9c1e$/)
-  expect(await row(ui, 'nexus:3.1')).toMatch(/^ {2}Shell {7}○ idle {2}nexus:3\.1$/)
+  expect(await row(ui, 'nexus:3.1')).toMatch(/^ {2}Shell {15}○ idle {2}nexus:3\.1$/)
   expect(await shows(ui, '⏎ or y copies nexus attach, x closes the session')).toBe(true)
   expect(await shows(ui, /^ATTACH FROM THIS MAC/)).toBe(true)
   expect(await shows(ui, `  nexus attach ${ID}`)).toBe(true)
@@ -39,12 +40,11 @@ test('Sessions lists each session with its harness, title, state, pane and sessi
   expect(painted.filter(colour => !THEME_KEYS.has(colour))).toEqual([])
 })
 
-test('a pylon with no sessions says n opens one, and Details no longer lists them', async ($, on) => {
+test('a pylon with no sessions says n opens one, and x says there is none to close', async ($, on) => {
   const cli = fake({ detail: { ...DETAIL, sessions: [] } })
   const { nexus, mount } = await boot($, on, cli)
   await nexus(`open ${ID}`)
   const ui = await mount()
-  expect((await ui.find({ type: 'Button', key: 'tab-sessions' }))?.text).toBe('Sessions')
   await toSessions(ui)
   expect(await shows(ui, 'No sessions. n opens one: Claude Code, pi or a shell.')).toBe(true)
   await keys(ui, 'x')
@@ -71,16 +71,16 @@ test('n opens the form: the harness and an optional title; Enter opens it, openi
   const fields = typing(ui)
   await fields.type('open-session-title', 'probe')
   await fields.submit('open-session-title')
-  // The form gives way to Sessions at once, where the open shows while the CLI wakes the pylon and starts the agent.
-  expect((await ui.find({ type: 'Button', key: 'tab-sessions' }))?.props.autoFocus).toBe(true)
+  // The form gives way to Pylon at once, where the open shows while the CLI wakes the pylon and starts the agent.
+  expect((await ui.find({ type: 'Button', key: 'tab-pylon' }))?.props.autoFocus).toBe(true)
   expect(await shows(ui, ' Opening Shell "probe"…')).toBe(true)
   expect(await shows(ui, 'Opening Shell "probe". Its agent can take a minute to start.')).toBe(true)
   await clock.advance(20_000)
   expect(cli.runs).toContainEqual(['session', 'open', '--json', '--harness=shell', '--title=probe', '--', ID])
   expect(await shows(ui, ' Opening Shell "probe"…')).toBe(false)
-  expect(await shows(ui, `Opened Shell "probe" in pane nexus:2.1. ⏎ in Sessions copies nexus attach: run it in a terminal and pick the session's workspace in Herdr.`)).toBe(true)
+  expect(await shows(ui, `Opened Shell "probe" in pane nexus:2.1. ⏎ on it in Pylon copies nexus attach: run it in a terminal and pick the session's workspace in Herdr.`)).toBe(true)
   // The details do not list it yet: it shows as opened, its row from what the CLI answered.
-  expect(await row(ui, 'nexus:2.1')).toMatch(/^ {2}Shell {7}probe {2}◌ opened {2}nexus:2\.1$/)
+  expect(await row(ui, 'nexus:2.1')).toMatch(/^ {2}Shell {7}probe {3}◌ opened {2}nexus:2\.1$/)
   cli.detail = { ...DETAIL, sessions: [CLAUDE, REPORTED] }
   await clock.advance(5_000)
   expect(await row(ui, 'nexus:2.1')).toMatch(/○ idle/)
@@ -113,7 +113,7 @@ test('Cancel leaves the form for the thread, opening nothing', async ($, on) => 
   const ui = await mount()
   await keys(ui, 'n')
   await ui.press({ key: 'open-session-cancel' })
-  expect(await shows(ui, /^‹ web \/ Fix login form 500s$/)).toBe(true)
+  expect(await shows(ui, /^‹ web \/ Fix login form 500s  ◉ working$/)).toBe(true)
   expect(cli.runs.some(argv => argv[0] === 'session')).toBe(false)
 })
 
@@ -239,7 +239,10 @@ test('a CLI before 0.5.0 says which version opening and closing a session need',
   await keys(ui, 'n')
   await ui.press({ key: 'open-session-submit' })
   expect(await shows(ui, 'The session did not open: nexus has no session open command: opening a session needs Nexus CLI 0.5.0 or later (nexus --version).')).toBe(true)
+  // The form gave way to Pylon, its cursor on the details: x there points at the rows.
   await keys(ui, 'x')
+  expect(await shows(ui, 'x closes the session under the cursor: j or k moves onto one.')).toBe(true)
+  await keys(ui, 'jjjx')
   expect(await shows(ui, 'Pane nexus:1.2 was not closed: nexus has no session close command: closing a session needs Nexus CLI 0.5.0 or later (nexus --version).')).toBe(true)
   expect((await nexus(`session open ${ID}`)).text).toBe('Nexus has no session open command: opening a session needs Nexus CLI 0.5.0 or later (nexus --version).')
 })
@@ -283,14 +286,14 @@ test('a paused session reads paused, resumes on wake; a failed one says failed w
   const { nexus, mount } = await boot($, on, cli)
   await nexus(`open ${ID}`)
   const ui = await mount()
-  expect((await ui.find({ type: 'Button', key: 'tab-sessions' }))?.text).toBe('Sessions 3')
   await toSessions(ui)
+  expect(await shows(ui, /^SESSIONS 3 ─/)).toBe(true)
   expect(await row(ui, 'nexus:1.2')).toMatch(/^❯ Claude Code claude {2}◌ paused, resumes on wake {2}nexus:1\.2 {2}session 9c1e$/)
   expect(await shows(ui, '⏎ or y copies nexus attach, which wakes the pylon')).toBe(true)
-  expect(await row(ui, 'failed-0123456789ab')).toMatch(/^ {2}pi {10}plan {2}✕ failed {2}failed-0123456789ab {2}session \/home\/user\/\.pi\/agent\/sessions\/s\.jsonl$/)
+  expect(await row(ui, 'failed-0123456789ab')).toMatch(/^ {2}pi {10}plan {4}✕ failed {2}failed-0123456789ab {2}session \/home\/user\/\.pi\/agent\/sessions\/s\.jsonl$/)
   expect((await ui.find({ type: 'Text', text: 'herdr agent start: the agent did not start.' }))?.props.color).toBe('error')
   // A running row is as before.
-  expect(await row(ui, 'nexus:3.1')).toMatch(/^ {2}Shell {7}○ idle {2}nexus:3\.1$/)
+  expect(await row(ui, 'nexus:3.1')).toMatch(/^ {2}Shell {15}○ idle {2}nexus:3\.1$/)
   const painted = (await ui.findAll({})).flatMap(one => ['color', 'borderColor', 'backgroundColor'].flatMap(prop => (typeof one.props[prop] === 'string' ? [one.props[prop] as string] : [])))
   expect(painted.filter(colour => !THEME_KEYS.has(colour))).toEqual([])
 })

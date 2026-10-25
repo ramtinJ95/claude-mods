@@ -69,7 +69,7 @@ test('a project chosen scopes the list, its counts, the strip and the working th
   await again.unmount()
   await nexus('')
   const third = await mount()
-  expect(await shows(third, /^‹ web \/ Fix login form 500s$/)).toBe(true)
+  expect(await shows(third, /^‹ web \/ Fix login form 500s  ◉ working$/)).toBe(true)
 })
 
 test("the strip shows only the project's threads, and names it", async ($, on) => {

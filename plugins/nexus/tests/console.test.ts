@@ -59,7 +59,7 @@ test('/nexus opens on the thread whose agent works; h goes back to the list with
   await nexus('')
   expect(cli.spawns).toContainEqual(['watch', ID, '--json'])
   const ui = await mount()
-  expect(await shows(ui, /^‹ web \/ Fix login form 500s$/)).toBe(true)
+  expect(await shows(ui, /^‹ web \/ Fix login form 500s  ◉ working$/)).toBe(true)
   await keys(ui, 'h')
   expect(await cursorOn(ui)).toBe(ID)
   expect(await ui.find({ type: 'Markdown' })).toBeUndefined()
@@ -105,7 +105,7 @@ test('the list groups threads by project, folds the closed ones and opens the ro
   await keys(ui, 'k')
   await keys(ui, 'k')
   await keys(ui, 'l')
-  expect(await shows(ui, /^‹ web \/ Fix login form 500s$/)).toBe(true)
+  expect(await shows(ui, /^‹ web \/ Fix login form 500s  ◉ working$/)).toBe(true)
 })
 
 test('a pylon not yet where it is wanted says so under the cursor', async ($, on) => {
@@ -214,7 +214,7 @@ test('after the pane takes the keys back unasked, Enter on the row the ring land
   expect(await shows(ui, /^◆ Nexus\s/)).toBe(true)
   expect(await shows(ui, 'The pane took the keys back after losing them, so that Enter opened nothing. Enter again opens Fix login form 500s.')).toBe(true)
   await ui.press({ key: ID })
-  expect(await shows(ui, /^‹ web \/ Fix login form 500s$/)).toBe(true)
+  expect(await shows(ui, /^‹ web \/ Fix login form 500s  ◉ working$/)).toBe(true)
   // A key the person presses first is theirs: Enter then opens at once.
   await keys(ui, 'hf')
   await ui.redraw({ title: 'Nexus', isFocused: false, bodyColumns: 100, placement: 'dock', scroll: { offset: 0, bodyRows: 60 }, view: {} } as never)
@@ -222,7 +222,7 @@ test('after the pane takes the keys back unasked, Enter on the row the ring land
   await ui.redraw({ title: 'Nexus', isFocused: true, bodyColumns: 100, placement: 'dock', scroll: { offset: 0, bodyRows: 60 }, view: {} } as never)
   await keys(ui, 'jk')
   await ui.press({ key: ID })
-  expect(await shows(ui, /^‹ web \/ Fix login form 500s$/)).toBe(true)
+  expect(await shows(ui, /^‹ web \/ Fix login form 500s  ◉ working$/)).toBe(true)
 })
 
 test('a thread draws as a Claude Code transcript: prompts, ⏺ answers in Markdown, tool calls with ⎿ results, edits as diffs', async ($, on) => {
@@ -230,8 +230,8 @@ test('a thread draws as a Claude Code transcript: prompts, ⏺ answers in Markdo
   const { nexus, mount } = await boot($, on, cli)
   await nexus(`open ${ID}`)
   const ui = await mount()
-  expect(await shows(ui, /^‹ web \/ Fix login form 500s$/)).toBe(true)
-  expect(await shows(ui, /^ working 1m 12s {3}firebat {2}· {2}claude-opus-5-5 {2}· {2}started 12 min ago$/)).toBe(true)
+  expect(await shows(ui, /^‹ web \/ Fix login form 500s  ◉ working$/)).toBe(true)
+  expect(await shows(ui, /^1m 12s {2}· {2}firebat {2}· {2}claude-opus-5-5 {2}· {2}started 12 min ago$/)).toBe(true)
   expect((await ui.find({ type: 'Button', key: 'tab-conversation' }))?.props.autoFocus).toBe(true)
   expect(await shows(ui, /^❯ The login form answers 500/, 'Box')).toBe(true)
   // As Claude Code draws its own: the prompt and the answers' marks in the text colour.
@@ -976,7 +976,7 @@ test('s shows the keys over the view, and q, s or h closes them', async ($, on) 
   expect(await ui.find({ type: 'Markdown' })).toBeDefined()
   await keys(ui, 'sh')
   expect(await ui.find({ type: 'Markdown' })).toBeDefined()
-  expect(await shows(ui, /^‹ web \/ Fix login form 500s$/)).toBe(true)
+  expect(await shows(ui, /^‹ web \/ Fix login form 500s  ◉ working$/)).toBe(true)
 })
 
 test('the help shows over the list too, and scrolls when the pane is too short for it', async ($, on) => {
@@ -1014,39 +1014,40 @@ test("opening a thread records one visit, and its show poll stands in for the li
   expect(cli.runs.filter(argv => argv[0] === 'wake')).toHaveLength(1)
 })
 
-test('l walks the tabs: Details shows the pylon, outputs and the attach command y copies; h walks back to the list', async ($, on) => {
+test('l walks the tabs Conversation, Changes, Previews and Pylon: Pylon shows the pylon, outputs, sessions and the attach command y copies; h walks back to the list', async ($, on) => {
   const cli = fake()
   const { nexus, mount } = await boot($, on, cli)
   await nexus(`open ${ID}`)
   const ui = await mount()
-  await keys(ui, 'l')
+  expect((await texts(ui, 'Button')).filter(text => /^(Conversation|Changes|Previews|Pylon)/.test(text))).toEqual(['Conversation', 'Changes', 'Previews 2', 'Pylon'])
+  await keys(ui, 'lll')
   const rows = await texts(ui, 'Box')
   expect(rows).toEqual(expect.arrayContaining(['Desired    ● running', 'Observed   ● running', 'Node       firebat', 'Last seen  just now', 'Human      2 min ago', 'Agent      turn running']))
-  // The preview output is the preview Ports lists, so the outputs leave it out.
+  // The preview output is the preview Previews lists, so the outputs leave it out.
   expect(await shows(ui, /^OUTPUTS 1 ─/, 'Box')).toBe(true)
   expect(await shows(ui, /^branch\s+fix\/login-plus$/, 'Box')).toBe(true)
-  // The sessions are the Sessions tab's.
-  expect(await shows(ui, /^SESSIONS/, 'Box')).toBe(false)
+  // The sessions follow the details, as the dashboard's Pylon tab lists them.
+  expect(await shows(ui, /^SESSIONS/, 'Box')).toBe(true)
   expect(await ui.find({ type: 'Link' })).toBeUndefined()
   await keys(ui, 'y')
   expect(cli.copied).toEqual(['herdr --session nexus-7f3a'])
   expect(await shows(ui, 'Copied: herdr --session nexus-7f3a')).toBe(true)
   await expectThemeColours(ui)
-  await keys(ui, 'h')
+  await keys(ui, 'hhh')
   expect(await ui.find({ type: 'Markdown' })).toBeDefined()
   await keys(ui, 'h')
   expect(await cursorOn(ui)).toBe(ID)
 })
 
-/** The Ports tab: l twice from the conversation. */
-const toPorts = (ui: Ui) => keys(ui, 'll')
+/** The Previews tab: l twice from the conversation. */
+const toPreviews = (ui: Ui) => keys(ui, 'll')
 
-test('Ports lists the previews linked by their own URL and the ports with none, each once, under a cursor', async ($, on) => {
+test('Previews lists the previews linked by their own URL and the ports with none, each once, under a cursor', async ($, on) => {
   const cli = fake()
   const { nexus, mount } = await boot($, on, cli)
   await nexus(`open ${ID}`)
   const ui = await mount()
-  await toPorts(ui)
+  await toPreviews(ui)
   expect((await ui.findAll({ type: 'Link' })).map(link => [link.props.href, link.text])).toEqual([[WEB_PREVIEW.url, WEB_PREVIEW.url]])
   expect((await ui.find({ type: 'Button', key: 'preview-web' }))?.text).toBe('❯ ● web :3000  ready ')
   expect(await shows(ui, /^⏎ or y copies the URL$/)).toBe(true)
@@ -1068,7 +1069,7 @@ test("a preview's link is the CLI's URL, with or without the nodes", async ($, o
   const { nexus, mount } = await boot($, on, cli)
   await nexus(`open ${ID}`)
   const ui = await mount()
-  await toPorts(ui)
+  await toPreviews(ui)
   expect((await ui.findAll({ type: 'Link' })).map(link => link.props.href)).toEqual([WEB_PREVIEW.url])
 })
 
@@ -1078,7 +1079,7 @@ test("a preview whose service failed says so in red with the node's reason, and 
   const { nexus, mount } = await boot($, on, cli)
   await nexus(`open ${ID}`)
   const ui = await mount()
-  await toPorts(ui)
+  await toPreviews(ui)
   expect((await ui.find({ type: 'Button', key: 'preview-web' }))?.text).toMatch(/web :3000 {2}failed $/)
   expect((await ui.find({ type: 'Text', text: 'web exited with code 1' }))?.props.color).toBe('error')
   expect(await ui.find({ type: 'Link' })).toBeUndefined()
@@ -1090,7 +1091,7 @@ test('o on a port publishes it: progress while the CLI waits, then Previews list
   const { clock, nexus, mount } = await boot($, on, cli)
   await nexus(`open ${ID}`)
   const ui = await mount()
-  await toPorts(ui)
+  await toPreviews(ui)
   await keys(ui, 'ge')
   expect(await cursorOn(ui)).toBe('port-5173')
   await keys(ui, 'o')
@@ -1117,7 +1118,7 @@ test('a port that does not open says why, and opens again when pressed', async (
   const { nexus, mount } = await boot($, on, cli)
   await nexus(`open ${ID}`)
   const ui = await mount()
-  await toPorts(ui)
+  await toPreviews(ui)
   await ui.press({ key: 'port-5173' })
   expect((await ui.find({ type: 'Button', key: 'port-5173' }))?.text).toBe('  ✕ 5173 did not open; ⏎ tries again')
   expect((await ui.find({ type: 'Text', text: /the pylon is not running/ }))?.props).toMatchObject({ color: 'error' })
@@ -1127,7 +1128,7 @@ test('a port that does not open says why, and opens again when pressed', async (
   expect(await ui.find({ type: 'Link', text: OPENED.url })).toBeDefined()
 })
 
-/** Moves the Ports cursor down to `key`. */
+/** Moves the Previews cursor down to `key`. */
 async function cursorTo(ui: Ui, key: string) {
   for (let step = 0; step < 8 && (await cursorOn(ui)) !== key; step += 1) await keys(ui, 'j')
   expect(await cursorOn(ui)).toBe(key)
@@ -1138,7 +1139,7 @@ test("x unpublishes the linked preview under the cursor: closing… while the CL
   const { clock, nexus, mount } = await boot($, on, cli)
   await nexus(`open ${ID}`)
   const ui = await mount()
-  await toPorts(ui)
+  await toPreviews(ui)
   expect(await shows(ui, /^PREVIEWS 3 ─/, 'Box')).toBe(true)
   await cursorTo(ui, 'preview-port-5173')
   expect(await shows(ui, /^⏎ or y copies the URL · x unpublishes it \(a new publish may get a new URL\)$/)).toBe(true)
@@ -1168,7 +1169,7 @@ test('a preview that does not close says why on its row and keeps its link; an o
   const { nexus, mount } = await boot($, on, cli)
   await nexus(`open ${ID}`)
   const ui = await mount()
-  await toPorts(ui)
+  await toPreviews(ui)
   await cursorTo(ui, 'preview-port-5173')
   await keys(ui, 'x')
   expect((await ui.find({ type: 'Text', text: /the node firebat cannot be reached\.$/ }))?.props).toMatchObject({ color: 'error' })
@@ -1183,7 +1184,7 @@ test('a publish still waiting is not offered for unpublishing, even once the det
   const { clock, nexus, mount } = await boot($, on, cli)
   await nexus(`open ${ID}`)
   const ui = await mount()
-  await toPorts(ui)
+  await toPreviews(ui)
   await ui.press({ key: 'port-5173' })
   // The control plane allocates the preview while `preview --wait` still waits for the node to serve it.
   const allocated = { ...OPENED, ready: false }
@@ -1206,12 +1207,12 @@ test('a publish under way is still known after leaving the thread and opening it
   const { clock, nexus, mount } = await boot($, on, cli)
   await nexus(`open ${ID}`)
   const ui = await mount()
-  await toPorts(ui)
+  await toPreviews(ui)
   await ui.press({ key: 'port-5173' })
   await keys(ui, 'hhh')
   expect(await ui.find({ type: 'Markdown' })).toBeUndefined()
   await nexus(`open ${ID}`)
-  await toPorts(ui)
+  await toPreviews(ui)
   expect((await ui.find({ type: 'Button', key: 'port-5173' }))?.text).toMatch(/◐ 5173 opening: publishing it and waiting for the node to serve its URL…$/)
   // The control plane lists the allocated preview while `preview --wait` still waits.
   const allocated = { ...OPENED, ready: false }
@@ -1230,7 +1231,7 @@ test('the details asked for right after a publish ends count, even in the same m
   const { clock, nexus, mount } = await boot($, on, cli)
   await nexus(`open ${ID}`)
   const ui = await mount()
-  await toPorts(ui)
+  await toPreviews(ui)
   await ui.press({ key: 'port-5173' })
   const polled = cli.spawns.filter(argv => argv[0] === 'show').length
   await clock.advance(3_000)
@@ -1244,7 +1245,7 @@ test('a port unpublished then published again before the details catch up stays 
   const { clock, nexus, mount } = await boot($, on, cli)
   await nexus(`open ${ID}`)
   const ui = await mount()
-  await toPorts(ui)
+  await toPreviews(ui)
   // From here the details lag: every `show` hangs, so the pane keeps the snapshot that lists the preview.
   cli.slow.show = 600_000
   await cursorTo(ui, 'preview-port-5173')
@@ -1267,7 +1268,7 @@ test("x says why a service's preview, or an archived thread's, cannot be unpubli
   const { clock, nexus, mount } = await boot($, on, cli)
   await nexus(`open ${ID}`)
   const ui = await mount()
-  await toPorts(ui)
+  await toPreviews(ui)
   await keys(ui, 'x')
   expect(await shows(ui, "web is a declared service's preview, which can't be unpublished.")).toBe(true)
   const archived = { ...THREAD, status: 'archived', agentTurnRunning: false }
@@ -1281,13 +1282,13 @@ test("x says why a service's preview, or an archived thread's, cannot be unpubli
   expect(cli.spawns.some(argv => argv[0] === 'unpreview')).toBe(false)
 })
 
-test('with no port to open, Ports says why: nothing listens and the ::1 hint, a pylon not running, or ports unknown', async ($, on) => {
+test('with no port to open, Previews says why: nothing listens and the ::1 hint, a pylon not running, or ports unknown', async ($, on) => {
   const hint = "A server bound only to ::1 can't be previewed, so bind it to 0.0.0.0 or 127.0.0.1."
   const cli = fake({ detail: { ...DETAIL, ports: [] } })
   const { clock, nexus, mount } = await boot($, on, cli)
   await nexus(`open ${ID}`)
   const ui = await mount()
-  await toPorts(ui)
+  await toPreviews(ui)
   expect(await shows(ui, `Nothing listens yet. ${hint}`)).toBe(true)
   cli.detail = { ...DETAIL, ports: [DETAIL.ports[0]] }
   await clock.advance(5_000)
@@ -1443,7 +1444,7 @@ test('Enter starts the text it delivered, and keys typed after it are the next d
   expect(cli.runs.filter(argv => argv[0] === 'start').at(-1)).toEqual(['start', '--json', '--project=web', '--title=zz'])
 })
 
-test("a thread whose agent has not acted yet says never, as Details does, not the time since 1970", async ($, on) => {
+test("a thread whose agent has not acted yet says never, as Pylon does, not the time since 1970", async ($, on) => {
   const cli = fake({ threads: [{ ...THREAD, agentTurnRunning: false, lastAgentActivityAt: 0 }] })
   const { nexus, mount } = await boot($, on, cli)
   await nexus('')

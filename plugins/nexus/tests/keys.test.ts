@@ -14,9 +14,10 @@ const PANE: NexusPane = {
   listTop: 0,
   isRetaken: false,
   scroll: null,
-  detailsTop: 0,
+  changesCursor: null,
+  diff: null,
   portCursor: null,
-  sessionCursor: null,
+  pylonCursor: null,
   toggled: {},
   filter: '',
   draft: '',
@@ -112,9 +113,9 @@ describe('the conversation', () => {
 
   test('h on Conversation goes back, l walks the tabs, i writes only where the thread takes messages', () => {
     expect(press(PANE, 'left', nav).effects).toEqual([{ kind: 'back' }])
-    const details = press(PANE, 'right', nav)
-    expect(details.pane.tab).toBe('details')
-    expect(details.effects).toEqual([{ kind: 'tab', tab: 'details' }])
+    const changes = press(PANE, 'right', nav)
+    expect(changes.pane.tab).toBe('changes')
+    expect(changes.effects).toEqual([{ kind: 'tab', tab: 'changes' }])
     expect(press(PANE, 'insert', nav)).toMatchObject({ pane: { mode: 'insert' }, effects: [{ kind: 'insert' }] })
     expect(press(PANE, 'insert', { ...nav, canInsert: false })).toMatchObject({ pane: { mode: 'normal' }, effects: [] })
   })
@@ -147,7 +148,7 @@ describe('the menu and the help', () => {
   })
 })
 
-describe('the list and ports', () => {
+describe('the list and previews', () => {
   const list: Nav = { context: 'list', area: 4, items: stack([2, 1, 2, 1, 1]) }
 
   test('j moves the cursor and the list scrolls only as far as shows it', () => {
@@ -161,7 +162,7 @@ describe('the list and ports', () => {
 
   test('x acts on the row under the cursor and o on its Enter', () => {
     const ports: Nav = {
-      context: 'ports',
+      context: 'previews',
       area: 10,
       canInsert: true,
       cursor: null,
@@ -180,11 +181,74 @@ describe('the list and ports', () => {
 
   test('the ring moved by the arrows, Tab or a click carries the cursor and the mode', () => {
     expect(ringMoved(PANE, 'compose')).toMatchObject({ mode: 'insert' })
-    expect(ringMoved({ ...PANE, mode: 'insert' }, 'tab-details')).toMatchObject({ mode: 'normal' })
-    expect(ringMoved({ ...PANE, tab: 'ports' }, 'port-5173')).toMatchObject({ portCursor: 'port-5173' })
+    expect(ringMoved({ ...PANE, mode: 'insert' }, 'tab-pylon')).toMatchObject({ mode: 'normal' })
+    expect(ringMoved({ ...PANE, tab: 'previews' }, 'port-5173')).toMatchObject({ portCursor: 'port-5173' })
     expect(ringMoved({ ...PANE, view: 'list' }, 'th-2')).toMatchObject({ listCursor: 'th-2' })
     expect(ringMoved({ ...PANE, overlay: { kind: 'menu', cursor: null } }, 'menu-delete').overlay).toEqual({ kind: 'menu', cursor: 'menu-delete' })
     const form = { title: '', project: 'web', node: '', branch: '', message: '', error: null, isStarting: false, request: 0, focused: null }
     expect(ringMoved({ ...PANE, view: 'start', start: form }, 'start-message').start).toMatchObject({ focused: 'start-message' })
+  })
+})
+
+describe('changes and pylon', () => {
+  const file = { path: 'src/a.ts', oldPath: null, status: 'modified' as const, additions: 1, deletions: 0 }
+  const changes: Nav = {
+    context: 'changes',
+    area: 10,
+    canInsert: true,
+    cursor: null,
+    thread: 'th-1',
+    items: [
+      { key: 'dir-src', top: 0, height: 1, enter: { kind: 'toggle', key: 'dir-src', isOpen: true } },
+      { key: 'file-src/a.ts', top: 1, height: 1, enter: { kind: 'open-diff', thread: 'th-1', file }, y: { kind: 'copy', text: 'src/a.ts' } },
+    ],
+  }
+  const onTab = { ...PANE, tab: 'changes' as const }
+
+  test('the tabs run Conversation, Changes, Previews, Pylon, and h walks back', () => {
+    const walked = ['right', 'right', 'right'].reduce<NexusPane[]>((panes, command) => [...panes, press(panes.at(-1)!, command as Command, changes).pane], [PANE])
+    expect(walked.map(pane => pane.tab)).toEqual(['conversation', 'changes', 'previews', 'pylon'])
+    expect(press(onTab, 'left', changes).pane.tab).toBe('conversation')
+  })
+
+  test('j moves over the tree, Enter opens a diff, y copies the path, r reads again and c switches the base', () => {
+    const down = press(onTab, 'down', changes)
+    expect(down.pane.changesCursor).toBe('file-src/a.ts')
+    const drawn = { ...changes, cursor: down.pane.changesCursor }
+    expect(press(down.pane, 'open', drawn).effects).toEqual([{ kind: 'open-diff', thread: 'th-1', file }])
+    expect(press(down.pane, 'yank', drawn).effects).toEqual([{ kind: 'copy', text: 'src/a.ts' }])
+    expect(press(onTab, 'refresh', changes).effects).toEqual([{ kind: 'read-changes', thread: 'th-1' }])
+    expect(press(onTab, 'uncommitted', changes).effects).toEqual([{ kind: 'uncommitted' }])
+  })
+
+  test('a diff scrolls with the keys, y copies its path, and h goes back to the tree with the cursor on its file', () => {
+    const open = { ...onTab, diff: { path: 'src/a.ts', top: 0 } }
+    const diff: Nav = { context: 'diff', total: 50, area: 10, canInsert: true, thread: 'th-1', path: 'src/a.ts' }
+    expect(press(open, 'halfDown', diff).pane.diff).toEqual({ path: 'src/a.ts', top: 5 })
+    expect(run(open, diff, ['g', 'e']).pane.diff).toEqual({ path: 'src/a.ts', top: 40 })
+    expect(press(open, 'yank', diff).effects).toEqual([{ kind: 'copy', text: 'src/a.ts' }])
+    const back = press(open, 'left', diff)
+    expect(back.pane).toMatchObject({ tab: 'changes', diff: null, changesCursor: 'file-src/a.ts' })
+    expect(back.effects).toEqual([{ kind: 'focus', key: 'file-src/a.ts' }])
+  })
+
+  test('in Pylon, the cursor stops on the details and the sessions, and x on a row with no session says so', () => {
+    const pylon: Nav = {
+      context: 'pylon',
+      area: 10,
+      canInsert: true,
+      cursor: null,
+      items: [
+        { key: 'pylon-details', top: 0, height: 4, y: { kind: 'copy', text: 'herdr --session x' } },
+        { key: 'session-1.2', top: 4, height: 1, enter: { kind: 'attach', thread: 'th-1', isCopy: false }, x: { kind: 'close-session', thread: 'th-1', id: '1.2' } },
+      ],
+    }
+    const onPylon = { ...PANE, tab: 'pylon' as const }
+    expect(press(onPylon, 'yank', pylon).effects).toEqual([{ kind: 'copy', text: 'herdr --session x' }])
+    expect(press(onPylon, 'unpublish', pylon).effects).toEqual([{ kind: 'say', text: 'No session to close. n opens one.' }])
+    const down = press(onPylon, 'down', pylon)
+    expect(down).toMatchObject({ pane: { pylonCursor: 'session-1.2' }, effects: [{ kind: 'focus', key: 'session-1.2' }] })
+    expect(press(down.pane, 'open', { ...pylon, cursor: 'session-1.2' }).effects).toEqual([{ kind: 'attach', thread: 'th-1', isCopy: false }])
+    expect(press(down.pane, 'up', { ...pylon, cursor: 'session-1.2' }).effects).toEqual([{ kind: 'focus', key: 'tab-pylon' }])
   })
 })

@@ -3,7 +3,12 @@
 // pane derives from them. docs/cli.md in the Nexus repository is the contract.
 import type {
   NexusActual,
+  NexusBase,
+  NexusChangedFile,
+  NexusChanges,
   NexusDesired,
+  NexusDiffRow,
+  NexusFileStatus,
   NexusDetail,
   NexusFailure,
   NexusLive,
@@ -176,7 +181,7 @@ export function parseProjects(json: unknown): NexusProject[] {
 /**
  * One of `show`'s sessions. A control plane older than CLI 0.8.0 lists only running sessions and sends no `state`,
  * `id` or `message`: no `state` is running, and no `id` is the pane. A state this mod does not know, a session with
- * no ID, a running one with no pane or a failed one with no message is a contract error, since the Sessions tab offers
+ * no ID, a running one with no pane or a failed one with no message is a contract error, since the Pylon tab offers
  * a close by state and ID.
  */
 function parseSession(raw: unknown): NexusSession {
@@ -208,7 +213,7 @@ function parseSession(raw: unknown): NexusSession {
 }
 
 /** `nexus project add`'s answer: the project it added. */
-/** `session open`'s `OpenedSession`, each field required: the pane is what a close and the Sessions tab name it by. */
+/** `session open`'s `OpenedSession`, each field required: the pane is what a close and the Pylon tab name it by. */
 export function parseOpenedSession(json: unknown): NexusOpenedSession {
   if (!isRecord(json) || typeof json.herdrPane !== 'string' || typeof json.title !== 'string' || !HARNESS.has(str(json.harness))) {
     throw contractError('session open', 'no OpenedSession')
@@ -676,7 +681,7 @@ export const SESSION_SETTLE_MS = 30_000
 
 export const NO_SESSION_CHANGES: NexusSessionChanges = { opening: [], opened: [], closing: [], closed: {} }
 
-/** A session as the Sessions tab lists it: `opened` is one the CLI opened that the node has not reported yet. */
+/** A session as the Pylon tab lists it: `opened` is one the CLI opened that the node has not reported yet. */
 export type ShownSession = NexusSession | (Omit<Extract<NexusSession, { state: 'running' }>, 'status'> & { status: 'opened' })
 
 type Opened = NexusSessionChanges['opened'][number]
@@ -747,6 +752,172 @@ export function settleSessions(changes: NexusSessionChanges, sessions: readonly 
   if (opened.length === changes.opened.length && Object.keys(closed).length === Object.keys(changes.closed).length) return changes
   return { ...changes, opened, closed }
 }
+
+// The Changes tab: the pylon's checkout as `changes` and `diff` print it, the tree the dashboard draws of it, and when
+// a read may run, since every read wakes a paused pylon.
+
+const FILE_STATUS = new Set<string>(['added', 'modified', 'deleted', 'renamed', 'copied', 'typechange'])
+
+function parseBase(raw: unknown, command: string): NexusBase {
+  if (!isRecord(raw) || (raw.kind !== 'start' && raw.kind !== 'head')) throw contractError(command, 'no base')
+  return { kind: raw.kind, commit: strOrNull(raw.commit) }
+}
+
+const countOrNull = (value: unknown) => (typeof value === 'number' ? value : null)
+
+/** `changes --json`. A file without its path or a known status fails the read: the CLI and the mod disagree. */
+export function parseChanges(json: unknown): NexusChanges {
+  if (!isRecord(json) || !Array.isArray(json.files)) throw contractError('changes', 'no files')
+  return {
+    base: parseBase(json.base, 'changes'),
+    files: json.files.map((raw): NexusChangedFile => {
+      if (!isRecord(raw) || typeof raw.path !== 'string' || !FILE_STATUS.has(str(raw.status))) throw contractError('changes', 'a file without its path or status')
+      return { path: raw.path, oldPath: strOrNull(raw.oldPath), status: raw.status as NexusFileStatus, additions: countOrNull(raw.additions), deletions: countOrNull(raw.deletions) }
+    }),
+    truncated: json.truncated === true,
+  }
+}
+
+/** `diff --json`: the unified diff as text, and whether the CLI cut it. */
+export function parseDiffReply(json: unknown): { base: NexusBase; diff: string; truncated: boolean } {
+  if (!isRecord(json) || typeof json.diff !== 'string') throw contractError('diff', 'no diff')
+  return { base: parseBase(json.base, 'diff'), diff: json.diff, truncated: json.truncated === true }
+}
+
+/** The one-letter badge of a file's status, as the dashboard's tree shows it. */
+export const STATUS_LETTER: Record<NexusFileStatus, string> = { added: 'A', modified: 'M', deleted: 'D', renamed: 'R', copied: 'C', typechange: 'T' }
+
+/** The facts a Changes read hangs on, from the thread's details. */
+export type CheckoutFacts = { status: NexusThread['status']; pylon: NexusActual; turn: boolean; agentAt: number }
+
+export const checkoutFacts = (detail: Pick<NexusDetail, 'thread' | 'pylon'>): CheckoutFacts => ({
+  status: detail.thread.status,
+  pylon: detail.pylon.actualState,
+  turn: detail.thread.agentTurnRunning,
+  agentAt: detail.thread.lastAgentActivityAt,
+})
+
+/** A read wakes nothing only on a running pylon, and an archived or deleted thread's checkout is never read. */
+export const canReadCheckout = (facts: CheckoutFacts) => facts.pylon === 'running' && (facts.status === 'active' || facts.status === 'idle')
+
+/**
+ * Whether new details call for a read, as the dashboard's `noticeFacts` decides: an agent turn ended on a running
+ * pylon (the run went idle, or the agent was active since with no turn running, so a turn between two polls counts
+ * too), or the pylon started running after the person asked to wake it, or while the Changes tab waits for its first
+ * read. Never on a timer: a read counts as human activity and keeps the pylon awake.
+ */
+export function checkoutTrigger(before: CheckoutFacts | null, now: CheckoutFacts, waiting: { isWanted: boolean; isFirst: boolean }): boolean {
+  if (!before || !canReadCheckout(now)) return false
+  const started = before.pylon !== 'running'
+  const turnEnded = !now.turn && (before.turn || now.agentAt !== before.agentAt)
+  return turnEnded || (started && (waiting.isWanted || waiting.isFirst))
+}
+
+/** `6 files · +30017 −5`, and what they are compared with: `since the pylon booted, 9abe10e`. */
+export function changesSummary(changes: NexusChanges): { counts: string; added: number; deleted: number; since: string } {
+  const added = changes.files.reduce((sum, file) => sum + (file.additions ?? 0), 0)
+  const deleted = changes.files.reduce((sum, file) => sum + (file.deletions ?? 0), 0)
+  const isHead = changes.base.kind === 'head'
+  // The base is the empty tree before a checkout's first commit, and at the start of a scratch project's pylon.
+  const commit = changes.base.commit === null ? (isHead ? 'no commit yet' : 'an empty repository') : changes.base.commit.slice(0, 7)
+  return { counts: `${plural(changes.files.length, 'file', 'files')}`, added, deleted, since: `${isHead ? 'since the last commit' : 'since the pylon booted'}, ${commit}` }
+}
+
+/** A row of the Changes tree as drawn: a folder, which Enter folds, or a file, which Enter opens. */
+export type TreeRow =
+  | { kind: 'dir'; key: string; path: string; name: string; depth: number; isOpen: boolean }
+  | { kind: 'file'; key: string; name: string; depth: number; file: NexusChangedFile }
+
+type Folder = { dirs: Map<string, Folder>; files: { name: string; file: NexusChangedFile }[] }
+
+export const dirKey = (path: string) => `dir-${path}`
+export const fileKey = (path: string) => `file-${path}`
+
+/**
+ * The changed files as the dashboard's tree: folders first, then files, each by name, a folder that holds only one
+ * folder merged into it (`src/checkout`), and the folders the person folded (`toggled`, keyed `dir-<path>`) closed.
+ */
+export function changeTree(files: readonly NexusChangedFile[], toggled: Readonly<Record<string, boolean>>): TreeRow[] {
+  const root: Folder = { dirs: new Map(), files: [] }
+  for (const file of files) {
+    const parts = file.path.split('/')
+    let folder = root
+    for (const part of parts.slice(0, -1)) {
+      if (!folder.dirs.has(part)) folder.dirs.set(part, { dirs: new Map(), files: [] })
+      folder = folder.dirs.get(part)!
+    }
+    folder.files.push({ name: parts.at(-1)!, file })
+  }
+  const rows: TreeRow[] = []
+  const walk = (folder: Folder, path: string, depth: number) => {
+    for (const [part, inner] of [...folder.dirs].sort(([a], [b]) => a.localeCompare(b))) {
+      let name = part
+      let deepest = inner
+      while (deepest.files.length === 0 && deepest.dirs.size === 1) {
+        const [child, next] = [...deepest.dirs][0]!
+        name = `${name}/${child}`
+        deepest = next
+      }
+      const at = path === '' ? name : `${path}/${name}`
+      const isOpen = toggled[dirKey(at)] ?? true
+      rows.push({ kind: 'dir', key: dirKey(at), path: at, name, depth, isOpen })
+      if (isOpen) walk(deepest, at, depth + 1)
+    }
+    for (const { name, file } of folder.files.toSorted((a, b) => a.name.localeCompare(b.name))) rows.push({ kind: 'file', key: fileKey(file.path), name, depth, file })
+  }
+  walk(root, '', 0)
+  return rows
+}
+
+/** The most rows a diff shows, as the dashboard caps it: the rest is said to be cut. */
+export const DIFF_ROWS = 20_000
+/** What a diff row keeps of its line: the pane cuts long lines at its width, and `$.state` holds the rows as JSON. */
+const DIFF_CHARS = 400
+/** What a diff says of a file beyond its lines, such as a rename or a new mode: the dashboard's `metaLine`. */
+const META_LINE = /^(old mode|new mode|new file mode|deleted file mode|similarity index|rename from|rename to|copy from|copy to) /
+
+/**
+ * A unified diff's rows, each line with the new file's number or none for a removed one, the hunk separators with
+ * their heading, and the lines that say what changed beyond the lines, as the dashboard's `parseDiff` reads it.
+ */
+export function parseDiff(text: string, max = DIFF_ROWS): { rows: NexusDiffRow[]; meta: string[]; isCut: boolean; isBinary: boolean } {
+  const rows: NexusDiffRow[] = []
+  const meta: string[] = []
+  let next = 0
+  let inHunk = false
+  for (const line of text.split('\n')) {
+    if (rows.length >= max) break
+    if (line.startsWith('diff --git ')) {
+      inHunk = false
+      continue
+    }
+    const hunk = /^@@ -\d+(?:,\d+)? \+(\d+)(?:,\d+)? @@(.*)$/.exec(line)
+    if (hunk) {
+      next = Number(hunk[1])
+      inHunk = true
+      rows.push({ kind: 'hunk', text: hunk[2]!.trim().slice(0, DIFF_CHARS) })
+      continue
+    }
+    if (!inHunk) {
+      if (META_LINE.test(line)) meta.push(line)
+      continue
+    }
+    if (line === '' || line[0] === '\\') continue
+    const kind = line[0] === '+' ? 'add' : line[0] === '-' ? 'del' : 'ctx'
+    rows.push({ kind, line: kind === 'del' ? null : next, text: line.slice(1, DIFF_CHARS + 1) })
+    if (kind !== 'del') next += 1
+  }
+  return { rows, meta, isCut: rows.length >= max, isBinary: /^Binary files /m.test(text) }
+}
+
+/** The changes reading needs: its argv, the base after `--uncommitted`, the thread after `--` as the CLI's parseArgs takes it. */
+export const changesArgv = (thread: string, uncommitted: boolean) => ['changes', ...(uncommitted ? ['--uncommitted'] : []), '--', thread]
+
+/** A file's diff: a renamed file's old path goes too, or the diff shows it as added. */
+export const diffArgv = (thread: string, file: NexusChangedFile, uncommitted: boolean) => ['diff', ...(uncommitted ? ['--uncommitted'] : []), '--', thread, file.path, ...(file.oldPath ? [file.oldPath] : [])]
+
+/** A refusal of the boot base because the pylon booted before Nexus recorded it: the CLI then says to ask since HEAD. */
+export const isNoBase = (message: string) => /refs\/nexus\/base|since HEAD/i.test(message)
 
 export type ToolRow = Extract<NexusRow, { kind: 'tool' }>
 

@@ -3,6 +3,10 @@ import type { EngineInterface, Register, RenderSurface, Timer } from 'claude-cod
 
 import type {
   NexusCatalog,
+  NexusChangedFile,
+  NexusCheckout,
+  NexusDetail,
+  NexusDiffShown,
   NexusFailure,
   NexusHarness,
   NexusList,
@@ -39,6 +43,16 @@ import {
   ago,
   attachCommand,
   applyEvent,
+  canReadCheckout,
+  changesArgv,
+  checkoutFacts,
+  checkoutTrigger,
+  diffArgv,
+  fileKey,
+  isNoBase,
+  parseChanges,
+  parseDiff,
+  parseDiffReply,
   closedKey,
   groupThreads,
   herdrError,
@@ -121,9 +135,10 @@ const paneAtom = atom({ plugin: 'nexus', key: 'pane' } as const, {
   listTop: 0,
   isRetaken: false,
   scroll: null,
-  detailsTop: 0,
+  changesCursor: null,
+  diff: null,
   portCursor: null,
-  sessionCursor: null,
+  pylonCursor: null,
   toggled: {},
   filter: '',
   draft: '',
@@ -143,6 +158,13 @@ const SCOPE = { plugin: 'nexus', key: 'scope' } as const
 const scopeAtom = atom(SCOPE, null)
 const STRIP_CURSOR = { plugin: 'nexus', key: 'stripCursor' } as const
 const stripCursorAtom = atom(STRIP_CURSOR, null)
+const CHECKOUT = { plugin: 'nexus', key: 'checkout' } as const
+const checkoutAtom = atom(CHECKOUT, null)
+const DIFF = { plugin: 'nexus', key: 'diff' } as const
+const diffAtom = atom(DIFF, null)
+const UNCOMMITTED = { plugin: 'nexus', key: 'uncommitted' } as const
+/** What `$.store` keeps under `uncommitted`, mirrored here so a change draws the Changes tab again. */
+const uncommittedAtom = atom(UNCOMMITTED, false)
 
 /** The CLI to run, from the `cli` option. */
 let cli = 'nexus'
@@ -156,6 +178,12 @@ let poller: { timer: Timer; ticker: Timer; isBusy: boolean; stop: () => void; st
 /** The second ask for the keyboard after `/nexus`, cancelled when the pane closes first. */
 let refocus: Timer | undefined
 let watcher: { thread: string; stop: () => void } | undefined
+/**
+ * The Changes tab's children: at most one `changes` and one `diff`, each a child of the pane killed when it closes,
+ * and stopped when the pane leaves their thread or a newer diff takes the place of one.
+ */
+let changesChild: { thread: string; stop: () => void } | undefined
+let diffChild: { thread: string; stop: () => void } | undefined
 /** The thread whose visit is still to be recorded, once its first `show` says whether it is open. */
 let visit: string | undefined
 /** The strip's poll of the list, which runs while the pane is closed or shows a thread. */
@@ -446,6 +474,8 @@ async function poll($: EngineInterface) {
     }
     const detail = parsed(got, parseDetail)
     if ((await read($, paneAtom)).selected !== thread) return
+    const shownBefore = await read($, shownAtom)
+    const before = shownBefore?.thread === thread ? shownBefore.detail : null
     if (detail.ok) void recordVisit($, detail.value.thread)
     // A reply the person sees in the pane is not news on the strip.
     if (detail.ok && pane.isShown) void markSeen($, thread, detail.value.thread.lastAgentActivityAt)
@@ -456,6 +486,7 @@ async function poll($: EngineInterface) {
           ? { ...shown, failure: detail.failure }
           : { thread, detail: null, askedSeq, failure: detail.failure },
     )
+    if (detail.ok) void noticeCheckout($, thread, before, detail.value)
     // The opens and closes these details show, or that waited long enough for them, are drawn from the details now.
     const changes = (await read($, paneAtom)).sessionChanges[thread]
     if (detail.ok && changes && settleSessions(changes, detail.value.sessions, now) !== changes) {
@@ -564,7 +595,8 @@ async function startPane($: EngineInterface) {
       stop,
       stopped: promise,
     }
-    void loadCatalog($, { projects: false })
+    // The projects too: the list heads each with its default branch.
+    void loadCatalog($, { projects: true })
     // A port's CLI ran under the poller before this one, or the module before a reload: none is under way now. A
     // session's open or close outlives the pane, so only those a reload ended go.
     await update($, paneAtom, pane => ({
@@ -660,9 +692,10 @@ const threadView = (pane: NexusPane, thread: string): Partial<NexusPane> => {
     overlay: null,
     pending: null,
     scroll: isSame ? pane.scroll : null,
-    detailsTop: isSame ? pane.detailsTop : 0,
+    changesCursor: isSame ? pane.changesCursor : null,
+    diff: isSame ? pane.diff : null,
     portCursor: isSame ? pane.portCursor : null,
-    sessionCursor: isSame ? pane.sessionCursor : null,
+    pylonCursor: isSame ? pane.pylonCursor : null,
     listCursor: thread,
     draft: '',
     fields: putFields(pane.fields, { [COMPOSE]: '' }),
@@ -835,6 +868,7 @@ const focusOn = ($: EngineInterface, key: string) =>
 async function followThread($: EngineInterface, thread: string) {
   const shown = await read($, shownAtom)
   if (shown?.thread !== thread) await $.state.set(SHOWN, null)
+  await leaveCheckout($, thread)
   // The person may have moved on during those awaits: only the thread still shown is followed.
   const pane = await read($, paneAtom)
   if (pane.selected !== thread || pane.view === 'list' || pane.view === 'start') return
@@ -950,6 +984,151 @@ async function changePort($: EngineInterface, selected: string, port: number, ac
   if ('refused' in held) await setPane($, () => ({ notice: { text: held.refused, tone: 'error' } }))
 }
 
+// The Changes tab. Every read of the checkout counts as human activity and wakes a paused pylon, so the changes are
+// read only while the pylon runs and the thread is open, when the tab is first shown, when an agent turn ends, when
+// the pylon runs after the person asked to wake it, and on r; never on a timer. A paused pylon is woken only when the
+// person says so. One `changes` child and one `diff` child at most, as children of the pane.
+
+const emptyCheckout = (thread: string): NexusCheckout => ({ thread, changes: null, failure: null, isReading: false, isWanted: false })
+
+/** Changes the Changes tab's reads of `thread`, if they are still the ones the pane holds. */
+const changeCheckout = ($: EngineInterface, thread: string, change: (was: NexusCheckout) => NexusCheckout) =>
+  update($, checkoutAtom, was => (was?.thread === thread ? change(was) : was))
+
+/** The Show only uncommitted choice as `$.store` kept it. */
+async function loadUncommitted($: EngineInterface) {
+  await $.state.set(UNCOMMITTED, (await $.store.get('uncommitted')) === true)
+}
+
+/**
+ * Reads `thread`'s changes, if the rule allows: its details say the pylon runs and the thread is open, or the person
+ * asked to wake it (`wake`, or an earlier ask still standing). One read at a time: a second ask while one runs is the
+ * same read. A reply for the base before a toggle of c is dropped, and the read runs again for the base now chosen.
+ */
+async function readChanges($: EngineInterface, thread: string, wake: boolean): Promise<void> {
+  const current = poller
+  if (!current || (await read($, paneAtom)).selected !== thread) return
+  const shown = await read($, shownAtom)
+  const detail = shown?.thread === thread ? shown.detail : null
+  // Until the first details say what the pylon is doing, nothing is read: their arrival reads (`noticeCheckout`).
+  if (!detail) return
+  const facts = checkoutFacts(detail)
+  if (facts.status !== 'active' && facts.status !== 'idle') return
+  const checkout = await update($, checkoutAtom, was => (was?.thread === thread ? was : emptyCheckout(thread)))
+  if (!canReadCheckout(facts)) {
+    if (!wake && !checkout?.isWanted) return
+    if (!checkout?.isWanted) await changeCheckout($, thread, was => ({ ...was, isWanted: true }))
+  }
+  const uncommitted = await read($, uncommittedAtom)
+  // The check and the claim are one synchronous step, so two asks at once never start two children.
+  if (changesChild?.thread === thread) return
+  changesChild?.stop()
+  const { promise, stop } = stopper()
+  const mine = { thread, stop }
+  changesChild = mine
+  await changeCheckout($, thread, was => ({ ...was, isReading: true }))
+  const got = await childJson($, changesArgv(thread, uncommitted), Promise.race([current.stopped, promise]))
+  if (changesChild === mine) changesChild = undefined
+  const isStale = got !== undefined && (await read($, uncommittedAtom)) !== uncommitted
+  if (!got || isStale) {
+    await changeCheckout($, thread, was => ({ ...was, isReading: false }))
+    if (isStale) await readChanges($, thread, false)
+    return
+  }
+  const changes = got.ok ? parsed(got, parseChanges) : { ok: false as const, failure: newer(got.failure, 'changes', 'reading the changes', '0.6.0') }
+  if (!changes.ok) {
+    const { message } = changes.failure
+    await changeCheckout($, thread, was => ({ ...was, changes: null, failure: { message, isNoBase: !uncommitted && isNoBase(message) }, isReading: false, isWanted: false }))
+    return
+  }
+  await changeCheckout($, thread, () => ({ thread, changes: changes.value, failure: null, isReading: false, isWanted: false }))
+  // The diff open is read again against what was just read, as the dashboard's open tab is: a turn changed it, or c did.
+  const { selected, diff } = await read($, paneAtom)
+  if (selected !== thread || !diff) return
+  const file = changes.value.files.find(one => one.path === diff.path) ?? (await read($, diffAtom))?.file
+  // The CLI answers only once the pylon runs, so the diff reads now, though the details may still say it was paused.
+  if (file?.path === diff.path) await readDiff($, thread, file, true)
+}
+
+/**
+ * Reads the diff of `file`, if the rule allows: on a pylon not running it reads nothing, and the diff view offers to
+ * wake it. The rows read before for the same file and base stay on screen during the read. A newer read stops this one.
+ * `isAwake`: a changes read just answered, which the CLI does only once the pylon runs, whatever the details say.
+ */
+async function readDiff($: EngineInterface, thread: string, file: NexusChangedFile, isAwake = false) {
+  const current = poller
+  if (!current || (await read($, paneAtom)).selected !== thread) return
+  const shown = await read($, shownAtom)
+  const detail = shown?.thread === thread ? shown.detail : null
+  const uncommitted = await read($, uncommittedAtom)
+  const fresh: NexusDiffShown = { thread, file, isUncommitted: uncommitted, rows: null, meta: [], isBinary: false, isCut: false, failure: null, isReading: false }
+  const kept = (was: NexusDiffShown | null): NexusDiffShown => (was?.thread === thread && was.file.path === file.path && was.isUncommitted === uncommitted ? { ...was, file } : fresh)
+  const facts = detail && checkoutFacts(detail)
+  const isOpen = facts?.status === 'active' || facts?.status === 'idle'
+  if (!facts || !isOpen || (!isAwake && !canReadCheckout(facts))) {
+    await update($, diffAtom, was => ({ ...kept(was), isReading: false }))
+    return
+  }
+  diffChild?.stop()
+  const { promise, stop } = stopper()
+  const mine = { thread, stop }
+  diffChild = mine
+  await update($, diffAtom, was => ({ ...kept(was), isReading: true }))
+  const got = await childJson($, diffArgv(thread, file, uncommitted), Promise.race([current.stopped, promise]))
+  // A newer read took this one's place, and writes its own.
+  if (diffChild !== mine) return
+  diffChild = undefined
+  const isOurs = (was: NexusDiffShown | null) => was?.thread === thread && was.file.path === file.path && was.isUncommitted === uncommitted
+  if (!got || (await read($, uncommittedAtom)) !== uncommitted) {
+    await update($, diffAtom, was => (isOurs(was) ? { ...was!, isReading: false } : was))
+    return
+  }
+  const reply = got.ok ? parsed(got, parseDiffReply) : { ok: false as const, failure: newer(got.failure, 'diff', 'reading a diff', '0.6.0') }
+  await update($, diffAtom, was => {
+    if (!isOurs(was)) return was
+    if (!reply.ok) return { ...was!, isReading: false, failure: reply.failure.message }
+    const { rows, meta, isCut, isBinary } = parseDiff(reply.value.diff)
+    return { ...fresh, rows, meta, isBinary, isCut: isCut || reply.value.truncated }
+  })
+}
+
+/** c: only the uncommitted changes, or all since the pylon booted again; kept between sessions, and read again. */
+async function toggleUncommitted($: EngineInterface) {
+  const next = !(await read($, uncommittedAtom))
+  await $.state.set(UNCOMMITTED, next)
+  await $.store.set('uncommitted', next)
+  const { selected } = await read($, paneAtom)
+  if (selected) await readChanges($, selected, false)
+}
+
+/** The Changes tab shown: its first read, unless one has run or runs for this thread. */
+async function firstRead($: EngineInterface) {
+  const { selected } = await read($, paneAtom)
+  const checkout = await read($, checkoutAtom)
+  if (selected && !(checkout?.thread === selected && (checkout.changes || checkout.failure || checkout.isReading))) await readChanges($, selected, false)
+}
+
+/**
+ * New details of the thread shown, against the ones before: read the changes when a turn ended on a running pylon,
+ * when the pylon runs after the person asked to wake it, and when the Changes tab waits for its first read.
+ */
+async function noticeCheckout($: EngineInterface, thread: string, before: NexusDetail | null, now: NexusDetail) {
+  const [pane, checkout] = await Promise.all([read($, paneAtom), read($, checkoutAtom)])
+  const mine = checkout?.thread === thread ? checkout : null
+  const isFirst = pane.view === 'thread' && pane.tab === 'changes' && !mine?.changes && !mine?.failure
+  // A tab still waiting for its first read reads with any details, so a read the pane's close cut short runs again.
+  const isDue = (isFirst && !mine?.isReading) || checkoutTrigger(before && checkoutFacts(before), checkoutFacts(now), { isWanted: mine?.isWanted ?? false, isFirst })
+  if (isDue) await readChanges($, thread, false)
+}
+
+/** The pane left the thread whose checkout it read, for `thread` or the list: its reads stop and are forgotten. */
+async function leaveCheckout($: EngineInterface, thread: string | null) {
+  if (changesChild && changesChild.thread !== thread) changesChild.stop()
+  if (diffChild && diffChild.thread !== thread) diffChild.stop()
+  await update($, checkoutAtom, was => (was && was.thread !== thread ? null : was))
+  await update($, diffAtom, was => (was && was.thread !== thread ? null : was))
+}
+
 async function act($: EngineInterface, action: Action, id: string): Promise<Outcome<string>> {
   const got = await nexus($, [action, id])
   if (!got.ok) return got
@@ -1048,7 +1227,7 @@ async function openInPane($: EngineInterface, thread: string, harness: NexusHarn
     const { harness: opener, title: named, herdrPane } = opened.value
     const done = `Opened ${sessionName(opener, named)} in pane ${herdrPane}`
     const how = herdrWorkspace ? 'attaches to it in a new Herdr tab' : "copies nexus attach: run it in a terminal and pick the session's workspace in Herdr"
-    await sayOf($, thread, `${done}. ⏎ in Sessions ${how}.`, `${done} of ${thread}.`, 'dim')
+    await sayOf($, thread, `${done}. ⏎ on it in Pylon ${how}.`, `${done} of ${thread}.`, 'dim')
     void poll($)
   } finally {
     sessionOps.delete(`open:${id}`)
@@ -1064,7 +1243,7 @@ async function sessionOf($: EngineInterface, thread: string, id: string): Promis
 }
 
 /**
- * Closes a running or failed session from the pane once the person says so; the Sessions tab offers no close of a
+ * Closes a running or failed session from the pane once the person says so; the Pylon tab offers no close of a
  * paused one. Keep comes first, so the dialog's default keeps it. A refusal shows the CLI's message as printed.
  */
 async function closeInPane($: EngineInterface, thread: string, id: string) {
@@ -1647,14 +1826,14 @@ async function openSessionForm($: EngineInterface) {
 }
 
 /**
- * Opens the session the form describes: the form gives way to the Sessions tab at once, where the session shows as
+ * Opens the session the form describes: the form gives way to the Pylon tab at once, where the session shows as
  * opening while the CLI wakes the pylon and starts the agent, as pi-nexus does.
  */
 async function submitSession($: EngineInterface, draft: NexusSessionDraft | null) {
   let thread: string | null = null
   await update($, paneAtom, (pane): NexusPane => {
     thread = pane.view === 'session' ? pane.selected : null
-    return thread ? { ...pane, view: 'thread', tab: 'sessions', mode: 'normal', session: null } : pane
+    return thread ? { ...pane, view: 'thread', tab: 'pylon', mode: 'normal', session: null } : pane
   })
   if (!thread || !draft) return
   await focusRing($, await read($, paneAtom))
@@ -1676,9 +1855,10 @@ const listView = (was: NexusPane): NexusPane => ({
   session: null,
   toggled: {},
   scroll: null,
-  detailsTop: 0,
+  changesCursor: null,
+  diff: null,
   portCursor: null,
-  sessionCursor: null,
+  pylonCursor: null,
   listCursor: was.selected ?? was.listCursor,
 })
 
@@ -1686,6 +1866,7 @@ const listView = (was: NexusPane): NexusPane => ({
 async function listShown($: EngineInterface, left: string | null, pane: NexusPane) {
   watcher?.stop()
   if (left) void markSeen($, left)
+  await leaveCheckout($, null)
   await Promise.all([$.state.set(WATCH, null), $.state.set(LIVE, null), $.state.set(SHOWN, null)])
   void poll($)
   await focusRing($, pane)
@@ -1743,7 +1924,7 @@ function paneActions($: EngineInterface, surface: RenderSurface): PaneActions {
   const refresh = async () => {
     const { selected, view } = await read($, paneAtom)
     if (selected && view !== 'list') watchInPane($, selected)
-    await Promise.all([poll($), loadCatalog($, { projects: false })])
+    await Promise.all([poll($), loadCatalog($, { projects: view === 'list' })])
   }
   const startAgain = async () => {
     const { selected } = await read($, paneAtom)
@@ -1786,6 +1967,7 @@ function paneActions($: EngineInterface, surface: RenderSurface): PaneActions {
   }
   const showTab = async (tab: NexusTab) => {
     await focusOn($, `tab-${tab}`)
+    if (tab === 'changes') await firstRead($)
     if (tab !== 'conversation') await Promise.all([poll($), loadCatalog($, { projects: false })])
   }
   const perform = async (effect: Effect): Promise<unknown> => {
@@ -1830,6 +2012,13 @@ function paneActions($: EngineInterface, surface: RenderSurface): PaneActions {
         return attach(effect.thread, effect.isCopy)
       case 'refresh':
         return refresh()
+      case 'read-changes':
+        return readChanges($, effect.thread, true)
+      case 'uncommitted':
+        return toggleUncommitted($)
+      case 'open-diff':
+        await setPane($, pane => (pane.selected === effect.thread ? { diff: { path: effect.file.path, top: 0 }, changesCursor: fileKey(effect.file.path) } : {}))
+        return readDiff($, effect.thread, effect.file)
       case 'close':
         return closePane($)
     }
@@ -1945,6 +2134,7 @@ export const register: Register = (on, options) => {
       ...Object.values(TOOLS).map(spec => $.tool.register(spec)),
       loadStrip($),
       loadScope($),
+      loadUncommitted($),
       readHerdr($),
     ])
     stripper?.cancel()
@@ -2016,7 +2206,7 @@ export const register: Register = (on, options) => {
       return <Text dimColor>The Nexus pane needs a surface with text fields.</Text>
     }
     const draw: Draw = $.ui.resolve(e)
-    const [list, watch, live, shown, catalog, pane, now, scope] = await Promise.all([
+    const [list, watch, live, shown, catalog, pane, now, scope, checkout, diff, uncommitted] = await Promise.all([
       read($, listAtom),
       read($, watchAtom),
       read($, liveAtom),
@@ -2025,6 +2215,9 @@ export const register: Register = (on, options) => {
       read($, paneAtom),
       read($, nowAtom),
       read($, scopeAtom),
+      read($, checkoutAtom),
+      read($, diffAtom),
+      read($, uncommittedAtom),
     ])
     // A drawing may not write: Esc out of a field or an overlay is taken up after it.
     if (!e.props.isFocused && (pane.mode !== 'normal' || pane.overlay) && !recovering) recovering = $.clock.after(0, () => void recover($))
@@ -2044,6 +2237,9 @@ export const register: Register = (on, options) => {
       surface: e.surface,
       inHerdr: herdrWorkspace !== null,
       cli,
+      checkout,
+      diff,
+      uncommitted,
     }
     const actions = paneActions($, e.surface)
     const tree =
