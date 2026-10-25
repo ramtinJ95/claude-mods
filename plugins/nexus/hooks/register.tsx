@@ -2200,7 +2200,7 @@ export const register: Register = (on, options) => {
   on('command.run', { command: 'nexus' }, async ($, e) => ({ text: await runCommand($, e.args) }))
 
   const input = (e: object) => {
-    const { tool, tool_use_id, ...args } = e as Record<string, unknown>
+    const { tool, tool_use_id, agentId, consent, requestMeta, ...args } = e as Record<string, unknown>
     return args
   }
   on('tool.call', { tool: 'mcp__nexus__projects' }, ($, e, next) => callTool($, 'projects', input(e), next.signal)).catch(failedTool)

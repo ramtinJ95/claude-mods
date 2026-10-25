@@ -240,13 +240,18 @@ test('project tools reject malformed contracts, skip unknown node states, and ex
   expect(await add({ node: 'chosen' })).toMatchObject({ deny: 'nexus (invalid): nexus has no project add command: adding a project needs Nexus CLI 0.7.0 or later (nexus --version). Update the nexus CLI.' })
 })
 
-test('cancelling before or during the node lookup never adds; cancelling an add stops its child', async () => {
-  // The kit's $.tool.call has no abort option; give the registered handler a real signal at its process boundary.
+function projectHandler() {
   let handler: (engine: unknown, input: Record<string, unknown>, next: { signal: AbortSignal }) => Promise<unknown> = async () => { throw new Error('project_add was not registered') }
   register(((event: string, matcher: unknown, run: typeof handler) => {
     if (event === 'tool.call' && (matcher as { tool: string }).tool === 'mcp__nexus__project_add') handler = run
     return { catch() {} }
   }) as never, {})
+  return handler
+}
+
+test('cancelling before or during the node lookup never adds; cancelling an add stops its child', async () => {
+  // The kit's $.tool.call has no abort option; give the registered handler a real signal at its process boundary.
+  const handler = projectHandler()
   for (const phase of ['before', 'nodes', 'project']) {
     const controller = new AbortController()
     const started: string[][] = []
@@ -270,5 +275,36 @@ test('cancelling before or during the node lookup never adds; cancelling an add 
     expect(await call).toEqual({ deny: 'nexus (failed): cancelled' })
     expect(started.map(argv => argv[1])).toEqual(phase === 'before' ? [] : [phase])
     expect(stopped).toBe(phase === 'before' ? 0 : 1)
+  }
+})
+
+test('project_add strips the engine metadata for agent calls but still rejects unknown model parameters', async () => {
+  // $.tool.call starts in the main loop and drops agentId; exercise the received event instead.
+  const handler = projectHandler()
+  const started: string[][] = []
+  const engine = {
+    clock: { after: () => ({ cancel() {} }) },
+    process: { spawn: ({ argv }: { argv: string[] }) => {
+      started.push(argv)
+      return (async function* () {
+        yield { stream: 'stderr', text: JSON.stringify({ error: 'Project docs already exists' }) }
+        return { code: 5, signal: null }
+      })()
+    } },
+  }
+  const next = { signal: new AbortController().signal }
+  for (const agentId of ['subagent-1', 'teammate-1']) {
+    const event = {
+      tool: 'mcp__nexus__project_add', tool_use_id: 'call-1', agentId,
+      consent: 'The user pressed Yes', requestMeta: { 'anthropic/sources': '[]' },
+      id: 'docs', repo_url: 'git@example.com:docs.git', node: 'chosen',
+    }
+    expect(await handler(engine, event, next)).toEqual({ deny: 'nexus (conflict): Project docs already exists' })
+    expect(started.at(-1)).toEqual(['nexus', 'project', 'add', '--json', '--branch=main', '--node=chosen', '--', 'docs', 'git@example.com:docs.git'])
+    const baseline = started.length
+    for (const key of ['secret', 'secret_hosts', 'unexpected']) {
+      expect(await handler(engine, { ...event, [key]: 'untrusted' }, next)).toEqual({ deny: `nexus (failed): Unknown project_add parameter: ${key}` })
+    }
+    expect(started).toHaveLength(baseline)
   }
 })
