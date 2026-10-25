@@ -51,7 +51,7 @@ Esc in normal mode hands the keyboard back to the prompt and leaves the pane ope
 - **Start a thread**, on `n` in the list: a title, the project (the one shown, by default), the node and branch it boots (the project's own by default) and a first message. Start again in the Actions menu of a thread whose pylon failed opens it with that thread's project and title.
 
 - **Projects**, on `p` in the list or a thread: All projects, then each project with its repository, then New project…, the one shown marked current. Choosing one shows its threads in the list, the strip and the title's counts, and `/nexus` opens only its working thread; the start form starts on it. Choosing one from a thread opens its list. The choice is kept between sessions, and a project that no longer exists goes back to all of them, saying so once.
-- **Add a project**, on New project…: an ID, the repository URL, the node its pylons boot on (the first one online, by default) and the branch they check out (`main` when left empty). It runs `nexus project add` and then shows the new project, unless you chose another while it ran. A refusal, such as an ID that exists or is not lowercase letters, digits and dashes, shows the CLI's message as it printed it and keeps the form filled. Adding a project needs Nexus CLI 0.4.0 or later, and only the CLI can set its resources, allowed hosts, secrets and logins.
+- **Add a project**, on New project…: an ID, the repository URL, the node its pylons boot on (the first one online, by default) and the branch they check out (`main` when left empty). It runs `nexus project add` and then shows the new project, unless you chose another while it ran. A refusal, such as an ID that exists or is not lowercase letters, digits and dashes, shows the CLI's message as it printed it and keeps the form filled. Adding a project needs Nexus CLI 0.4.0 or later, the form leaves resources, allowed hosts, secrets and logins to the CLI or the model tool below.
 
 Delete in the Actions menu asks first, naming the thread, with Keep as the default. Opening an open thread counts as a visit, which wakes its paused pylon, as the dashboard's page does.
 
@@ -93,6 +93,8 @@ An ID may be a unique prefix, with or without `th-` (`4f2a`, `th-4f2a`). Without
 
 | Tool | What it does |
 | --- | --- |
+| `mcp__nexus__projects` | Lists projects (read-only) |
+| `mcp__nexus__project_add` | Adds a repository or scratch project and returns the CLI’s Project JSON; refreshes the pane’s catalog without changing the project shown |
 | `mcp__nexus__threads` | Lists threads, optionally for one project, whichever project the pane shows |
 | `mcp__nexus__start` | Starts a thread on a project with a first message and returns its ID |
 | `mcp__nexus__send` | Sends a message to a thread's agent |
@@ -102,7 +104,9 @@ An ID may be a unique prefix, with or without `th-` (`4f2a`, `th-4f2a`). Without
 | `mcp__nexus__unpublish` | Closes the preview a linked port was published as, waking a paused pylon first. A declared service's preview can't be closed |
 | `mcp__nexus__archive` | Archives a thread |
 
-The model cannot add a project, delete a thread, retry a pylon, or open, close or attach to a session. Those are left to you as `/nexus project add`, `/nexus delete`, `/nexus retry-pylon` and `/nexus session`, because a delete cannot be undone, a pylon retry acts on a VM, and a session runs an agent you log in. The tools wait behind ToolSearch until the model asks for them, so sessions that never touch Nexus carry no tool text for them.
+`project_add` needs Nexus CLI 0.7.0 or later, which added `--scratch` and `--secret`. It takes `id` and exactly one of `repo_url` or `scratch: true`. Optional `node` defaults to the first online node (no online node means you must name one); `branch` defaults to `main`. It also accepts `cpus`, `memory_gib`, `disk_gib`, `allow_hosts` (strings), `logins` (`claude` or `chatgpt`), and `github` (boolean). `github: true` grants only `GH_TOKEN:api.github.com,github.com`, as the dashboard’s GitHub access checkbox does. No other secret or secret hosts can be supplied. CLI refusals are returned unchanged.
+
+The model cannot delete a thread, retry parked tasks or a pylon, or open, close or attach to a session. Those are left to you as `/nexus delete`, `/nexus retry`, `/nexus retry-pylon` and `/nexus session`, because a delete cannot be undone, a pylon retry acts on a VM, and a session runs an agent you log in. The tools wait behind ToolSearch until the model asks for them, so sessions that never touch Nexus carry no tool text for them.
 
 ## Troubleshooting
 
