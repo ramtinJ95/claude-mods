@@ -1282,17 +1282,16 @@ test("x says why a service's preview, or an archived thread's, cannot be unpubli
   expect(cli.spawns.some(argv => argv[0] === 'unpreview')).toBe(false)
 })
 
-test('with no port to open, Previews says why: nothing listens and the ::1 hint, a pylon not running, or ports unknown', async ($, on) => {
-  const hint = "A server bound only to ::1 can't be previewed, so bind it to 0.0.0.0 or 127.0.0.1."
+test('with no port to open, Previews says why: nothing listens, a pylon not running, or ports unknown', async ($, on) => {
   const cli = fake({ detail: { ...DETAIL, ports: [] } })
   const { clock, nexus, mount } = await boot($, on, cli)
   await nexus(`open ${ID}`)
   const ui = await mount()
   await toPreviews(ui)
-  expect(await shows(ui, `Nothing listens yet. ${hint}`)).toBe(true)
+  expect(await shows(ui, /^Nothing listens yet\.$/)).toBe(true)
   cli.detail = { ...DETAIL, ports: [DETAIL.ports[0]] }
   await clock.advance(5_000)
-  expect(await shows(ui, `Every port that listens is under Previews. ${hint}`)).toBe(true)
+  expect(await shows(ui, /^Every port that listens is under Previews\.$/)).toBe(true)
   cli.detail = { ...DETAIL, pylon: { ...DETAIL.pylon, actualState: 'paused' }, ports: [] }
   await clock.advance(5_000)
   expect(await shows(ui, 'Ports show while the pylon runs.')).toBe(true)

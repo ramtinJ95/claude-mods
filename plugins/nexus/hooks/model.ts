@@ -608,7 +608,7 @@ export function clock(ms: number): string {
 export function previewLook(detail: Pick<NexusDetail, 'thread' | 'pylon'>, preview: NexusPreview) {
   if (detail.thread.status === 'archived') return { linked: false, label: 'paused', tone: 'idle' as Tone, hint: 'Unarchive the thread to open it.' }
   if (detail.pylon.actualState === 'paused') return { linked: true, label: 'paused', tone: 'idle' as Tone, hint: 'Opening it wakes the pylon.' }
-  // A failed service's URL answers 502 until the service runs again, so it is no link; the reason is the node's.
+  // A failed service's URL answers 502, and an unrouted port's 404, so it is no link; the reason is the node's.
   if (preview.failed) return { linked: false, label: 'failed', tone: 'bad' as Tone, hint: preview.failed }
   return preview.ready ? { linked: true, label: 'ready', tone: 'ok' as Tone, hint: null } : { linked: false, label: 'starting', tone: 'busy' as Tone, hint: null }
 }
