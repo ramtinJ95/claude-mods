@@ -1,6 +1,6 @@
 {
 	"name": "nexus",
-	"version": "0.10.0",
+	"version": "0.11.0",
 	"description": "Drive Nexus coding-agent threads from Claude Code: a live pane of threads and conversations, /nexus commands, and tools for the model",
 	"author": { "name": "ramtinJ95" },
 	"types": "./types/index.d.ts",

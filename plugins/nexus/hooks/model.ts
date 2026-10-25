@@ -227,6 +227,22 @@ export function parseSessionClosed(raw: unknown): null {
   return null
 }
 
+export function projectJson(json: unknown, command: 'projects' | 'project add'): unknown {
+  const projects = command === 'projects' ? json : [json]
+  if (!Array.isArray(projects)) throw contractError(command, 'no project list')
+  for (const project of projects) {
+    if (!isRecord(project) || typeof project.id !== 'string' || (project.repoUrl !== null && typeof project.repoUrl !== 'string') || typeof project.defaultNode !== 'string' || typeof project.defaultBranch !== 'string') {
+      throw contractError(command, 'a malformed project')
+    }
+  }
+  return json
+}
+
+export function onlineNode(json: unknown): string | undefined {
+  if (!Array.isArray(json) || json.some(node => !isRecord(node) || typeof node.name !== 'string' || typeof node.state !== 'string')) throw contractError('nodes', 'a malformed node list')
+  return json.find(node => node.state === 'online')?.name
+}
+
 export function parseAdded(json: unknown): NexusProject {
   if (!isRecord(json) || typeof json.id !== 'string') throw new Error('nexus project add did not print the project it added')
   return projectOf(json.id, json)

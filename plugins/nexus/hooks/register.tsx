@@ -64,6 +64,8 @@ import {
   matchThread,
   parseCommand,
   parseAdded,
+  projectJson,
+  onlineNode,
   parseDetail,
   parseFailure,
   parseHerdrTab,
@@ -88,7 +90,7 @@ import {
 } from './model'
 import { COMPOSE, type Effect, FILTER, type MenuAction, fieldKey, fieldOf, press, putFields, ringMoved } from './keys'
 import { StripView } from './strip'
-import { needsHuman, portFacts, TOOLS } from './tools'
+import { needsHuman, portFacts, projectArgs, TOOLS } from './tools'
 import { type Draw, ListView, PROJECT_KEYS, type PaneActions, ProjectView, SESSION_KEYS, START_KEYS, type Scene, SessionView, StartView, ThreadView, ringOf } from './view'
 
 const PANE = 'nexus'
@@ -331,9 +333,10 @@ async function followWatch(
 /** One CLI command as a child `stop` kills, such as a poll of the pane: a closed pane leaves none running. Undefined once stopped. */
 async function childJson($: EngineInterface, argv: readonly string[], stop: Promise<void>): Promise<Outcome<unknown> | undefined> {
   let stdout = ''
+  const words = argv[0] === 'project' || argv[0] === 'session' ? 2 : 1
   const end = await runChild(
     $,
-    [argv[0]!, '--json', ...argv.slice(1)],
+    [...argv.slice(0, words), '--json', ...argv.slice(words)],
     text => {
       stdout += text
       return false
@@ -346,6 +349,20 @@ async function childJson($: EngineInterface, argv: readonly string[], stop: Prom
     return { ok: true, value: JSON.parse(stdout) }
   } catch {
     return failed(`nexus ${argv[0]} printed something that is not JSON`)
+  }
+}
+
+async function toolJson($: EngineInterface, args: readonly string[], signal: AbortSignal): Promise<Outcome<unknown>> {
+  if (signal.aborted) return failed('cancelled')
+  const { promise, stop } = stopper()
+  const timer = $.clock.after(RUN_MS, stop)
+  signal.addEventListener('abort', stop)
+  try {
+    const got = await childJson($, args, promise)
+    return signal.aborted ? failed('cancelled') : got ?? failed('timed out')
+  } finally {
+    timer.cancel()
+    signal.removeEventListener('abort', stop)
   }
 }
 
@@ -1601,6 +1618,31 @@ async function callTool($: EngineInterface, tool: keyof typeof TOOLS, input: Rec
 
 async function runTool($: EngineInterface, tool: keyof typeof TOOLS, input: Record<string, unknown>, signal: AbortSignal): Promise<ToolAnswer> {
   switch (tool) {
+    case 'projects':
+      return answer(parsed(await toolJson($, ['projects'], signal), json => projectJson(json, 'projects')))
+    case 'project_add': {
+      let args: string[]
+      try {
+        args = projectArgs(input)
+      } catch (error) {
+        return answer(failed(messageOf(error)))
+      }
+      if (input.node === undefined) {
+        const node = parsed(await toolJson($, ['nodes'], signal), onlineNode)
+        if (!node.ok) return answer(node)
+        if (node.value === undefined) return answer(failed('no online node is available; provide node explicitly'))
+        args.splice(2, 0, `--node=${node.value}`)
+      }
+      if (signal.aborted) return answer(failed('cancelled'))
+      const got = await toolJson($, args, signal)
+      if (!got.ok) {
+        const failure = got.failure.kind === 'invalid' ? newer(got.failure, 'project add', 'adding a project', '0.7.0') : got.failure
+        return answer({ ok: false, failure: failure === got.failure ? failure : { ...failure, message: `${failure.message}. Update the nexus CLI.` } })
+      }
+      const added = parsed(got, json => projectJson(json, 'project add'))
+      if (added.ok) void loadCatalog($, { projects: true })
+      return answer(added)
+    }
     case 'threads': {
       const got = await listThreads($, str(input, 'project'))
       if (!got.ok) return answer(got)
@@ -2157,7 +2199,12 @@ export const register: Register = (on, options) => {
 
   on('command.run', { command: 'nexus' }, async ($, e) => ({ text: await runCommand($, e.args) }))
 
-  const input = (e: object) => e as Record<string, unknown>
+  const input = (e: object) => {
+    const { tool, tool_use_id, agentId, consent, requestMeta, ...args } = e as Record<string, unknown>
+    return args
+  }
+  on('tool.call', { tool: 'mcp__nexus__projects' }, ($, e, next) => callTool($, 'projects', input(e), next.signal)).catch(failedTool)
+  on('tool.call', { tool: 'mcp__nexus__project_add' }, ($, e, next) => callTool($, 'project_add', input(e), next.signal)).catch(failedTool)
   on('tool.call', { tool: 'mcp__nexus__threads' }, ($, e, next) => callTool($, 'threads', input(e), next.signal)).catch(failedTool)
   on('tool.call', { tool: 'mcp__nexus__start' }, ($, e, next) => callTool($, 'start', input(e), next.signal)).catch(failedTool)
   on('tool.call', { tool: 'mcp__nexus__send' }, ($, e, next) => callTool($, 'send', input(e), next.signal)).catch(failedTool)
