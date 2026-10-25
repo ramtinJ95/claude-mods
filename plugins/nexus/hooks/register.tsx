@@ -30,13 +30,13 @@ import type {
 } from '../types'
 import {
   ACTIONS,
+  ATTACH_HINT,
   type Action,
   type Reply,
   FULL_ID,
   HARNESS_LABEL,
   NO_CHANGE,
   NO_SESSION_CHANGES,
-  SSH_HINT,
   USAGE,
   type WatchEntry,
   type WatchEvent,
@@ -1309,12 +1309,12 @@ async function askSession($: EngineInterface, thread: string): Promise<Outcome<{
 
 /** How to attach a terminal on this Mac to the thread's sessions: Claude Code cannot hand its own terminal over. */
 const attachHow = (thread: string) =>
-  `Claude Code cannot give its terminal to the attach, so run this in a terminal or a Herdr tab:\n\n  ${attachCommand(cli, thread)}\n\nEach session is a workspace in the pylon's Herdr: pick one there, and detach from Herdr to come back. ${SSH_HINT}`
+  `Claude Code cannot give its terminal to the attach, so run this in a terminal or a Herdr tab:\n\n  ${attachCommand(cli, thread)}\n\nEach session is a workspace in the pylon's Herdr: pick one there, and detach from Herdr to come back. ${ATTACH_HINT}`
 
 /**
  * `nexus attach` in a new tab of the Herdr workspace Claude Code runs in, put in front: Claude Code cannot hand its
  * own terminal over, and a Herdr tab can. The tab's shell runs it, so the detach leaves the tab at its shell, with any
- * error of ssh's still there to read. Resolves the tab's label.
+ * error of the attach still there to read. Resolves the tab's label.
  */
 async function attachInHerdr($: EngineInterface, workspace: string, thread: string): Promise<Outcome<string>> {
   // The ID is typed into a shell: only one of the CLI's own form goes there.

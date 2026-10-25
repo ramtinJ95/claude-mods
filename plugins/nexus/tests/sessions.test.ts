@@ -1,6 +1,6 @@
 import { expect, test } from 'claude-code/testing'
 
-import { SSH_HINT, cells } from '../hooks/model'
+import { cells } from '../hooks/model'
 import { rowsOf } from '../hooks/view'
 import { TOOLS } from '../hooks/tools'
 import { DETAIL, ID, THEME_KEYS, THREAD, boot, fake, field, state, typing } from './fake-cli'
@@ -15,6 +15,7 @@ const cursorOn = async (ui: Ui) => (await ui.findAll({ type: 'Button' })).find(o
 const row = async (ui: Ui, pane: string) => (await ui.find({ type: 'Button', key: `session-${pane}` }))?.text
 /** The Pylon tab, l three times from the conversation, and j past its three blocks of details onto the first session. */
 const toSessions = (ui: Ui) => keys(ui, 'llljjj')
+const ATTACH_NEEDS = 'Attaching needs Nexus CLI 0.9.0 or newer and goes through the control plane.'
 
 const CLAUDE = { herdrPane: 'nexus:1.2', harness: 'claude-code', harnessSessionId: '9c1e', status: 'working', title: 'claude', pylon: 'pylon-7f3a' }
 const SHELL = { herdrPane: 'nexus:3.1', harness: 'shell', harnessSessionId: null, status: 'idle', title: null, pylon: 'pylon-7f3a' }
@@ -34,7 +35,7 @@ test('Pylon lists each session with its harness, title, state, pane and session 
   expect(await shows(ui, '⏎ or y copies nexus attach, x closes the session')).toBe(true)
   expect(await shows(ui, /^ATTACH FROM THIS MAC/)).toBe(true)
   expect(await shows(ui, `  nexus attach ${ID}`)).toBe(true)
-  expect(await shows(ui, SSH_HINT)).toBe(true)
+  expect(await shows(ui, ATTACH_NEEDS)).toBe(true)
   await keys(ui, 'j')
   expect(await cursorOn(ui)).toBe('session-nexus:3.1')
   const painted = (await ui.findAll({})).flatMap(one => ['color', 'borderColor', 'backgroundColor'].flatMap(prop => (typeof one.props[prop] === 'string' ? [one.props[prop] as string] : [])))
@@ -212,7 +213,9 @@ test('outside Herdr, or with no workspace to open the tab in, nothing runs herdr
   const ui = await mount()
   await toSessions(ui)
   await keys(ui, 'o')
-  expect((await nexus(`session attach ${ID}`)).text).toContain(`run this in a terminal or a Herdr tab:\n\n  nexus attach ${ID}\n\n`)
+  expect((await nexus(`session attach ${ID}`)).text).toBe(
+    `Claude Code cannot give its terminal to the attach, so run this in a terminal or a Herdr tab:\n\n  nexus attach ${ID}\n\nEach session is a workspace in the pylon's Herdr: pick one there, and detach from Herdr to come back. ${ATTACH_NEEDS}`,
+  )
   expect(cli.herdr).toEqual([])
   expect(cli.copied).toEqual([`nexus attach ${ID}`])
 })

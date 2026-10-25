@@ -44,6 +44,7 @@ import type {
 import { COMPOSE, type Command, type Effect, FILTER, HELP, KEYMAP, type MenuAction, type Nav, type NavItem, blockAt, fieldKey, keepInView, scrolledRows } from './keys'
 import {
   ACTUAL_BADGE,
+  ATTACH_HINT,
   type Block,
   type CheckoutFacts,
   DESIRED_TONE,
@@ -61,7 +62,6 @@ import {
   pausedClose,
   resumesOn,
   sessionPlace,
-  SSH_HINT,
   type ShownSession,
   attachCommand,
   type Tone,
@@ -2005,8 +2005,8 @@ function PylonBody(draw: Draw, scene: Scene, actions: PaneActions, area: number,
           ? "⏎ runs it in a new tab of this Herdr workspace, and y copies it. Each session is a workspace in the pylon's Herdr, so pick one there, and detach from the pylon's Herdr to come back."
           : "⏎ and y copy it: run it in a terminal or a Herdr tab. Each session is a workspace in the pylon's Herdr, so pick one there, and detach from Herdr to come back."}
       </Text>
-      <Text key="attach-ssh" color="subtle">
-        {SSH_HINT}
+      <Text key="attach-needs" color="subtle">
+        {ATTACH_HINT}
       </Text>
     </Box>,
     { key: 'attach-mac', enter: attach, y: copy, x: offRow },
