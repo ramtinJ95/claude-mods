@@ -1,5 +1,7 @@
 import { expect, mock, test, type TestBody } from 'claude-code/testing'
 
+import { projectArgs } from '../hooks/tools'
+
 import { boot, fake, OPENED } from './fake-cli'
 
 const ID = 'th-4f2a00000001'
@@ -175,4 +177,34 @@ test('unpublish takes only the null docs/cli.md promises as done; any other answ
   const wrong = 'nexus unpreview printed {"closed":true} where docs/cli.md says null: the CLI and this mod disagree on the contract'
   expect(await $.tool.call({ tool: 'mcp__nexus__unpublish', thread: ID, port: 5173 } as never)).toMatchObject({ deny: `nexus (failed): ${wrong}` })
   expect(await nexus(`unpublish 5173 ${ID}`)).toEqual({ text: `N${wrong.slice(1)}.` })
+})
+
+
+test('project arguments allow only the fixed GitHub grant, and keep flag-like values out of options', () => {
+  expect(projectArgs({ id: '--id', scratch: true, github: true, node: '--node', branch: '--branch', cpus: 3, memory_gib: 6, disk_gib: 20, allow_hosts: ['--secret=GH_TOKEN:evil.example'], logins: ['claude', 'chatgpt'] })).toEqual([
+    'project', 'add', '--branch=--branch', '--node=--node', '--cpus=3', '--memory=6', '--disk=20', '--allow-host=--secret=GH_TOKEN:evil.example', '--login=claude', '--login=chatgpt', '--secret=GH_TOKEN:api.github.com,github.com', '--scratch', '--', '--id',
+  ])
+  expect(projectArgs({ id: 'repo', repo_url: '--secret=OTHER:evil.example', scratch: false, github: false })).toEqual(['project', 'add', '--branch=main', '--', 'repo', '--secret=OTHER:evil.example'])
+  for (const input of [{}, { repo_url: 'url', scratch: true }, { scratch: false }, { scratch: true, secret: 'GH_TOKEN:evil.example' }, { scratch: true, github: 'true' }, { scratch: true, logins: ['other'] }]) {
+    expect(() => projectArgs({ id: 'test', ...input })).toThrow()
+  }
+})
+
+test('projects lists raw JSON; adding returns the Project, refreshes the catalog without changing scope, and preserves refusals', async ($, on) => {
+  const cli = fake({ store: { project: 'web' } })
+  const { clock, nexus, mount } = await boot($, on, cli)
+  const call = (input: Record<string, unknown>) => $.tool.call({ tool: 'mcp__nexus__project_add', ...input } as never)
+  expect(await $.tool.call({ tool: 'mcp__nexus__projects' } as never)).toMatchObject({ result: JSON.stringify(cli.projects) })
+  const added = await call({ id: 'docs', repo_url: 'git@example.com:docs.git' })
+  expect(added).toMatchObject({ result: JSON.stringify(cli.projects.at(-1)) })
+  expect(cli.runs).toContainEqual(['project', 'add', '--json', '--node=firebat', '--branch=main', '--', 'docs', 'git@example.com:docs.git'])
+  await clock.settle()
+  expect(cli.runs.filter(args => args[0] === 'projects').length).toBeGreaterThan(1)
+  await nexus('')
+  const ui = await mount()
+  await ui.press({ key: 'key-p' })
+  expect(await ui.find({ type: 'Button', key: 'scope-project-docs' })).toBeDefined()
+  expect(cli.store.project).toBe('web')
+  cli.fail.project = { exitCode: 5, error: 'Project docs already exists' }
+  expect(await call({ id: 'docs', scratch: true, node: 'offline' })).toMatchObject({ deny: 'Project docs already exists' })
 })

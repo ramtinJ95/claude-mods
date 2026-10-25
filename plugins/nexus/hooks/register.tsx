@@ -88,7 +88,7 @@ import {
 } from './model'
 import { COMPOSE, type Effect, FILTER, type MenuAction, fieldKey, fieldOf, press, putFields, ringMoved } from './keys'
 import { StripView } from './strip'
-import { needsHuman, portFacts, TOOLS } from './tools'
+import { needsHuman, portFacts, projectArgs, TOOLS } from './tools'
 import { type Draw, ListView, PROJECT_KEYS, type PaneActions, ProjectView, SESSION_KEYS, START_KEYS, type Scene, SessionView, StartView, ThreadView, ringOf } from './view'
 
 const PANE = 'nexus'
@@ -1601,6 +1601,22 @@ async function callTool($: EngineInterface, tool: keyof typeof TOOLS, input: Rec
 
 async function runTool($: EngineInterface, tool: keyof typeof TOOLS, input: Record<string, unknown>, signal: AbortSignal): Promise<ToolAnswer> {
   switch (tool) {
+    case 'projects':
+      return answer(await nexus($, ['projects']))
+    case 'project_add': {
+      const args = projectArgs(input)
+      if (input.node === undefined) {
+        const nodes = parsed(await nexus($, ['nodes']), parseNodes)
+        if (!nodes.ok) return answer(nodes)
+        const node = nodes.value.find(one => one.state === 'online')
+        if (!node) return { deny: 'No online Nexus node is available; specify node explicitly.' }
+        args.splice(2, 0, `--node=${node.name}`)
+      }
+      const added = await nexus($, args)
+      if (!added.ok) return { deny: added.failure.message }
+      void loadCatalog($, { projects: true })
+      return answer(added)
+    }
     case 'threads': {
       const got = await listThreads($, str(input, 'project'))
       if (!got.ok) return answer(got)
@@ -2157,7 +2173,12 @@ export const register: Register = (on, options) => {
 
   on('command.run', { command: 'nexus' }, async ($, e) => ({ text: await runCommand($, e.args) }))
 
-  const input = (e: object) => e as Record<string, unknown>
+  const input = (e: object) => {
+    const { tool, tool_use_id, ...args } = e as Record<string, unknown>
+    return args
+  }
+  on('tool.call', { tool: 'mcp__nexus__projects' }, ($, e, next) => callTool($, 'projects', input(e), next.signal)).catch(failedTool)
+  on('tool.call', { tool: 'mcp__nexus__project_add' }, ($, e, next) => callTool($, 'project_add', input(e), next.signal)).catch(failedTool)
   on('tool.call', { tool: 'mcp__nexus__threads' }, ($, e, next) => callTool($, 'threads', input(e), next.signal)).catch(failedTool)
   on('tool.call', { tool: 'mcp__nexus__start' }, ($, e, next) => callTool($, 'start', input(e), next.signal)).catch(failedTool)
   on('tool.call', { tool: 'mcp__nexus__send' }, ($, e, next) => callTool($, 'send', input(e), next.signal)).catch(failedTool)

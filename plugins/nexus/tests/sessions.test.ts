@@ -414,5 +414,5 @@ test('/nexus session close offers only the sessions that can be closed, and says
 })
 
 test('no model tool opens, closes or attaches to a session', () => {
-  expect(Object.keys(TOOLS).sort()).toEqual(['archive', 'preview', 'read', 'send', 'start', 'threads', 'unpublish', 'wait'])
+  expect(Object.keys(TOOLS).sort()).toEqual(['archive', 'preview', 'project_add', 'projects', 'read', 'send', 'start', 'threads', 'unpublish', 'wait'])
 })
