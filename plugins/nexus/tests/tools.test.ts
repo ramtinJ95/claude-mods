@@ -1,6 +1,7 @@
 import { expect, mock, test, type TestBody } from 'claude-code/testing'
 
 import { projectArgs } from '../hooks/tools'
+import { register } from '../hooks/register'
 
 import { boot, fake, OPENED } from './fake-cli'
 
@@ -184,7 +185,7 @@ test('project arguments allow only the fixed GitHub grant, and keep flag-like va
   expect(projectArgs({ id: '--id', scratch: true, github: true, node: '--node', branch: '--branch', cpus: 3, memory_gib: 6, disk_gib: 20, allow_hosts: ['--secret=GH_TOKEN:evil.example'], logins: ['claude', 'chatgpt'] })).toEqual([
     'project', 'add', '--branch=--branch', '--node=--node', '--cpus=3', '--memory=6', '--disk=20', '--allow-host=--secret=GH_TOKEN:evil.example', '--login=claude', '--login=chatgpt', '--secret=GH_TOKEN:api.github.com,github.com', '--scratch', '--', '--id',
   ])
-  expect(projectArgs({ id: 'repo', repo_url: '--secret=OTHER:evil.example', scratch: false, github: false })).toEqual(['project', 'add', '--branch=main', '--', 'repo', '--secret=OTHER:evil.example'])
+  expect(projectArgs({ id: ' repo ', repo_url: ' --secret=OTHER:evil.example ', scratch: false, github: false })).toEqual(['project', 'add', '--branch=main', '--', 'repo', '--secret=OTHER:evil.example'])
   for (const input of [{}, { repo_url: 'url', scratch: true }, { scratch: false }, { scratch: true, secret: 'GH_TOKEN:evil.example' }, { scratch: true, github: 'true' }, { scratch: true, logins: ['other'] }]) {
     expect(() => projectArgs({ id: 'test', ...input })).toThrow()
   }
@@ -192,19 +193,82 @@ test('project arguments allow only the fixed GitHub grant, and keep flag-like va
 
 test('projects lists raw JSON; adding returns the Project, refreshes the catalog without changing scope, and preserves refusals', async ($, on) => {
   const cli = fake({ store: { project: 'web' } })
-  const { clock, nexus, mount } = await boot($, on, cli)
+  let catalog: unknown
+  on('state.set', (_, e, next) => {
+    if (e.key === 'catalog') catalog = e.value
+    return next(e)
+  })
+  const { clock } = await boot($, on, cli)
   const call = (input: Record<string, unknown>) => $.tool.call({ tool: 'mcp__nexus__project_add', ...input } as never)
   expect(await $.tool.call({ tool: 'mcp__nexus__projects' } as never)).toMatchObject({ result: JSON.stringify(cli.projects) })
-  const added = await call({ id: 'docs', repo_url: 'git@example.com:docs.git' })
-  expect(added).toMatchObject({ result: JSON.stringify(cli.projects.at(-1)) })
-  expect(cli.runs).toContainEqual(['project', 'add', '--json', '--node=firebat', '--branch=main', '--', 'docs', 'git@example.com:docs.git'])
   await clock.settle()
-  expect(cli.runs.filter(args => args[0] === 'projects').length).toBeGreaterThan(1)
-  await nexus('')
-  const ui = await mount()
-  await ui.press({ key: 'key-p' })
-  expect(await ui.find({ type: 'Button', key: 'scope-project-docs' })).toBeDefined()
+  const baseline = cli.runs.filter(args => args[0] === 'projects').length
+  const added = await call({ id: ' docs ', repo_url: 'git@example.com:docs.git' })
+  expect(added).toMatchObject({ result: JSON.stringify(cli.projects.at(-1)) })
+  expect(cli.spawns).toContainEqual(['project', 'add', '--json', '--node=firebat', '--branch=main', '--', 'docs', 'git@example.com:docs.git'])
+  await clock.settle()
+  expect(cli.runs.filter(args => args[0] === 'projects').length).toBe(baseline + 1)
+  expect(cli.isOpen).toBe(false)
+  expect(catalog).toMatchObject({ projects: cli.projects.map(({ id, repoUrl, defaultBranch, defaultNode }) => ({ id, repoUrl, defaultBranch, defaultNode })) })
   expect(cli.store.project).toBe('web')
   cli.fail.project = { exitCode: 5, error: 'Project docs already exists' }
-  expect(await call({ id: 'docs', scratch: true, node: 'offline' })).toMatchObject({ deny: 'Project docs already exists' })
+  expect(await call({ id: 'docs', scratch: true, node: 'offline' })).toMatchObject({ deny: 'nexus (conflict): Project docs already exists' })
+})
+
+test('project tools reject malformed contracts, skip unknown node states, and explain an old CLI', async ($, on) => {
+  const cli = fake()
+  await boot($, on, cli)
+  const add = (input: Record<string, unknown> = {}) => $.tool.call({ tool: 'mcp__nexus__project_add', id: 'scratch', scratch: true, ...input } as never)
+  for (const json of [null, {}, [null], [{ id: 'missing-fields' }]]) {
+    cli.printed.projects = json
+    expect(await $.tool.call({ tool: 'mcp__nexus__projects' } as never)).toMatchObject({ deny: expect.stringContaining('contract') })
+  }
+  for (const json of [null, {}, { id: 'missing-fields' }]) {
+    cli.printed.project = json
+    expect(await add({ node: 'chosen' })).toMatchObject({ deny: expect.stringContaining('contract') })
+  }
+  const project = { id: 'scratch', repoUrl: null, defaultNode: 'online', defaultBranch: 'main', extra: { kept: true } }
+  cli.printed.projects = [project]
+  expect(await $.tool.call({ tool: 'mcp__nexus__projects' } as never)).toMatchObject({ result: JSON.stringify([project]) })
+  cli.printed.project = project
+  cli.printed.nodes = [{ name: 'unknown', state: 'unknown' }, { name: 'offline', state: 'offline' }, { name: 'online', state: 'online' }]
+  expect(await add()).toMatchObject({ result: JSON.stringify(project) })
+  expect(cli.spawns.at(-1)).toEqual(['project', 'add', '--json', '--node=online', '--branch=main', '--scratch', '--', 'scratch'])
+  cli.printed.nodes = [{ name: 'unknown', state: 'unknown' }]
+  expect(await add()).toMatchObject({ deny: 'nexus (failed): no online node is available; provide node explicitly' })
+  cli.fail.project = { exitCode: 64, error: 'unknown command project' }
+  expect(await add({ node: 'chosen' })).toMatchObject({ deny: 'nexus (invalid): nexus has no project add command: adding a project needs Nexus CLI 0.7.0 or later (nexus --version). Update the nexus CLI.' })
+})
+
+test('cancelling before or during the node lookup never adds; cancelling an add stops its child', async () => {
+  // The kit's $.tool.call has no abort option; give the registered handler a real signal at its process boundary.
+  let handler: (engine: unknown, input: Record<string, unknown>, next: { signal: AbortSignal }) => Promise<unknown> = async () => { throw new Error('project_add was not registered') }
+  register(((event: string, matcher: unknown, run: typeof handler) => {
+    if (event === 'tool.call' && (matcher as { tool: string }).tool === 'mcp__nexus__project_add') handler = run
+    return { catch() {} }
+  }) as never, {})
+  for (const phase of ['before', 'nodes', 'project']) {
+    const controller = new AbortController()
+    const started: string[][] = []
+    let stopped = 0
+    let entered = () => {}
+    const waiting = new Promise<void>(resolve => { entered = resolve })
+    const engine = {
+      clock: { after: () => ({ cancel() {} }) },
+      process: { spawn: ({ argv }: { argv: string[] }) => {
+        started.push(argv)
+        entered()
+        return { next: () => new Promise(() => {}), return: async () => { stopped++; return { done: true } } }
+      } },
+    }
+    if (phase === 'before') controller.abort()
+    const call = handler(engine, { id: 'scratch', scratch: true, ...(phase === 'project' ? { node: 'chosen' } : {}) }, { signal: controller.signal })
+    if (phase !== 'before') {
+      await waiting
+      controller.abort()
+    }
+    expect(await call).toEqual({ deny: 'nexus (failed): cancelled' })
+    expect(started.map(argv => argv[1])).toEqual(phase === 'before' ? [] : [phase])
+    expect(stopped).toBe(phase === 'before' ? 0 : 1)
+  }
 })

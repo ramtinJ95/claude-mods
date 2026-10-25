@@ -322,6 +322,15 @@ export async function boot(...[$, on, cli]: [...Body, Fake]) {
         yield { stream: 'stderr' as const, text: `${JSON.stringify({ error: failure.error, kind: 'failed', status: 500 })}\n` }
         return { value: { code: failure.exitCode, signal: null } }
       }
+      if (argv[0] === 'project' && !('project' in cli.printed)) {
+        const added = parseProjectAdd(argv.slice(2))
+        if (typeof added === 'string') throw new Error(added)
+        const { values, positionals: [id, repoUrl] } = added
+        const project = { id, repoUrl, defaultBranch: values.branch ?? 'main', defaultNode: values.node, resources: { cpus: 2, memoryGiB: 4, diskGiB: 10 }, allowedHosts: [], secrets: [], logins: [], preSetup: null }
+        cli.projects = [...cli.projects, project]
+        yield { stream: 'stdout' as const, text: JSON.stringify(project) }
+        return { value: { code: 0, signal: null } }
+      }
       if (cli.publishes && (argv[0] === 'preview' || argv[0] === 'unpreview')) {
         cli.detail = withPreview(cli.detail, Number(argv[3]), argv[0] === 'preview' ? OPENED : null)
       }

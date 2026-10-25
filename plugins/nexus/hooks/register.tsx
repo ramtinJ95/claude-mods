@@ -64,6 +64,8 @@ import {
   matchThread,
   parseCommand,
   parseAdded,
+  projectJson,
+  onlineNode,
   parseDetail,
   parseFailure,
   parseHerdrTab,
@@ -331,9 +333,10 @@ async function followWatch(
 /** One CLI command as a child `stop` kills, such as a poll of the pane: a closed pane leaves none running. Undefined once stopped. */
 async function childJson($: EngineInterface, argv: readonly string[], stop: Promise<void>): Promise<Outcome<unknown> | undefined> {
   let stdout = ''
+  const words = argv[0] === 'project' || argv[0] === 'session' ? 2 : 1
   const end = await runChild(
     $,
-    [argv[0]!, '--json', ...argv.slice(1)],
+    [...argv.slice(0, words), '--json', ...argv.slice(words)],
     text => {
       stdout += text
       return false
@@ -346,6 +349,20 @@ async function childJson($: EngineInterface, argv: readonly string[], stop: Prom
     return { ok: true, value: JSON.parse(stdout) }
   } catch {
     return failed(`nexus ${argv[0]} printed something that is not JSON`)
+  }
+}
+
+async function toolJson($: EngineInterface, args: readonly string[], signal: AbortSignal): Promise<Outcome<unknown>> {
+  if (signal.aborted) return failed('cancelled')
+  const { promise, stop } = stopper()
+  const timer = $.clock.after(RUN_MS, stop)
+  signal.addEventListener('abort', stop)
+  try {
+    const got = await childJson($, args, promise)
+    return signal.aborted ? failed('cancelled') : got ?? failed('timed out')
+  } finally {
+    timer.cancel()
+    signal.removeEventListener('abort', stop)
   }
 }
 
@@ -1602,19 +1619,28 @@ async function callTool($: EngineInterface, tool: keyof typeof TOOLS, input: Rec
 async function runTool($: EngineInterface, tool: keyof typeof TOOLS, input: Record<string, unknown>, signal: AbortSignal): Promise<ToolAnswer> {
   switch (tool) {
     case 'projects':
-      return answer(await nexus($, ['projects']))
+      return answer(parsed(await toolJson($, ['projects'], signal), json => projectJson(json, 'projects')))
     case 'project_add': {
-      const args = projectArgs(input)
-      if (input.node === undefined) {
-        const nodes = parsed(await nexus($, ['nodes']), parseNodes)
-        if (!nodes.ok) return answer(nodes)
-        const node = nodes.value.find(one => one.state === 'online')
-        if (!node) return { deny: 'No online Nexus node is available; specify node explicitly.' }
-        args.splice(2, 0, `--node=${node.name}`)
+      let args: string[]
+      try {
+        args = projectArgs(input)
+      } catch (error) {
+        return answer(failed(messageOf(error)))
       }
-      const added = await nexus($, args)
-      if (!added.ok) return { deny: added.failure.message }
-      void loadCatalog($, { projects: true })
+      if (input.node === undefined) {
+        const node = parsed(await toolJson($, ['nodes'], signal), onlineNode)
+        if (!node.ok) return answer(node)
+        if (node.value === undefined) return answer(failed('no online node is available; provide node explicitly'))
+        args.splice(2, 0, `--node=${node.value}`)
+      }
+      if (signal.aborted) return answer(failed('cancelled'))
+      const got = await toolJson($, args, signal)
+      if (!got.ok) {
+        const failure = got.failure.kind === 'invalid' ? newer(got.failure, 'project add', 'adding a project', '0.7.0') : got.failure
+        return answer({ ok: false, failure: failure === got.failure ? failure : { ...failure, message: `${failure.message}. Update the nexus CLI.` } })
+      }
+      const added = parsed(got, json => projectJson(json, 'project add'))
+      if (added.ok) void loadCatalog($, { projects: true })
       return answer(added)
     }
     case 'threads': {

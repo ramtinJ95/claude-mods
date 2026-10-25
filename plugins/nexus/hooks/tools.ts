@@ -120,7 +120,8 @@ export function projectArgs(input: Record<string, unknown>): string[] {
     } else if (typeof value !== spec.type || (typeof value === 'number' && !Number.isFinite(value))) throw new Error(`Invalid ${key}`)
   }
   if (typeof input.id !== 'string' || !input.id.trim()) throw new Error('id is required')
-  if ((typeof input.repo_url === 'string' && !!input.repo_url.trim()) === (input.scratch === true) || (input.scratch === true && input.repo_url !== undefined)) throw new Error('Provide exactly one of repo_url or scratch: true')
+  if ((input.repo_url !== undefined) === (input.scratch === true)) throw new Error('provide exactly one of repo_url or scratch: true')
+  if (typeof input.repo_url === 'string' && !input.repo_url.trim()) throw new Error('repo_url is required')
   const args = ['project', 'add', `--branch=${input.branch ?? 'main'}`]
   if (input.node !== undefined) args.push(`--node=${input.node}`)
   for (const [key, flag] of [['cpus', 'cpus'], ['memory_gib', 'memory'], ['disk_gib', 'disk']] as const) {
@@ -130,7 +131,7 @@ export function projectArgs(input: Record<string, unknown>): string[] {
   for (const login of (input.logins ?? []) as string[]) args.push(`--login=${login}`)
   if (input.github === true) args.push('--secret=GH_TOKEN:api.github.com,github.com')
   if (input.scratch === true) args.push('--scratch')
-  args.push('--', input.id)
-  if (input.repo_url !== undefined) args.push(input.repo_url as string)
+  args.push('--', input.id.trim())
+  if (input.repo_url !== undefined) args.push((input.repo_url as string).trim())
   return args
 }
