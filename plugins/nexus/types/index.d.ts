@@ -236,8 +236,54 @@ export type NexusProjectDraft = {
 
 export type NexusView = 'list' | 'thread' | 'start' | 'project' | 'session'
 
-/** The thread view's tabs, in the order h and l walk them. */
-export type NexusTab = 'conversation' | 'details' | 'ports' | 'sessions'
+/** The thread view's tabs, in the order h and l walk them: the dashboard's inspector, after the conversation. */
+export type NexusTab = 'conversation' | 'changes' | 'previews' | 'pylon'
+
+/** What a checkout read compares with: `start`, what the pylon booted at, or `head`. Null `commit` is the empty tree. */
+export type NexusBase = { kind: 'start' | 'head'; commit: string | null }
+
+export type NexusFileStatus = 'added' | 'modified' | 'deleted' | 'renamed' | 'copied' | 'typechange'
+
+/** One file of `changes --json`. A binary file's counts are null. */
+export type NexusChangedFile = { path: string; oldPath: string | null; status: NexusFileStatus; additions: number | null; deletions: number | null }
+
+/** `changes --json`: the files that differ from the base, at most 3000, `truncated` when there were more. */
+export type NexusChanges = { base: NexusBase; files: NexusChangedFile[]; truncated: boolean }
+
+/**
+ * The Changes tab's reads of the thread shown. Each read reaches into the pylon and wakes it, so they happen only on
+ * the rules `checkoutTrigger` keeps, one at a time.
+ */
+export type NexusCheckout = {
+  thread: string
+  /** The last reply, kept on screen while a read runs again. */
+  changes: NexusChanges | null
+  /** Why the last read failed; `isNoBase` when the pylon booted before Nexus recorded its base. */
+  failure: { message: string; isNoBase: boolean } | null
+  isReading: boolean
+  /** The person asked to wake a paused pylon to read it: the read runs, and runs again once the pylon runs. */
+  isWanted: boolean
+}
+
+/** One drawn row of a diff: a hunk's separator with its heading, or a line with the new file's number (none when removed). */
+export type NexusDiffRow = { kind: 'hunk'; text: string } | { kind: 'add' | 'del' | 'ctx'; line: number | null; text: string }
+
+/** The diff open in the Changes tab, as `diff --json` printed it, parsed into rows. */
+export type NexusDiffShown = {
+  thread: string
+  file: NexusChangedFile
+  /** Whether it was read against HEAD. */
+  isUncommitted: boolean
+  /** Null until a read answers. */
+  rows: NexusDiffRow[] | null
+  /** What git says beyond the lines: renames, modes. */
+  meta: string[]
+  isBinary: boolean
+  /** The rows stop short: the CLI's `truncated`, or `DIFF_ROWS`. */
+  isCut: boolean
+  failure: string | null
+  isReading: boolean
+}
 
 /**
  * Where typed letters go: to the hotkeys (`normal`), the composer (`insert`) or the list's filter (`filter`). The
@@ -296,13 +342,15 @@ export type NexusPane = {
    */
   isRetaken: boolean
   scroll: NexusScroll
-  /** The details' first row shown. */
-  detailsTop: number
-  /** The Ports tab's row under the cursor: `preview-<service>` or `port-<port>`. */
+  /** The Changes tab's row under the cursor: `dir-<path>` or `file-<path>`. */
+  changesCursor: string | null
+  /** The diff open in the Changes tab, in place of the tree, and its first row shown; null for the tree. */
+  diff: { path: string; top: number } | null
+  /** The Previews tab's row under the cursor: `preview-<service>` or `port-<port>`. */
   portCursor: string | null
-  /** The Sessions tab's row under the cursor: `session-<id>`. */
-  sessionCursor: string | null
-  /** The folds, tool rows and closed-thread groups the person opened or closed, by key; the rest follow the defaults. */
+  /** The Pylon tab's stop under the cursor: `pylon-details`, `session-<id>` or `attach-mac`. */
+  pylonCursor: string | null
+  /** The folds, tool rows, closed-thread groups and Changes folders the person opened or closed, by key; the rest follow the defaults. */
   toggled: Record<string, boolean>
   filter: string
   /** The composer's text as the person typed it, for the rows it takes. */
@@ -348,6 +396,12 @@ declare module 'claude-code' {
       stripCursor: string | null
       /** The run clock, ticked each second while a shown run works. */
       now: number
+      /** The Changes tab's reads of the thread shown, null before the first. */
+      checkout: NexusCheckout | null
+      /** The diff the Changes tab shows, null before one is opened. */
+      diff: NexusDiffShown | null
+      /** Whether Changes shows only what is uncommitted (since HEAD) rather than all since the pylon booted; kept in `$.store`. */
+      uncommitted: boolean
     }
   }
 }

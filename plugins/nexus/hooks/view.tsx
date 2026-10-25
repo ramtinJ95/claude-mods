@@ -1,6 +1,6 @@
 // How the pane looks: a dock with a title bar, the thread list grouped by project,
 // one thread under four tabs (its conversation drawn as a Claude Code transcript
-// draws its own, its details, its ports, its pylon's sessions), the Actions menu,
+// draws its own, its changes, its previews, its pylon and sessions), the Actions menu,
 // the key help and the forms. Each function takes the surface's elements, what the atoms hold and
 // the handlers the hooks module made, and holds no state of its own. Every colour
 // is a theme key, so the pane follows the person's theme.
@@ -21,6 +21,9 @@ import type {
 import type {
   NexusActual,
   NexusCatalog,
+  NexusChangedFile,
+  NexusCheckout,
+  NexusDiffShown,
   NexusDesired,
   NexusDetail,
   NexusList,
@@ -42,7 +45,14 @@ import { COMPOSE, type Command, type Effect, FILTER, HELP, KEYMAP, type MenuActi
 import {
   ACTUAL_BADGE,
   type Block,
+  type CheckoutFacts,
   DESIRED_TONE,
+  STATUS_LETTER,
+  type TreeRow,
+  canReadCheckout,
+  changeTree,
+  changesSummary,
+  checkoutFacts,
   FOLD_AT,
   HARNESS_LABEL,
   HARNESSES,
@@ -122,6 +132,11 @@ export type Scene = {
   inHerdr: boolean
   /** The CLI the `cli` option names, which the attach command shown runs. */
   cli: string
+  /** The Changes tab's reads of the thread shown, and the diff it shows. */
+  checkout: NexusCheckout | null
+  diff: NexusDiffShown | null
+  /** Changes shows only what is uncommitted, since HEAD. */
+  uncommitted: boolean
 }
 
 export type PaneActions = {
@@ -233,7 +248,7 @@ function SectionRule({ Box, Text }: Draw, scene: Scene, title: string, count: st
       <Text bold color="claude">
         {title.toUpperCase()}
       </Text>
-      <Text color="subtle">{`${count ? ` ${count}` : ''} ${'─'.repeat(Math.max(0, scene.width - title.length - count.length - 2))}`}</Text>
+      <Text color="subtle">{`${count ? ` ${count}` : ''} ${'─'.repeat(Math.max(0, scene.width - title.length - (count ? count.length + 1 : 0) - 1))}`}</Text>
     </Box>
   )
 }
@@ -317,9 +332,11 @@ function inlineText(node: unknown): string {
   if (typeof node === 'string' || typeof node === 'number') return String(node)
   if (Array.isArray(node)) return node.map(inlineText).join('')
   if (!isElement(node)) return ''
+  // The engine gives a Button with children a `label` of their text too, so the label counts only without them.
+  const own = inlineText(node.children)
   const label = typeof node.props?.label === 'string' ? node.props.label : ''
   const hotkey = typeof node.props?.hotkey === 'string' && node.props.plain ? `${node.props.hotkey}: ` : ''
-  return `${hotkey}${label}${inlineText(node.children)}`
+  return `${hotkey}${own || label}`
 }
 
 /** Rows `text` takes at `width` cells, wrapped, each line at least one. */
@@ -483,6 +500,19 @@ function TitleOfList(draw: Draw, scene: Scene) {
   )
 }
 
+/** A project's row in the list, as the dashboard's sidebar heads it: `▾ web  main`, the default branch dim. */
+function ProjectHeader({ Box, Text }: Draw, project: string, branch: string | undefined) {
+  return (
+    <Box key={`project-${project}`} marginTop={1}>
+      <Text wrap="truncate-end">
+        <Text color="subtle">{'▾ '}</Text>
+        <Text bold>{project}</Text>
+        {branch ? <Text color="subtle">{`  ${branch}`}</Text> : ''}
+      </Text>
+    </Box>
+  )
+}
+
 export function ListView(draw: Draw, scene: Scene, actions: PaneActions) {
   const { Box, Text, Button, Input } = draw
   const { list, pane } = scene
@@ -501,11 +531,14 @@ export function ListView(draw: Draw, scene: Scene, actions: PaneActions) {
     drawn.push(node)
     y += height
   }
+  // The dashboard's sidebar: a dot by state, the title, the state's word while there is room, how long ago, dim.
   const row = (thread: NexusThreadRow) => {
     const [label, tone] = threadState(thread, thread.pylon.actualState)
     const age = thread.agentTurnRunning ? 'now' : (span(now - thread.lastActivityAt) ?? 'now')
-    const pill = label === 'agent working' ? 'working' : label
-    const room = Math.max(8, scene.width - 4 - (pill.length + 2) - 7)
+    const word = label === 'agent working' ? 'working' : label
+    const hasWord = scene.width >= 44
+    // The pointer, the dot and a space, then the title, the word and the age, padded to "22 min", two cells apart.
+    const room = Math.max(8, scene.width - 12 - (hasWord ? cells(word) + 2 : 0))
     const title = clip(thread.title, room)
     const isCursor = cursor === thread.id
     const wants = PHASE[thread.pylon.actualState] !== thread.desired ? `wants ${thread.desired} · ` : ''
@@ -516,8 +549,8 @@ export function ListView(draw: Draw, scene: Scene, actions: PaneActions) {
           {Dot(draw, tone)}
           <Text bold={isCursor} color={isCursor ? 'suggestion' : 'text'}>{` ${title}`}</Text>
           {' '.repeat(Math.max(1, room - cells(title)))}
-          {Pill(draw, pill, tone)}
-          <Text color="subtle">{` ${age.padStart(5)}`}</Text>
+          {hasWord ? <Text color={LOOK[tone]}>{`  ${word}`}</Text> : ''}
+          <Text color="subtle">{`  ${age.padStart(6)}`}</Text>
         </Button>
         {isCursor && (
           <Text color="subtle" wrap="truncate-end">{`    ${wants}${thread.pylon.node} · you ${span(now - thread.lastHumanActivityAt) ?? 'now'} · agent ${thread.agentTurnRunning ? 'working' : thread.lastAgentActivityAt === 0 ? 'never' : (span(now - thread.lastAgentActivityAt) ?? 'now')} · ${thread.id}`}</Text>
@@ -527,7 +560,7 @@ export function ListView(draw: Draw, scene: Scene, actions: PaneActions) {
     )
   }
   for (const group of groups) {
-    place(SectionRule(draw, scene, group.project, String(group.open.length), `project-${group.project}`))
+    place(ProjectHeader(draw, group.project, scene.catalog.projects?.find(project => project.id === group.project)?.defaultBranch))
     group.open.forEach(row)
     if (group.closed.length > 0) {
       const key = closedKey(group.project)
@@ -610,12 +643,12 @@ function threadOf(scene: Scene): { id: string; thread: NexusThread | undefined; 
   return { id, thread: detail?.thread ?? scene.list.threads?.find(one => one.id === id), detail }
 }
 
-const TAB_LABEL: Record<NexusTab, string> = { conversation: 'Conversation', details: 'Details', ports: 'Ports', sessions: 'Sessions' }
+const TAB_LABEL: Record<NexusTab, string> = { conversation: 'Conversation', changes: 'Changes', previews: 'Previews', pylon: 'Pylon' }
 
 /** What the body laid out for the keys, filled in once it is drawn: Enter on the active tab acts on it as o does. */
 type Holder = { nav: Nav }
 
-/** The rows the Ports and Sessions tabs list, which their labels count. */
+/** What the Changes and Previews labels count: the files of the last read, and the previews. */
 type Counts = Partial<Record<NexusTab, number>>
 
 function Header(draw: Draw, scene: Scene, actions: PaneActions, counts: Counts, holder: Holder) {
@@ -630,18 +663,13 @@ function Header(draw: Draw, scene: Scene, actions: PaneActions, counts: Counts, 
   const known = pylon ? threadState(facts, pylon) : null
   const node = detail?.pylon.node ?? row?.pylon.node
   const run = watch && state?.run === 'working' ? runOf(watch.rows) : null
-  const pill = known
-    ? known[0] === 'agent working'
-      ? `working${run?.since ? ` ${clock(scene.now - run.since)}` : ''}`
-      : known[0]
-    : watch?.ended
-      ? 'not watching'
-      : watch?.outage
-        ? 'not connected'
-        : 'connecting'
+  // The dashboard's header: `shop / Validate postcodes ● running`, then the facts the pane had, the run clock first.
+  const word = known ? (known[0] === 'agent working' ? 'working' : known[0]) : watch?.ended ? 'not watching' : watch?.outage ? 'not connected' : 'connecting'
+  const tone = known?.[1] ?? 'muted'
+  const clockText = known?.[0] === 'agent working' && run?.since ? clock(scene.now - run.since) : null
   const tab = (key: NexusTab) => {
-    const count = counts[key] ?? 0
-    const label = `${TAB_LABEL[key]}${count > 0 ? ` ${count}` : ''}`
+    const count = counts[key]
+    const label = `${TAB_LABEL[key]}${count === undefined ? '' : ` ${count}`}`
     const isOn = scene.pane.tab === key && !scene.pane.overlay
     return (
       <Button
@@ -669,18 +697,20 @@ function Header(draw: Draw, scene: Scene, actions: PaneActions, counts: Counts, 
           <Text color="subtle">{'‹ '}</Text>
           {thread && <Text color="subtle">{`${thread.project} / `}</Text>}
           <Text bold>{thread?.title ?? id}</Text>
+          {'  '}
+          {Dot(draw, tone)}
+          <Text color={LOOK[tone]}>{` ${word}`}</Text>
         </Text>,
         id,
       )}
-      <Text wrap="truncate-end">
-        {Pill(draw, pill, known?.[1] ?? 'muted')}
-        <Text color="subtle">{`  ${[node, watch?.model, thread ? `started ${since(thread.createdAt, scene.now)}` : null].filter(Boolean).join('  ·  ')}`}</Text>
+      <Text color="subtle" wrap="truncate-end">
+        {[clockText, node, watch?.model, thread ? `started ${since(thread.createdAt, scene.now)}` : null].filter(Boolean).join('  ·  ')}
       </Text>
       <Box flexDirection="row" columnGap={3}>
         {tab('conversation')}
-        {tab('details')}
-        {tab('ports')}
-        {tab('sessions')}
+        {tab('changes')}
+        {tab('previews')}
+        {tab('pylon')}
         <Box flexGrow={1} />
         <Text color={scene.pane.overlay?.kind === 'menu' ? 'claude' : 'subtle'}>m actions</Text>
       </Box>
@@ -737,9 +767,9 @@ export function ThreadView(draw: Draw, scene: Scene, actions: PaneActions) {
   const canInsert = status !== 'deleted' && status !== 'archived' && !failed && (!detail || detail.hasConversation)
   const { pane } = scene
   const ports = detail ? portsOf(scene, detail) : null
-  const sessions = detail ? sessionsOf(scene, detail) : null
   const holder: Holder = { nav: { context: 'none' } }
-  const counts = { ports: ports ? ports.previews.length + (ports.unpublished?.length ?? 0) : 0, sessions: sessions?.length ?? 0 }
+  const files = scene.checkout?.thread === id ? scene.checkout.changes?.files.length : undefined
+  const counts: Counts = { changes: files, previews: ports?.previews.length }
   const header = Header(draw, scene, actions, counts, holder)
   const runLine = RunLine(draw, scene)
   const composer = Composer(draw, scene, actions, { failed, refused }, canInsert)
@@ -755,9 +785,11 @@ export function ThreadView(draw: Draw, scene: Scene, actions: PaneActions) {
         ? [['⏎', state && state.run !== 'idle' ? 'queue' : 'send'], ['esc', 'normal mode'], ['empty ⏎', 'normal mode']]
         : pane.tab === 'conversation'
           ? [['j/k', 'block'], ['d/u', 'page'], ...(scrolled ? [['ge', 'follow'] as [string, string]] : []), ['o', 'open'], ['h/l', 'tabs'], ...(canInsert ? [['i', 'write'] as [string, string]] : []), ['m', 'actions'], ['s', 'keys']]
-          : pane.tab === 'details'
-            ? [['j/k', 'scroll'], ['y', 'copy attach'], ['h/l', 'tabs'], ['m', 'actions'], ['s', 'keys']]
-            : pane.tab === 'ports'
+          : pane.tab === 'changes'
+            ? pane.diff
+              ? [['j/k', 'scroll'], ['d/u', 'page'], ['h', 'files'], ['c', scene.uncommitted ? 'all changes' : 'uncommitted'], ['r', 'read again'], ['y', 'copy path'], ['s', 'keys']]
+              : [['j/k', 'move'], ['⏎', 'open · fold'], ['c', scene.uncommitted ? 'all changes' : 'uncommitted'], ['r', 'read again'], ['y', 'copy path'], ['h/l', 'tabs'], ['s', 'keys']]
+            : pane.tab === 'previews'
               ? [['j/k', 'move'], ['⏎', 'publish · copy'], ['x', 'unpublish'], ['y', 'copy URL'], ['h/l', 'tabs'], ['s', 'keys']]
               : [['j/k', 'move'], ...(scene.inHerdr ? ([['⏎', 'attach'], ['y', 'copy attach']] as [string, string][]) : [['⏎/y', 'copy attach'] as [string, string]]), ['x', 'close'], ['n', 'open'], ['h/l', 'tabs'], ['s', 'keys']]
   // A composer the thread's change took away leaves the letters to the keys.
@@ -772,11 +804,13 @@ export function ThreadView(draw: Draw, scene: Scene, actions: PaneActions) {
           ? ProjectsBody(draw, scene, actions, area)
           : pane.tab === 'conversation'
           ? Conversation(draw, scene, actions, area, DRAWN_LIMIT - drawnChars([header, footer]), canInsert)
-          : pane.tab === 'details'
-            ? DetailsBody(draw, scene, area, canInsert)
-            : pane.tab === 'ports'
+          : pane.tab === 'changes'
+            ? pane.diff
+              ? DiffBody(draw, scene, area, canInsert, pane.diff)
+              : ChangesBody(draw, scene, actions, area, canInsert)
+            : pane.tab === 'previews'
               ? PortsBody(draw, scene, actions, area, canInsert)
-              : SessionsBody(draw, scene, actions, area, canInsert)
+              : PylonBody(draw, scene, actions, area, canInsert)
   holder.nav = body.nav
   return Frame(
     draw,
@@ -1375,7 +1409,7 @@ function Composer(draw: Draw, scene: Scene, actions: PaneActions, pylon: { faile
 const UNREACHABLE_HINT = "A server bound only to ::1 can't be previewed, so bind it to 0.0.0.0 or 127.0.0.1."
 
 /**
- * The previews and the ports with none, as Ports lists them with what the person confirmed since: a port just
+ * The previews and the ports with none, as Previews lists them with what the person confirmed since: a port just
  * unpublished is under Ports, one just published under Previews. `closable` holds the ports whose preview x can
  * unpublish: a linked port's, which the CLI closes, of a thread that can run, with no operation under way.
  */
@@ -1409,54 +1443,262 @@ function whyNotClosable(preview: NexusPreview, change: NexusPortChange, canRun: 
   return change.pending === 'open' ? 'Its publish is still under way.' : 'It is closing already.'
 }
 
-/** The pylon, the thread's outputs and the attach command from a shell in it: read-only, scrolled by the keys. */
-function DetailsBody(draw: Draw, scene: Scene, area: number, canInsert: boolean): Body {
-  const { Box, Text } = draw
-  const { detail } = threadOf(scene)
-  if (!detail) return { nav: { context: 'details', total: 0, area, canInsert, attach: null }, node: <Text color="subtle">{scene.shown?.failure ? '' : 'Loading the details…'}</Text> }
-  const { thread, pylon } = detail
-  const node = scene.catalog.nodes?.find(one => one.name === pylon.node)
-  const offline = node?.state === 'offline'
-  const kv = (label: string, value: RenderChildren, key: string) => (
-    <Box key={key} flexDirection="row">
-      <Text color="subtle">{label.padEnd(11)}</Text>
-      <Box flexShrink={1}>{typeof value === 'string' ? <Text>{value}</Text> : value}</Box>
-    </Box>
-  )
-  const state = (label: string, tone: Tone) => (
+/** A file's status as the dashboard's badge, one letter in its colour. */
+const BADGE_COLOR: Record<NexusChangedFile['status'], string> = { added: 'success', modified: 'suggestion', deleted: 'error', renamed: 'suggestion', copied: 'suggestion', typechange: 'warning' }
+
+const Badge = ({ Text }: Draw, file: NexusChangedFile) => <Text color={BADGE_COLOR[file.status]} bold>{STATUS_LETTER[file.status]}</Text>
+
+/** `+12 −3` in green and red, or a dim `binary` for a file whose lines git does not count. */
+const countsText = (additions: number | null, deletions: number | null) => (additions === null ? 'binary' : `+${additions} −${deletions ?? 0}`)
+function Counts({ Text }: Draw, additions: number | null, deletions: number | null) {
+  if (additions === null) return <Text color="subtle">binary</Text>
+  return (
     <Text>
-      {Dot(draw, tone)} {label}
+      <Text color="success">{`+${additions}`}</Text> <Text color="error">{`−${deletions ?? 0}`}</Text>
     </Text>
   )
-  // A preview output stays only for a preview the control plane no longer lists, as the dashboard's outputs do.
-  const outputs = detail.outputs.filter(output => output.kind !== 'preview' || !detail.previews.some(preview => preview.service === output.ref))
-  const observed = pylon.observedAt === null ? 'never' : `${since(Date.parse(pylon.observedAt), scene.now)}${offline ? ' (stale)' : ''}`
-  const content = (
-    <Box key="details" flexDirection="column" flexShrink={0} marginTop={-scene.pane.detailsTop}>
-      {SectionRule(draw, scene, 'Pylon', '', 'pylon')}
-      {kv('Desired', state(detail.desired, DESIRED_TONE[detail.desired]), 'desired')}
-      {kv('Observed', state(...ACTUAL_BADGE[pylon.actualState]), 'observed')}
-      {kv('Node', `${pylon.node}${offline ? ' (offline)' : ''}`, 'node')}
-      {kv('Last seen', observed, 'seen')}
-      {kv('Human', since(thread.lastHumanActivityAt, scene.now), 'human')}
-      {kv('Agent', thread.agentTurnRunning ? 'turn running' : since(thread.lastAgentActivityAt, scene.now), 'agent')}
-      <Text color="subtle">{pylon.id}</Text>
-      {pylon.failed && <Text color="error">{`The planner gave up: ${pylon.failed}`}</Text>}
-      {SectionRule(draw, scene, 'Outputs', String(outputs.length), 'outputs')}
-      {outputs.length === 0 && <Text color="subtle">No outputs yet.</Text>}
-      {outputs.map((output, index) => (
-        <Box key={`output-${index}`} flexDirection="row" columnGap={1}>
-          <Text color="subtle">{output.kind.padEnd(8)}</Text>
-          <Text>{output.ref}</Text>
-        </Box>
-      ))}
-      {SectionRule(draw, scene, 'Attach', '', 'attach')}
-      <Text color="subtle">From a shell in the pylon; y copies it:</Text>
-      <Text>{`  ${detail.attach}`}</Text>
-    </Box>
-  )
-  return { nav: { context: 'details', total: rowsOf(content, scene.width) + scene.pane.detailsTop, area, canInsert, attach: detail.attach }, node: content }
 }
+
+/** What the Changes tab reads of the thread shown: its details' facts and its reads, or null before the details. */
+function checkoutOf(scene: Scene) {
+  const { id, thread, detail } = threadOf(scene)
+  const status = detail?.thread.status ?? thread?.status
+  const facts: CheckoutFacts | null = detail ? checkoutFacts(detail) : null
+  return { id, status, facts, checkout: scene.checkout?.thread === id ? scene.checkout : null }
+}
+
+/** Why an archived or deleted thread's checkout cannot be read; null for an open thread. */
+const closedCheckout = (status: NexusThread['status'] | undefined) =>
+  status === 'deleted'
+    ? 'The thread is deleted, so its checkout is gone.'
+    : status === 'archived'
+      ? "An archived thread's pylon stays paused, so its changes can't be read. Unarchive the thread to read them."
+      : null
+
+/**
+ * The files the agent changed, as the dashboard's Changes panel shows them: a summary of what they are compared with,
+ * then a tree, folders first, a folder that holds one folder merged into it. Enter folds a folder and opens a file's
+ * diff. A read wakes a paused pylon, so a pylon that is not running offers to wake it instead of reading.
+ */
+function ChangesBody(draw: Draw, scene: Scene, actions: PaneActions, area: number, canInsert: boolean): Body {
+  const { Box, Text, Button } = draw
+  const { id, status, facts, checkout } = checkoutOf(scene)
+  const items: NavItem[] = []
+  const drawn: { node: RenderChildren; y: number; height: number }[] = []
+  let y = 0
+  const place = (node: RenderChildren, item?: Omit<NavItem, 'top' | 'height'>) => {
+    const height = rowsOf(node, scene.width)
+    if (item) items.push({ ...item, top: y, height })
+    drawn.push({ node, y, height })
+    y += height
+  }
+  const note = (key: string, text: string, color = 'subtle') => place(<Text key={key} color={color}>{text}</Text>)
+  const wake: Effect = { kind: 'read-changes', thread: id }
+  const isRunning = facts !== null && canReadCheckout(facts)
+  const pylon = facts ? ACTUAL_BADGE[facts.pylon][0] : ''
+  const closed = closedCheckout(status)
+  // The only stop of a note: the cursor is on it, and Enter there wakes the pylon.
+  const wakeButton = () => {
+    place(
+      <Button key="changes-wake" plain autoFocus onPress={() => actions.effect(wake)}>
+        {Pointer(draw, true)}
+        <Text color="suggestion">⏎ or r wakes it and reads</Text>
+      </Button>,
+      { key: 'changes-wake', enter: wake },
+    )
+  }
+  const changes = checkout?.changes ?? null
+  if (closed) note('changes-closed', closed)
+  else if (!facts) note('changes-loading', scene.shown?.failure ? '' : "Loading the thread's details…")
+  else if (changes) {
+    const summary = changesSummary(changes)
+    place(
+      <Text key="changes-summary">
+        {`${summary.counts} · `}
+        {Counts(draw, summary.added, summary.deleted)}
+        <Text color="subtle">{`  ${summary.since}`}</Text>
+      </Text>,
+    )
+    if (checkout?.isReading) note('changes-reading', isRunning ? 'Reading the changes…' : 'Waking the pylon…')
+    else if (!isRunning) note('changes-paused', `The pylon is ${pylon}. r wakes it and reads the changes again.`)
+    if (changes.files.length === 0) note('changes-none', changes.base.kind === 'head' ? 'No uncommitted changes.' : 'Nothing has changed since the pylon booted.')
+    const rows = changeTree(changes.files, scene.pane.toggled)
+    const keys = rows.map(row => row.key)
+    const cursor = keys.find(key => key === scene.pane.changesCursor) ?? keys[0] ?? null
+    // A tree row takes one row, its name clipped to the width, so only the rows on screen are built: 3000 files drawn
+    // whole would pass the characters the engine draws of one tree.
+    const first = y
+    rows.forEach((row, index) => items.push({ ...treeStop(row, id), top: first + index, height: 1 }))
+    y += rows.length
+    if (changes.truncated) note('changes-truncated', `Showing the first ${changes.files.length} files.`)
+    const current = items.find(item => item.key === cursor)
+    // On the last row, the note after the tree scrolls into view with it.
+    const top = keepInView(0, current && current === items.at(-1) ? { top: current.top, height: y - current.top } : current, area)
+    const isShown = (at: number, height: number) => at + height > top && at < top + area
+    const shown = [
+      ...drawn.filter(one => one.y < first && isShown(one.y, one.height)),
+      ...rows.flatMap((row, index) => (isShown(first + index, 1) ? [{ node: TreeLine(draw, scene, actions, row, id, cursor === row.key), y: first + index, height: 1 }] : [])),
+      ...drawn.filter(one => one.y >= first && isShown(one.y, one.height)),
+    ]
+    return {
+      nav: { context: 'changes', items, area, canInsert, cursor, thread: id },
+      node: (
+        <Box key="changes-tree" flexDirection="column" flexShrink={0} marginTop={-(top - (shown[0]?.y ?? top))}>
+          {shown.map(one => one.node)}
+        </Box>
+      ),
+    }
+  } else if (checkout?.failure && !checkout.isReading) {
+    note('changes-failure', sentence(checkout.failure.message), 'error')
+    if (checkout.failure.isNoBase) note('changes-no-base', 'c shows the uncommitted changes instead, since the last commit.')
+    if (isRunning) note('changes-again', 'r reads them again.')
+    else wakeButton()
+  } else if (checkout?.isReading) note('changes-reading', isRunning ? 'Reading the changes…' : 'Waking the pylon. Its changes show once it runs.')
+  else if (!isRunning) {
+    if (checkout?.isWanted) note('changes-waking', 'Waking the pylon. Its changes show once it runs.')
+    else {
+      note('changes-paused', `The pylon is ${pylon}. Reading its changes wakes it.`)
+      wakeButton()
+    }
+  } else note('changes-reading', 'Reading the changes…')
+  return { nav: { context: 'changes', items, area, canInsert, cursor: items[0]?.key ?? null, thread: id }, node: <Box key="changes-note" flexDirection="column" flexShrink={0}>{drawn.map(one => one.node)}</Box> }
+}
+
+/** What Enter and y do on a row of the tree: fold a folder or copy its path, open a file's diff or copy its path. */
+function treeStop(row: TreeRow, thread: string): Omit<NavItem, 'top' | 'height'> {
+  if (row.kind === 'dir') return { key: row.key, enter: { kind: 'toggle', key: row.key, isOpen: row.isOpen }, y: { kind: 'copy', text: row.path } }
+  return { key: row.key, enter: { kind: 'open-diff', thread, file: row.file }, y: { kind: 'copy', text: row.file.path } }
+}
+
+/** One row of the tree: a folder, `▾ src/checkout`, or a file, its badge, name and counts right-aligned. */
+function TreeLine(draw: Draw, scene: Scene, actions: PaneActions, row: TreeRow, thread: string, isCursor: boolean): RenderChildren {
+  const { Text, Button } = draw
+  const indent = '  '.repeat(row.depth)
+  const name = (text: string, room: number) => (
+    <Text bold={isCursor} color={isCursor ? 'suggestion' : 'text'}>
+      {clip(text, Math.max(4, room))}
+    </Text>
+  )
+  if (row.kind === 'dir') {
+    return (
+      <Button key={row.key} plain autoFocus={isCursor ? true : undefined} onPress={() => actions.toggle(row.key, row.isOpen)}>
+        {Pointer(draw, isCursor)}
+        <Text color="subtle">{`${indent}${row.isOpen ? '▾' : '▸'} `}</Text>
+        {name(row.name, scene.width - 4 - cells(indent))}
+      </Button>
+    )
+  }
+  const { file } = row
+  const counts = countsText(file.additions, file.deletions)
+  // The pointer, the indent, the badge and a space; then the name, the old path while there is room, and the counts.
+  const room = scene.width - 2 - cells(indent) - 2 - cells(counts) - 2
+  const shownName = clip(row.name, Math.max(4, room))
+  const old = file.oldPath ? `  ← ${file.oldPath}` : ''
+  const oldShown = old && room - cells(shownName) >= Math.min(cells(old), 12) ? clip(old, room - cells(shownName)) : ''
+  return (
+    <Button key={row.key} plain autoFocus={isCursor ? true : undefined} onPress={() => actions.effect({ kind: 'open-diff', thread, file })}>
+      {Pointer(draw, isCursor)}
+      {indent}
+      {Badge(draw, file)} {name(shownName, room)}
+      <Text color="subtle">{oldShown}</Text>
+      {' '.repeat(Math.max(2, room + 2 - cells(shownName) - cells(oldShown)))}
+      {Counts(draw, file.additions, file.deletions)}
+    </Button>
+  )
+}
+
+/** Tabs as the diff shows them: four columns, so a cut line keeps its indentation. */
+const untab = (text: string) => text.replace(/\t/g, '    ')
+
+/**
+ * A changed file's diff in place of the tree: its badge, path and counts, what git says beyond the lines, then each
+ * line with the new file's number, its sign and the code, added and removed lines on the colours of Claude Code's own
+ * diffs. Only the rows the window shows are drawn, and long lines are cut. On a paused pylon it offers to wake it.
+ */
+function DiffBody(draw: Draw, scene: Scene, area: number, canInsert: boolean, open: { path: string; top: number }): Body {
+  const { Box, Text } = draw
+  const { id, status, facts, checkout } = checkoutOf(scene)
+  const shown = scene.diff?.thread === id && scene.diff.file.path === open.path ? scene.diff : null
+  const file = shown?.file ?? checkout?.changes?.files.find(one => one.path === open.path) ?? null
+  const isUncommitted = shown?.isUncommitted ?? scene.uncommitted
+  const head: RenderChildren[] = []
+  const counts = file ? countsText(file.additions, file.deletions) : ''
+  const against = isUncommitted ? 'vs last commit' : 'vs boot'
+  const room = scene.width - 2 - cells(against) - 2 - cells(counts) - 2
+  const path = clip(open.path, Math.max(8, room))
+  head.push(
+    <Text key="diff-head" wrap="truncate-end">
+      {file ? Badge(draw, file) : ' '} <Text bold>{path}</Text>
+      <Text color="subtle">{`  ${against}`}</Text>
+      {' '.repeat(Math.max(2, room + 2 - cells(path)))}
+      {file ? Counts(draw, file.additions, file.deletions) : ''}
+    </Text>,
+  )
+  for (const [index, line] of (shown?.meta ?? []).entries()) head.push(<Text key={`diff-meta-${index}`} color="subtle" wrap="truncate-end">{line}</Text>)
+  const isRunning = facts !== null && canReadCheckout(facts)
+  const wake: Effect = { kind: 'read-changes', thread: id }
+  const say = (text: string, color = 'subtle') => head.push(<Text key={`diff-note-${head.length}`} color={color}>{text}</Text>)
+  const closed = closedCheckout(status)
+  const rows = shown?.rows ?? null
+  let canWake = false
+  if (closed && !rows) say(status === 'deleted' ? closed : "The pylon stays paused, so the diff can't be read.")
+  else if (!rows) {
+    if (shown?.failure && !shown.isReading) say(sentence(shown.failure), 'error')
+    else if (shown?.isReading) say(isRunning ? 'Reading the diff…' : 'Waking the pylon. The diff shows once it runs.')
+    else if (facts && !isRunning) {
+      if (checkout?.isWanted || checkout?.isReading) say('Waking the pylon. The diff shows once it runs.')
+      else {
+        say(`The pylon is ${ACTUAL_BADGE[facts.pylon][0]}. Reading the diff wakes it.`)
+        say('⏎ or r wakes it and reads.', 'suggestion')
+        canWake = true
+      }
+    } else say('Reading the diff…')
+  } else {
+    if (shown?.isReading) say(isRunning ? 'Reading the diff…' : 'Waking the pylon…')
+    else if (shown?.failure) say(sentence(shown.failure), 'error')
+    if (rows.length === 0) say(shown?.isBinary ? 'The file is binary, so there is no diff to show.' : (shown?.meta.length ?? 0) > 0 ? 'No lines changed.' : 'The file has no changes now.')
+  }
+  const headRows = rowsOf(head, scene.width)
+  const listed = rows ?? []
+  const tail = shown?.isCut ? 1 : 0
+  const window = Math.max(1, area - headRows)
+  const total = listed.length + tail
+  const top = clamp(open.top, 0, Math.max(0, total - window))
+  const gutter = Math.max(3, String(listed.reduce((most, row) => (row.kind !== 'hunk' && row.line !== null ? Math.max(most, row.line) : most), 0)).length)
+  const code = Math.max(4, scene.width - gutter - 3)
+  const lines: RenderChildren[] = []
+  for (let at = top; at < Math.min(total, top + window); at += 1) {
+    const row = listed[at]
+    if (!row) {
+      lines.push(<Text key="diff-cut" color="subtle">The diff is cut short here, because the whole of it is too long to show.</Text>)
+      continue
+    }
+    if (row.kind === 'hunk') {
+      lines.push(<Text key={`diff-${at}`} color="subtle" wrap="truncate-end">{`${'⋯'.padStart(gutter)}   ${clip(untab(row.text), code)}`}</Text>)
+      continue
+    }
+    const sign = row.kind === 'add' ? '+' : row.kind === 'del' ? '−' : ' '
+    const text = clip(untab(row.text), code)
+    const pad = ' '.repeat(Math.max(0, code - cells(text)))
+    lines.push(
+      <Text key={`diff-${at}`} wrap="truncate-end" backgroundColor={row.kind === 'add' ? 'diffAdded' : row.kind === 'del' ? 'diffRemoved' : undefined}>
+        <Text color="subtle">{`${row.line === null ? '' : String(row.line)}`.padStart(gutter)}</Text>
+        {` ${sign} ${text}${pad}`}
+      </Text>,
+    )
+  }
+  return {
+    nav: { context: 'diff', total, area: window, canInsert, thread: id, path: open.path, ...(canWake ? { wake } : {}) },
+    node: (
+      <Box key="diff" flexDirection="column" flexShrink={0}>
+        {head}
+        {lines}
+      </Box>
+    ),
+  }
+}
+
+const clamp = (value: number, low: number, high: number) => Math.max(low, Math.min(high, value))
 
 /**
  * The previews and the ports that listen with none, each port once, as rows the cursor moves over: Enter publishes a
@@ -1466,7 +1708,7 @@ function DetailsBody(draw: Draw, scene: Scene, area: number, canInsert: boolean)
 function PortsBody(draw: Draw, scene: Scene, actions: PaneActions, area: number, canInsert: boolean): Body {
   const { Box, Text, Button, Link } = draw
   const { detail } = threadOf(scene)
-  if (!detail) return { nav: { context: 'ports', items: [], area, canInsert, cursor: null }, node: <Text color="subtle">{scene.shown?.failure ? '' : 'Loading the ports…'}</Text> }
+  if (!detail) return { nav: { context: 'previews', items: [], area, canInsert, cursor: null }, node: <Text color="subtle">{scene.shown?.failure ? '' : 'Loading the ports…'}</Text> }
   const { pylon } = detail
   const { previews, unpublished, closable, changeOf, canRun } = portsOf(scene, detail)
   const portOf = new Map((detail.ports ?? []).flatMap(one => (one.preview ? [[one.preview.service, one.port] as const] : [])))
@@ -1532,7 +1774,7 @@ function PortsBody(draw: Draw, scene: Scene, actions: PaneActions, area: number,
   const current = items.find(item => item.key === cursor)
   const top = keepInView(0, current, area)
   return {
-    nav: { context: 'ports', items, area, canInsert, cursor },
+    nav: { context: 'previews', items, area, canInsert, cursor },
     node: (
       <Box key="ports-list" flexDirection="column" flexShrink={0} marginTop={-top}>
         {drawn}
@@ -1583,26 +1825,37 @@ function PortRow(draw: Draw, actions: PaneActions, thread: string, port: NexusPo
   ]
 }
 
-/** The sessions as the Sessions tab lists them: the details with what the person confirmed since they were read. */
+/** The sessions as the Pylon tab lists them: the details with what the person confirmed since they were read. */
 function sessionsOf(scene: Scene, detail: NexusDetail): ShownSession[] {
   return shownSessions(detail.sessions, scene.pane.sessionChanges[detail.thread.id] ?? NO_SESSION_CHANGES, scene.now)
 }
 
+/** The stops of the pylon's details, above its sessions. */
+const PYLON_STOPS = ['pylon-state', 'pylon-outputs', 'pylon-attach']
+
 /**
- * The pylon's sessions, one row each, as the dashboard lists them: harness, title, state, pane and session ID. A paused
- * one says what brings it back, and a failed one why the last wake did not, below it. The opens under way follow, then
- * how to attach from this Mac. Enter and y give the attach command wherever the cursor is, and x closes the running or
- * failed session under it, after asking; on a paused one it says why it can't.
+ * The dashboard's Pylon panel: the pylon's wanted and observed state, its node, when it was last seen, the activity,
+ * the outputs and the attach command from a shell in it; then its sessions, as the dashboard lists them, and how to
+ * attach from this Mac. A paused session says what brings it back, and a failed one why the last wake did not, below
+ * it. The cursor stops on the details, each session and the attach: y copies the attach command that stop shows, Enter
+ * on a session or the attach attaches, and x closes the running or failed session under it, after asking; on a paused
+ * one it says why it can't.
  */
-function SessionsBody(draw: Draw, scene: Scene, actions: PaneActions, area: number, canInsert: boolean): Body {
+function PylonBody(draw: Draw, scene: Scene, actions: PaneActions, area: number, canInsert: boolean): Body {
   const { Box, Text, Button } = draw
   const { id, detail } = threadOf(scene)
-  const empty = { context: 'sessions' as const, items: [], area, canInsert, cursor: null, thread: id }
-  if (!detail) return { nav: empty, node: <Text color="subtle">{scene.shown?.failure ? '' : 'Loading the sessions…'}</Text> }
-  const changes = scene.pane.sessionChanges[detail.thread.id] ?? NO_SESSION_CHANGES
+  const empty = { context: 'pylon' as const, items: [] as NavItem[], area, canInsert, cursor: null }
+  if (!detail) return { nav: empty, node: <Text color="subtle">{scene.shown?.failure ? '' : 'Loading the details…'}</Text> }
+  const { thread, pylon } = detail
+  const changes = scene.pane.sessionChanges[thread.id] ?? NO_SESSION_CHANGES
   const sessions = sessionsOf(scene, detail)
-  const keys = sessions.map(session => `session-${session.id}`)
-  const cursor = keys.find(key => key === scene.pane.sessionCursor) ?? keys[0] ?? null
+  // The details are three stops, so details taller than the pane still scroll into view a block at a time.
+  const keys = [...PYLON_STOPS, ...sessions.map(session => `session-${session.id}`), 'attach-mac']
+  // A session closed under the cursor leaves it on the first session left, not back up on the details.
+  const wasSession = scene.pane.pylonCursor?.startsWith('session-') === true
+  const cursor = keys.find(key => key === scene.pane.pylonCursor) ?? (wasSession ? keys[PYLON_STOPS.length] : keys[0])!
+  // x off a session row points at the rows; with none, the keys say n opens one.
+  const offRow: Effect | undefined = sessions.length > 0 ? { kind: 'say', text: 'x closes the session under the cursor: j or k moves onto one.' } : undefined
   const items: NavItem[] = []
   const drawn: RenderChildren[] = []
   let y = 0
@@ -1612,12 +1865,67 @@ function SessionsBody(draw: Draw, scene: Scene, actions: PaneActions, area: numb
     drawn.push(node)
     y += height
   }
-  const attach: Effect = { kind: 'attach', thread: detail.thread.id, isCopy: false }
-  const copy: Effect = { kind: 'attach', thread: detail.thread.id, isCopy: true }
+  const node = scene.catalog.nodes?.find(one => one.name === pylon.node)
+  const offline = node?.state === 'offline'
+  const kv = (label: string, value: RenderChildren, key: string) => (
+    <Box key={key} flexDirection="row">
+      <Text color="subtle">{label.padEnd(11)}</Text>
+      <Box flexShrink={1}>{typeof value === 'string' ? <Text>{value}</Text> : value}</Box>
+    </Box>
+  )
+  const state = (label: string, tone: Tone) => (
+    <Text>
+      {Dot(draw, tone)} {label}
+    </Text>
+  )
+  // A preview output stays only for a preview the control plane no longer lists, as the dashboard's outputs do.
+  const outputs = detail.outputs.filter(output => output.kind !== 'preview' || !detail.previews.some(preview => preview.service === output.ref))
+  const observed = pylon.observedAt === null ? 'never' : `${since(Date.parse(pylon.observedAt), scene.now)}${offline ? ' (stale)' : ''}`
+  // Each stop's y copies the attach from a shell in the pylon, as the details did as one block.
+  const stop = (key: string) => ({ key, y: { kind: 'copy', text: detail.attach } as Effect, x: offRow })
+  place(
+    <Box key="pylon-state" flexDirection="column">
+      {SectionRule(draw, scene, 'Pylon', '', 'pylon')}
+      {kv('Desired', state(detail.desired, DESIRED_TONE[detail.desired]), 'desired')}
+      {kv('Observed', state(...ACTUAL_BADGE[pylon.actualState]), 'observed')}
+      {kv('Node', `${pylon.node}${offline ? ' (offline)' : ''}`, 'node')}
+      {kv('Last seen', observed, 'seen')}
+      {kv('Human', since(thread.lastHumanActivityAt, scene.now), 'human')}
+      {kv('Agent', thread.agentTurnRunning ? 'turn running' : since(thread.lastAgentActivityAt, scene.now), 'agent')}
+      <Text color="subtle">{pylon.id}</Text>
+      {pylon.failed && <Text color="error">{`The planner gave up: ${pylon.failed}`}</Text>}
+    </Box>,
+    stop('pylon-state'),
+  )
+  place(
+    <Box key="pylon-outputs" flexDirection="column">
+      {SectionRule(draw, scene, 'Outputs', String(outputs.length), 'outputs')}
+      {outputs.length === 0 && <Text color="subtle">No outputs yet.</Text>}
+      {outputs.map((output, index) => (
+        <Box key={`output-${index}`} flexDirection="row" columnGap={1}>
+          <Text color="subtle">{output.kind.padEnd(8)}</Text>
+          <Text>{output.ref}</Text>
+        </Box>
+      ))}
+    </Box>,
+    stop('pylon-outputs'),
+  )
+  place(
+    <Box key="pylon-attach" flexDirection="column">
+      {SectionRule(draw, scene, 'Attach', '', 'attach')}
+      <Text color="subtle">{PYLON_STOPS.includes(cursor) ? 'From a shell in the pylon; y copies it:' : 'From a shell in the pylon:'}</Text>
+      <Text>{`  ${detail.attach}`}</Text>
+    </Box>,
+    stop('pylon-attach'),
+  )
+  const attach: Effect = { kind: 'attach', thread: thread.id, isCopy: false }
+  const copy: Effect = { kind: 'attach', thread: thread.id, isCopy: true }
   place(SectionRule(draw, scene, 'Sessions', String(sessions.length), 'sessions'))
   if (sessions.length === 0 && changes.opening.length === 0) place(<Text key="no-sessions" color="subtle">No sessions. n opens one: Claude Code, pi or a shell.</Text>)
   // The watch hears of an archive or unarchive before the next details.
   const status = (scene.watch?.thread === id ? scene.watch.state?.status : undefined) ?? detail.thread.status
+  // The titles take one column, as wide as the longest, so the states line up.
+  const titled = Math.max(0, ...sessions.map(session => (session.title ? cells(session.title) + 2 : 0)))
   for (const session of sessions) {
     const key = `session-${session.id}`
     const isCursor = cursor === key
@@ -1643,7 +1951,7 @@ function SessionsBody(draw: Draw, scene: Scene, actions: PaneActions, area: numb
         <Button key={key} plain autoFocus={isCursor ? true : undefined} onPress={() => actions.effect(attach)}>
           {Pointer(draw, isCursor)}
           <Text>{HARNESS_LABEL[session.harness].padEnd(12)}</Text>
-          {session.title ? <Text bold>{`${session.title}  `}</Text> : ''}
+          <Text bold>{`${session.title ?? ''}${' '.repeat(titled - cells(session.title ?? ''))}`}</Text>
           {Dot(draw, tone)}
           <Text>{` ${label}  `}</Text>
           {/* A failed session in no pane goes by the ID /nexus session close takes. */}
@@ -1678,26 +1986,32 @@ function SessionsBody(draw: Draw, scene: Scene, actions: PaneActions, area: numb
       </Box>,
     )
   }
-  place(SectionRule(draw, scene, 'Attach from this Mac', '', 'attach-mac'))
-  place(<Text key="attach-command">{`  ${attachCommand(scene.cli, detail.thread.id)}`}</Text>)
+  const isMac = cursor === 'attach-mac'
   place(
-    <Text key="attach-how" color="subtle">
-      {scene.inHerdr
-        ? "⏎ runs it in a new tab of this Herdr workspace, and y copies it. Each session is a workspace in the pylon's Herdr, so pick one there, and detach from the pylon's Herdr to come back."
-        : "⏎ and y copy it: run it in a terminal or a Herdr tab. Each session is a workspace in the pylon's Herdr, so pick one there, and detach from Herdr to come back."}
-    </Text>,
+    <Box key="row-attach-mac" flexDirection="column">
+      {SectionRule(draw, scene, 'Attach from this Mac', '', 'attach-mac-rule')}
+      <Button key="attach-mac" plain autoFocus={isMac ? true : undefined} onPress={() => actions.effect(attach)}>
+        {Pointer(draw, isMac)}
+        <Text>{attachCommand(scene.cli, thread.id)}</Text>
+      </Button>
+      <Text key="attach-how" color="subtle">
+        {scene.inHerdr
+          ? "⏎ runs it in a new tab of this Herdr workspace, and y copies it. Each session is a workspace in the pylon's Herdr, so pick one there, and detach from the pylon's Herdr to come back."
+          : "⏎ and y copy it: run it in a terminal or a Herdr tab. Each session is a workspace in the pylon's Herdr, so pick one there, and detach from Herdr to come back."}
+      </Text>
+      <Text key="attach-ssh" color="subtle">
+        {SSH_HINT}
+      </Text>
+    </Box>,
+    { key: 'attach-mac', enter: attach, y: copy, x: offRow },
   )
-  place(
-    <Text key="attach-ssh" color="subtle">
-      {SSH_HINT}
-    </Text>,
-  )
+  // A stop taller than the window shows its top, where the cursor is.
   const current = items.find(item => item.key === cursor)
-  const top = keepInView(0, current, area)
+  const top = current ? Math.min(keepInView(0, current, area), current.top) : 0
   return {
     nav: { ...empty, items, cursor },
     node: (
-      <Box key="sessions-list" flexDirection="column" flexShrink={0} marginTop={-top}>
+      <Box key="pylon-list" flexDirection="column" flexShrink={0} marginTop={-top}>
         {drawn}
       </Box>
     ),

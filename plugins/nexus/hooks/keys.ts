@@ -3,7 +3,7 @@
 // pane and the effects the hooks module carries out. Claude Code gives a pane's
 // hotkeys one lowercase letter or digit, Shift folded in, so vim's G, ctrl+d and
 // ctrl+u, / and ? are spelled ge, d, u, f and s here.
-import type { NexusField, NexusMode, NexusPane, NexusTab } from '../types'
+import type { NexusChangedFile, NexusField, NexusMode, NexusPane, NexusTab } from '../types'
 import type { Action } from './model'
 
 export type Command =
@@ -24,6 +24,7 @@ export type Command =
   | 'new'
   | 'projects'
   | 'refresh'
+  | 'uncommitted'
   | 'help'
   | 'close'
 
@@ -47,6 +48,7 @@ export const KEYMAP: readonly { hotkey: string; command: Command }[] = [
   { hotkey: 'n', command: 'new' },
   { hotkey: 'p', command: 'projects' },
   { hotkey: 'r', command: 'refresh' },
+  { hotkey: 'c', command: 'uncommitted' },
   { hotkey: 's', command: 'help' },
   { hotkey: 'q', command: 'close' },
 ]
@@ -70,16 +72,34 @@ export const HELP: readonly { title: string; keys: readonly [keys: string, what:
   {
     title: 'A thread',
     keys: [
-      ['h l', 'previous · next tab; h on Conversation goes back to the threads'],
+      ['h l', 'previous · next tab: Conversation, Changes, Previews, Pylon; h on Conversation goes back to the threads'],
       ['i a', 'write a message (insert mode); enter sends, an empty enter or esc leaves'],
       ['m', 'actions: abort, retry, archive, delete, start again, copy attach, sessions'],
       ['n', 'open a session in the pylon: Claude Code, pi or a shell'],
-      ['y', 'copy the block under the cursor, a URL, or the attach command'],
-      ['r', 'watch again'],
+      ['y', 'copy the block under the cursor, a path, a URL, or the attach command'],
+      ['r', 'watch again; in Changes, read the changes again'],
     ],
   },
-  { title: 'Ports', keys: [['enter', 'publish a port, or copy a preview’s URL'], ['x', 'unpublish the linked preview under the cursor']] },
-  { title: 'Sessions', keys: [['enter', 'attach in a new Herdr tab, inside Herdr; else copy nexus attach'], ['y', 'copy nexus attach, to run in a terminal'], ['x', 'close the session under the cursor, after asking'], ['n', 'open a session']] },
+  {
+    title: 'Changes',
+    keys: [
+      ['enter o', "open a file's diff, or fold a folder; on a paused pylon, wake it and read"],
+      ['c', 'only uncommitted changes, or all since the pylon booted'],
+      ['r', 'read the changes again, waking a paused pylon'],
+      ['y', "copy the file's path"],
+      ['h', 'from a diff, back to the files'],
+    ],
+  },
+  { title: 'Previews', keys: [['enter', 'publish a port, or copy a preview’s URL'], ['x', 'unpublish the linked preview under the cursor']] },
+  {
+    title: 'Pylon',
+    keys: [
+      ['enter', 'on a session or Attach: attach in a new Herdr tab, inside Herdr; else copy nexus attach'],
+      ['y', 'copy the attach command: from a shell in the pylon, or nexus attach on a session'],
+      ['x', 'close the session under the cursor, after asking'],
+      ['n', 'open a session'],
+    ],
+  },
 ]
 
 /** What a single press asks for that only the hooks module can do. */
@@ -110,6 +130,12 @@ export type Effect =
   /** `nexus attach` for `thread`'s sessions: run in a new Herdr tab inside Herdr, else copied; `isCopy` always copies. */
   | { kind: 'attach'; thread: string; isCopy: boolean }
   | { kind: 'refresh' }
+  /** Changes read again for `thread`, waking a paused pylon: `r`, or Enter on the paused note. */
+  | { kind: 'read-changes'; thread: string }
+  /** Shows only the uncommitted changes, or all since the pylon booted again. */
+  | { kind: 'uncommitted' }
+  /** A changed file's diff, in place of the tree. */
+  | { kind: 'open-diff'; thread: string; file: NexusChangedFile }
   | { kind: 'close' }
 
 /** What the Actions menu runs: the CLI's verbs on a thread, and the pane's own. */
@@ -128,17 +154,20 @@ export type NavItem = { key: string; top: number; height: number; enter?: Effect
 export type Nav =
   | { context: 'list'; items: NavItem[]; area: number }
   | { context: 'conversation'; items: NavItem[]; total: number; area: number; canInsert: boolean }
-  | { context: 'details'; total: number; area: number; canInsert: boolean; attach: string | null }
-  /** `cursor` as drawn: a port that moved between Previews and Ports keeps it. */
-  | { context: 'ports'; items: NavItem[]; area: number; canInsert: boolean; cursor: string | null }
-  /** Enter and y act on the thread, whatever row the cursor is on: they give the attach command. */
-  | { context: 'sessions'; items: NavItem[]; area: number; canInsert: boolean; cursor: string | null; thread: string }
+  /** The tree, or the note in its place; `thread` is what r reads again. */
+  | { context: 'changes'; items: NavItem[]; area: number; canInsert: boolean; cursor: string | null; thread: string }
+  /** A diff in place of the tree, scrolled by the keys; h goes back to the file. */
+  | { context: 'diff'; total: number; area: number; canInsert: boolean; thread: string; path: string; wake?: Effect }
+  /** `cursor` as drawn: a port that moved between the sections keeps it. */
+  | { context: 'previews'; items: NavItem[]; area: number; canInsert: boolean; cursor: string | null }
+  /** The pylon's details, each session and the attach from this Mac, as stops. */
+  | { context: 'pylon'; items: NavItem[]; area: number; canInsert: boolean; cursor: string | null }
   | { context: 'menu'; items: NavItem[]; area: number }
   | { context: 'projects'; items: NavItem[]; area: number; drawn: string }
   | { context: 'help'; total: number; area: number }
   | { context: 'none' }
 
-export const TABS: readonly NexusTab[] = ['conversation', 'details', 'ports', 'sessions']
+export const TABS: readonly NexusTab[] = ['conversation', 'changes', 'previews', 'pylon']
 
 /** The keys of the composer and the list's filter, the two fields that take typed letters. */
 export const COMPOSE = 'compose'
@@ -304,8 +333,18 @@ export function press(before: NexusPane, pressed: Command, nav: Nav): Step {
   }
 
   // What every thread tab answers alike.
-  const thread = nav.context === 'conversation' || nav.context === 'details' || nav.context === 'ports' || nav.context === 'sessions' ? nav : null
+  const thread = nav.context === 'conversation' || nav.context === 'changes' || nav.context === 'diff' || nav.context === 'previews' || nav.context === 'pylon' ? nav : null
   if (thread) {
+    // In Changes, c switches what the changes compare with, and r reads them again rather than watching again.
+    if (nav.context === 'changes' || nav.context === 'diff') {
+      if (command === 'uncommitted') return done({}, [{ kind: 'uncommitted' }])
+      if (command === 'refresh') return done({}, [{ kind: 'read-changes', thread: nav.thread }])
+    }
+    // h on a diff goes back to the tree, the cursor on its file.
+    if (nav.context === 'diff' && command === 'left') {
+      const key = `file-${nav.path}`
+      return done({ diff: null, changesCursor: key, ...mode('normal') }, [{ kind: 'focus', key }])
+    }
     switch (command) {
       case 'menu':
         return done({ overlay: { kind: 'menu', cursor: null } })
@@ -362,16 +401,28 @@ export function press(before: NexusPane, pressed: Command, nav: Nav): Step {
       if (command === 'yank') return apply(current?.y)
       return done()
     }
-    case 'details': {
+    case 'changes': {
+      const current = nav.items.find(item => item.key === nav.cursor) ?? nav.items[0]
+      if (isMotion(command)) {
+        const key = moveOver(nav.items, current?.key ?? null, command, nav.area)
+        return done({ changesCursor: key ?? null }, key ? [{ kind: 'focus', key }] : [])
+      }
+      if (command === 'open') return apply(current?.enter)
+      if (command === 'yank') return apply(current?.y)
+      return done()
+    }
+    case 'diff': {
+      if (!pane.diff) return done()
       const most = Math.max(0, nav.total - nav.area)
       const half = Math.max(1, Math.floor(nav.area / 2))
       const moved: Partial<Record<Command, number>> = { down: 1, up: -1, halfDown: half, halfUp: -half, g: -Infinity, e: Infinity }
       const by = moved[command]
-      if (by !== undefined) return done({ detailsTop: clamp(pane.detailsTop + by, 0, most) })
-      if (command === 'yank' && nav.attach) return done({}, [{ kind: 'copy', text: nav.attach }])
+      if (by !== undefined) return done({ diff: { ...pane.diff, top: clamp(pane.diff.top + by, 0, most) } })
+      if (command === 'yank') return done({}, [{ kind: 'copy', text: nav.path }])
+      if (command === 'open') return apply(nav.wake)
       return done()
     }
-    case 'ports': {
+    case 'previews': {
       const current = nav.items.find(item => item.key === nav.cursor) ?? nav.items[0]
       if (isMotion(command)) {
         const key = moveOver(nav.items, current?.key ?? null, command, nav.area)
@@ -382,13 +433,15 @@ export function press(before: NexusPane, pressed: Command, nav: Nav): Step {
       if (command === 'yank') return apply(current?.y)
       return done()
     }
-    case 'sessions': {
+    case 'pylon': {
       const current = nav.items.find(item => item.key === nav.cursor) ?? nav.items[0]
       if (isMotion(command)) {
-        const key = moveOver(nav.items, current?.key ?? null, command, nav.area)
-        return done({ sessionCursor: key ?? null }, key ? [{ kind: 'focus', key }] : [])
+        // The ring follows the cursor onto a stop that is a button, else back to the tab, whose ⏎ acts as o does.
+        const item = nav.items.find(one => one.key === moveOver(nav.items, current?.key ?? null, command, nav.area))
+        return done({ pylonCursor: item?.key ?? null }, item ? [{ kind: 'focus', key: item.enter ? item.key : 'tab-pylon' }] : [])
       }
-      if (command === 'open' || command === 'yank') return done({}, [{ kind: 'attach', thread: nav.thread, isCopy: command === 'yank' }])
+      if (command === 'open') return apply(current?.enter)
+      if (command === 'yank') return apply(current?.y)
       if (command === 'unpublish') return current?.x ? apply(current.x) : done({}, [{ kind: 'say', text: 'No session to close. n opens one.' }])
       return done()
     }
@@ -407,7 +460,8 @@ export function ringMoved(pane: NexusPane, element: string): NexusPane {
   if (element.startsWith('menu-') && pane.overlay?.kind === 'menu') return { ...base, overlay: { kind: 'menu', cursor: element } }
   if (element.startsWith('scope-') && pane.overlay?.kind === 'projects') return { ...base, overlay: { kind: 'projects', cursor: element } }
   if (element.startsWith('preview-') || element.startsWith('port-')) return { ...base, portCursor: element }
-  if (element.startsWith('session-')) return { ...base, sessionCursor: element }
+  if (element.startsWith('session-') || element === 'attach-mac') return { ...base, pylonCursor: element }
+  if (element.startsWith('dir-') || element.startsWith('file-') || element === 'changes-wake') return { ...base, changesCursor: element }
   if (pane.view === 'list') return { ...base, listCursor: element }
   if (pane.view === 'start' && pane.start) return { ...base, start: { ...pane.start, focused: field } }
   return base
