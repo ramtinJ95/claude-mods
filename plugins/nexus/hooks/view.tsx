@@ -44,6 +44,7 @@ import type {
 import { COMPOSE, type Command, type Effect, FILTER, HELP, KEYMAP, type MenuAction, type Nav, type NavItem, blockAt, fieldKey, keepInView, scrolledRows } from './keys'
 import {
   ACTUAL_BADGE,
+  ATTACH_HINT,
   type Block,
   type CheckoutFacts,
   DESIRED_TONE,
@@ -61,7 +62,6 @@ import {
   pausedClose,
   resumesOn,
   sessionPlace,
-  SSH_HINT,
   type ShownSession,
   attachCommand,
   type Tone,
@@ -1405,9 +1405,6 @@ function Composer(draw: Draw, scene: Scene, actions: PaneActions, pylon: { faile
   )
 }
 
-/** Gondolin's ingress reaches only the pylon's 127.0.0.1, so a server bound only to ::1 is neither listed nor reachable. */
-const UNREACHABLE_HINT = "A server bound only to ::1 can't be previewed, so bind it to 0.0.0.0 or 127.0.0.1."
-
 /**
  * The previews and the ports with none, as Previews lists them with what the person confirmed since: a port just
  * unpublished is under Ports, one just published under Previews. `closable` holds the ports whose preview x can
@@ -1770,7 +1767,7 @@ function PortsBody(draw: Draw, scene: Scene, actions: PaneActions, area: number,
   if (unpublished === null) place(<Text key="ports-unknown" color="subtle">The pylon's ports could not be read.</Text>)
   else if (unpublished.length > 0) for (const port of unpublished) place(...PortRow(draw, actions, detail.thread.id, port, changeOf(port.port), cursor === `port-${port.port}`))
   else if (pylon.actualState !== 'running') place(<Text key="ports-none" color="subtle">Ports show while the pylon runs.</Text>)
-  else place(<Text key="ports-none" color="subtle">{`${detail.ports?.length === 0 ? 'Nothing listens yet.' : 'Every port that listens is under Previews.'} ${UNREACHABLE_HINT}`}</Text>)
+  else place(<Text key="ports-none" color="subtle">{detail.ports?.length === 0 ? 'Nothing listens yet.' : 'Every port that listens is under Previews.'}</Text>)
   const current = items.find(item => item.key === cursor)
   const top = keepInView(0, current, area)
   return {
@@ -2008,8 +2005,8 @@ function PylonBody(draw: Draw, scene: Scene, actions: PaneActions, area: number,
           ? "⏎ runs it in a new tab of this Herdr workspace, and y copies it. Each session is a workspace in the pylon's Herdr, so pick one there, and detach from the pylon's Herdr to come back."
           : "⏎ and y copy it: run it in a terminal or a Herdr tab. Each session is a workspace in the pylon's Herdr, so pick one there, and detach from Herdr to come back."}
       </Text>
-      <Text key="attach-ssh" color="subtle">
-        {SSH_HINT}
+      <Text key="attach-needs" color="subtle">
+        {ATTACH_HINT}
       </Text>
     </Box>,
     { key: 'attach-mac', enter: attach, y: copy, x: offRow },

@@ -608,7 +608,7 @@ export function clock(ms: number): string {
 export function previewLook(detail: Pick<NexusDetail, 'thread' | 'pylon'>, preview: NexusPreview) {
   if (detail.thread.status === 'archived') return { linked: false, label: 'paused', tone: 'idle' as Tone, hint: 'Unarchive the thread to open it.' }
   if (detail.pylon.actualState === 'paused') return { linked: true, label: 'paused', tone: 'idle' as Tone, hint: 'Opening it wakes the pylon.' }
-  // A failed service's URL answers 502 until the service runs again, so it is no link; the reason is the node's.
+  // A failed service's URL answers 502, and an unrouted port's 404, so it is no link; the reason is the node's.
   if (preview.failed) return { linked: false, label: 'failed', tone: 'bad' as Tone, hint: preview.failed }
   return preview.ready ? { linked: true, label: 'ready', tone: 'ok' as Tone, hint: null } : { linked: false, label: 'starting', tone: 'busy' as Tone, hint: null }
 }
@@ -646,8 +646,8 @@ export function herdrError(exitCode: number, stdout: string, stderr: string): st
   return stderr.trim() || stdout.trim() || `herdr exited with ${exitCode}`
 }
 
-/** How to reach a pylon's node when ssh cannot as it is, which the CLI's own failure repeats. */
-export const SSH_HINT = `Attaching needs Nexus CLI 0.5.0 and ssh to the pylon's node. When ssh needs another user or an alias for the node, set "ssh": {"<node>": "<user@host or alias>"} in ~/.config/nexus/cli.json, or NEXUS_ATTACH, as the CLI's docs/cli.md describes.`
+/** What attaching from this Mac needs, in pi-nexus's words too. */
+export const ATTACH_HINT = 'Attaching needs Nexus CLI 0.9.0 or newer and goes through the control plane.'
 
 /** A session as a person names it: its harness, and its title when it has one, such as `Claude Code "login"`. */
 export const sessionName = (harness: NexusHarness, title: string | null | undefined) => `${HARNESS_LABEL[harness]}${title ? ` "${title}"` : ''}`

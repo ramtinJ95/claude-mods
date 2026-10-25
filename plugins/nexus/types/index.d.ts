@@ -37,7 +37,7 @@ export type NexusPreview = {
   httpsPort: number
   /** The node publishes it and has warmed its URL; it says nothing of the pylon answering. */
   ready: boolean
-  /** Why it cannot answer: the pylon's node reported its service failed. Null otherwise, and from a control plane too old to say. */
+  /** Why it cannot answer: the pylon's node reported its service failed, or its port without a route into the pylon. Null otherwise, and from a control plane too old to say. */
   failed: string | null
   /** The CLI's own URL, used as it is. */
   url: string
