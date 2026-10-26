@@ -218,7 +218,7 @@ describe('changes and pylon', () => {
     expect(press(down.pane, 'open', drawn).effects).toEqual([{ kind: 'open-diff', thread: 'th-1', file }])
     expect(press(down.pane, 'yank', drawn).effects).toEqual([{ kind: 'copy', text: 'src/a.ts' }])
     expect(press(onTab, 'refresh', changes).effects).toEqual([{ kind: 'read-changes', thread: 'th-1' }])
-    expect(press(onTab, 'uncommitted', changes).effects).toEqual([{ kind: 'uncommitted' }])
+    expect(press(onTab, 'base', changes).effects).toEqual([{ kind: 'base' }])
   })
 
   test('a diff scrolls with the keys, y copies its path, and h goes back to the tree with the cursor on its file', () => {

@@ -52,11 +52,14 @@ describe('the tree', () => {
     expect(changesSummary(changes)).toEqual({ counts: '5 files', added: 15, deleted: 45, since: 'since the pylon booted, a1b2c3d' })
     expect(changesSummary({ ...changes, base: { kind: 'start', commit: null } }).since).toBe('since the pylon booted, an empty repository')
     expect(changesSummary({ ...changes, base: { kind: 'head', commit: null } }).since).toBe('since the last commit, no commit yet')
+    // The latest turn's base is a hidden snapshot, not a commit of the branch: it goes unnamed.
+    expect(changesSummary({ ...changes, base: { kind: 'turn', commit: '7e1f00d' } }).since).toBe('since the latest turn began')
     expect(() => parseChanges({ base: CHANGES.base, files: [{ path: 'a', status: 'mystery' }] })).toThrow(/a file without its path or status/)
   })
 
   test("a renamed file's diff names both paths", () => {
-    expect(diffArgv(ID, { ...file('src/new.ts', 'renamed'), oldPath: 'src/old.ts' }, true)).toEqual(['diff', '--uncommitted', '--', ID, 'src/new.ts', 'src/old.ts'])
+    expect(diffArgv(ID, { ...file('src/new.ts', 'renamed'), oldPath: 'src/old.ts' }, 'head')).toEqual(['diff', '--uncommitted', '--', ID, 'src/new.ts', 'src/old.ts'])
+    expect(diffArgv(ID, file('src/new.ts', 'added'), 'turn')).toEqual(['diff', '--turn', '--', ID, 'src/new.ts'])
   })
 })
 
@@ -220,12 +223,12 @@ describe('the Changes tab', () => {
     await clock.advance(3_000)
     expect(reads(cli.spawns)).toEqual([
       ['changes', '--json', '--', ID],
-      ['changes', '--json', '--uncommitted', '--', ID],
+      ['changes', '--json', '--turn', '--', ID],
     ])
     expect(await shows(ui, /since the pylon booted/)).toBe(false)
     await clock.advance(3_000)
-    expect(await shows(ui, '5 files · +15 −45  since the last commit, f00d123')).toBe(true)
-    expect(cli.store.uncommitted).toBe(true)
+    expect(await shows(ui, '5 files · +15 −45  since the latest turn began')).toBe(true)
+    expect(cli.store.changesBase).toBe('turn')
     expect(reads(cli.spawns)).toHaveLength(2)
   })
 
@@ -271,6 +274,8 @@ describe('the Changes tab', () => {
     await toChanges(ui)
     expect(await shows(ui, 'Nothing has changed since the pylon booted.')).toBe(true)
     await keys(ui, 'c')
+    expect(await shows(ui, 'Nothing changed in the latest turn.')).toBe(true)
+    await keys(ui, 'c')
     expect(await shows(ui, 'No uncommitted changes.')).toBe(true)
     cli.changes = { ...CHANGES, truncated: true }
     await keys(ui, 'c')
@@ -287,7 +292,34 @@ describe('the Changes tab', () => {
     cli.fail = { changes: { exitCode: 1, error: 'The pylon booted before Nexus recorded refs/nexus/base. Ask for the changes since HEAD with --uncommitted.' } }
     await keys(ui, 'r')
     expect(await shows(ui, /^The pylon booted before Nexus recorded refs\/nexus\/base/)).toBe(true)
-    expect(await shows(ui, 'c shows the uncommitted changes instead, since the last commit.')).toBe(true)
+    expect(await shows(ui, "c shows the latest turn's changes instead.")).toBe(true)
+  })
+
+  test('the latest turn: no snapshot yet suggests the next base, and a CLI before 0.11.0 names the version it needs', async ($, on) => {
+    const cli = fake({ store: { themeNotice: true, changesBase: 'turn' } })
+    cli.fail = { changes: { exitCode: 1, error: 'the checkout has no latest-turn snapshot: no turn has been captured yet, or its snapshot failed. Start another agent turn or ask for changes since HEAD instead' } }
+    const { nexus, mount } = await boot($, on, cli)
+    await nexus(`open ${ID}`)
+    const ui = await mount()
+    await toChanges(ui)
+    expect(reads(cli.spawns)).toEqual([['changes', '--json', '--turn', '--', ID]])
+    expect(await shows(ui, /^the checkout has no latest-turn snapshot/)).toBe(true)
+    expect(await shows(ui, 'c shows the uncommitted changes instead.')).toBe(true)
+    cli.fail = { changes: { exitCode: 64, error: "Unknown option '--turn'. To specify a positional argument starting with a '-', place it at the end of the command after '--', as in '-- \"--turn\"" } }
+    cli.version = '0.10.0'
+    await keys(ui, 'r')
+    expect(await shows(ui, 'nexus is 0.10.0: comparing with the latest turn needs Nexus CLI 0.11.0 or later (nexus --version).')).toBe(true)
+  })
+
+  test('the uncommitted choice an earlier version kept becomes the base it stood for, and its key goes', async ($, on) => {
+    const cli = fake({ store: { themeNotice: true, uncommitted: true } })
+    const { nexus, mount } = await boot($, on, cli)
+    await nexus(`open ${ID}`)
+    const ui = await mount()
+    await toChanges(ui)
+    expect(reads(cli.spawns)).toEqual([['changes', '--json', '--uncommitted', '--', ID]])
+    expect(cli.store.changesBase).toBe('head')
+    expect('uncommitted' in cli.store).toBe(false)
   })
 })
 

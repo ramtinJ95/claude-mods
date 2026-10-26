@@ -810,7 +810,7 @@ export function settleSessions(changes: NexusSessionChanges, sessions: readonly 
 const FILE_STATUS = new Set<string>(['added', 'modified', 'deleted', 'renamed', 'copied', 'typechange'])
 
 function parseBase(raw: unknown, command: string): NexusBase {
-  if (!isRecord(raw) || (raw.kind !== 'start' && raw.kind !== 'head')) throw contractError(command, 'no base')
+  if (!isRecord(raw) || (raw.kind !== 'start' && raw.kind !== 'turn' && raw.kind !== 'head')) throw contractError(command, 'no base')
   return { kind: raw.kind, commit: strOrNull(raw.commit) }
 }
 
@@ -868,10 +868,10 @@ export function checkoutTrigger(before: CheckoutFacts | null, now: CheckoutFacts
 export function changesSummary(changes: NexusChanges): { counts: string; added: number; deleted: number; since: string } {
   const added = changes.files.reduce((sum, file) => sum + (file.additions ?? 0), 0)
   const deleted = changes.files.reduce((sum, file) => sum + (file.deletions ?? 0), 0)
-  const isHead = changes.base.kind === 'head'
-  // The base is the empty tree before a checkout's first commit, and at the start of a scratch project's pylon.
-  const commit = changes.base.commit === null ? (isHead ? 'no commit yet' : 'an empty repository') : changes.base.commit.slice(0, 7)
-  return { counts: `${plural(changes.files.length, 'file', 'files')}`, added, deleted, since: `${isHead ? 'since the last commit' : 'since the pylon booted'}, ${commit}` }
+  const { kind, commit } = changes.base
+  // The base is the empty tree before a checkout's first commit, and at the start of a scratch project's pylon. A turn's is a hidden snapshot, no commit of the branch.
+  const at = kind === 'turn' ? null : commit === null ? (kind === 'head' ? 'no commit yet' : 'an empty repository') : commit.slice(0, 7)
+  return { counts: `${plural(changes.files.length, 'file', 'files')}`, added, deleted, since: at === null ? BASES[kind].since : `${BASES[kind].since}, ${at}` }
 }
 
 /** A row of the Changes tree as drawn: a folder, which Enter folds, or a file, which Enter opens. */
@@ -961,14 +961,24 @@ export function parseDiff(text: string, max = DIFF_ROWS): { rows: NexusDiffRow[]
   return { rows, meta, isCut: rows.length >= max, isBinary: /^Binary files /m.test(text) }
 }
 
-/** The changes reading needs: its argv, the base after `--uncommitted`, the thread after `--` as the CLI's parseArgs takes it. */
-export const changesArgv = (thread: string, uncommitted: boolean) => ['changes', ...(uncommitted ? ['--uncommitted'] : []), '--', thread]
+/** What the Changes tab can compare with, in the order `c` steps through them: the CLI's flag and the tab's words. */
+export const BASES: Record<NexusBase['kind'], { flag: string[]; next: NexusBase['kind']; name: string; shows: string; since: string; against: string; none: string }> = {
+  start: { flag: [], next: 'turn', name: 'all changes', shows: 'all the changes since the pylon booted', since: 'since the pylon booted', against: 'vs boot', none: 'Nothing has changed since the pylon booted.' },
+  turn: { flag: ['--turn'], next: 'head', name: 'latest turn', shows: "the latest turn's changes", since: 'since the latest turn began', against: 'vs turn', none: 'Nothing changed in the latest turn.' },
+  head: { flag: ['--uncommitted'], next: 'start', name: 'uncommitted', shows: 'the uncommitted changes', since: 'since the last commit', against: 'vs last commit', none: 'No uncommitted changes.' },
+}
+
+/** The changes reading needs: its argv, the base's flag, the thread after `--` as the CLI's parseArgs takes it. */
+export const changesArgv = (thread: string, base: NexusBase['kind']) => ['changes', ...BASES[base].flag, '--', thread]
 
 /** A file's diff: a renamed file's old path goes too, or the diff shows it as added. */
-export const diffArgv = (thread: string, file: NexusChangedFile, uncommitted: boolean) => ['diff', ...(uncommitted ? ['--uncommitted'] : []), '--', thread, file.path, ...(file.oldPath ? [file.oldPath] : [])]
+export const diffArgv = (thread: string, file: NexusChangedFile, base: NexusBase['kind']) => ['diff', ...BASES[base].flag, '--', thread, file.path, ...(file.oldPath ? [file.oldPath] : [])]
 
-/** A refusal of the boot base because the pylon booted before Nexus recorded it: the CLI then says to ask since HEAD. */
-export const isNoBase = (message: string) => /refs\/nexus\/base|since HEAD/i.test(message)
+/**
+ * A refusal of the base: a pylon that booted before Nexus recorded it, or no latest-turn snapshot yet. The CLI then
+ * says to ask since HEAD.
+ */
+export const isNoBase = (message: string) => /refs\/nexus\/base|latest-turn snapshot|since HEAD/i.test(message)
 
 export type ToolRow = Extract<NexusRow, { kind: 'tool' }>
 

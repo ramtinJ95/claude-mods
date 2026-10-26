@@ -247,8 +247,11 @@ export type NexusView = 'list' | 'thread' | 'start' | 'project' | 'session'
 /** The thread view's tabs, in the order h and l walk them: the dashboard's inspector, after the conversation. */
 export type NexusTab = 'conversation' | 'changes' | 'previews' | 'pylon'
 
-/** What a checkout read compares with: `start`, what the pylon booted at, or `head`. Null `commit` is the empty tree. */
-export type NexusBase = { kind: 'start' | 'head'; commit: string | null }
+/**
+ * What a checkout read compares with: `start`, what the pylon booted at, `turn`, the snapshot taken before the latest
+ * reply's first model request (CLI 0.11.0), or `head`. Null `commit` is the empty tree; a `turn` names its snapshot.
+ */
+export type NexusBase = { kind: 'start' | 'turn' | 'head'; commit: string | null }
 
 export type NexusFileStatus = 'added' | 'modified' | 'deleted' | 'renamed' | 'copied' | 'typechange'
 
@@ -280,8 +283,8 @@ export type NexusDiffRow = { kind: 'hunk'; text: string } | { kind: 'add' | 'del
 export type NexusDiffShown = {
   thread: string
   file: NexusChangedFile
-  /** Whether it was read against HEAD. */
-  isUncommitted: boolean
+  /** What it was read against. */
+  base: NexusBase['kind']
   /** Null until a read answers. */
   rows: NexusDiffRow[] | null
   /** What git says beyond the lines: renames, modes. */
@@ -402,8 +405,8 @@ declare module 'claude-code' {
       checkout: NexusCheckout | null
       /** The diff the Changes tab shows, null before one is opened. */
       diff: NexusDiffShown | null
-      /** Whether Changes shows only what is uncommitted (since HEAD) rather than all since the pylon booted; kept in `$.store`. */
-      uncommitted: boolean
+      /** What Changes compares with: what the pylon booted at, the latest turn's snapshot or HEAD; kept in `$.store`. */
+      changesBase: NexusBase['kind']
     }
   }
 }

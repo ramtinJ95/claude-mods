@@ -20,6 +20,7 @@ import type {
 
 import type {
   NexusActual,
+  NexusBase,
   NexusCatalog,
   NexusChangedFile,
   NexusCheckout,
@@ -45,6 +46,7 @@ import { COMPOSE, type Command, type Effect, FILTER, HELP, KEYMAP, type MenuActi
 import {
   ACTUAL_BADGE,
   ATTACH_HINT,
+  BASES,
   type Block,
   type CheckoutFacts,
   DESIRED_TONE,
@@ -136,8 +138,8 @@ export type Scene = {
   /** The Changes tab's reads of the thread shown, and the diff it shows. */
   checkout: NexusCheckout | null
   diff: NexusDiffShown | null
-  /** Changes shows only what is uncommitted, since HEAD. */
-  uncommitted: boolean
+  /** What Changes compares with. */
+  changesBase: NexusBase['kind']
 }
 
 export type PaneActions = {
@@ -789,8 +791,8 @@ export function ThreadView(draw: Draw, scene: Scene, actions: PaneActions) {
           ? [['j/k', 'block'], ['d/u', 'page'], ...(scrolled ? [['ge', 'follow'] as [string, string]] : []), ['o', 'open'], ['h/l', 'tabs'], ...(canInsert ? [['i', 'write'] as [string, string]] : []), ['m', 'actions'], ['s', 'keys']]
           : pane.tab === 'changes'
             ? pane.diff
-              ? [['j/k', 'scroll'], ['d/u', 'page'], ['h', 'files'], ['c', scene.uncommitted ? 'all changes' : 'uncommitted'], ['r', 'read again'], ['y', 'copy path'], ['s', 'keys']]
-              : [['j/k', 'move'], ['⏎', 'open · fold'], ['c', scene.uncommitted ? 'all changes' : 'uncommitted'], ['r', 'read again'], ['y', 'copy path'], ['h/l', 'tabs'], ['s', 'keys']]
+              ? [['j/k', 'scroll'], ['d/u', 'page'], ['h', 'files'], ['c', BASES[BASES[scene.changesBase].next].name], ['r', 'read again'], ['y', 'copy path'], ['s', 'keys']]
+              : [['j/k', 'move'], ['⏎', 'open · fold'], ['c', BASES[BASES[scene.changesBase].next].name], ['r', 'read again'], ['y', 'copy path'], ['h/l', 'tabs'], ['s', 'keys']]
             : pane.tab === 'previews'
               ? [['j/k', 'move'], ['⏎', 'publish · copy'], ['x', 'unpublish'], ['y', 'copy URL'], ['h/l', 'tabs'], ['s', 'keys']]
               : [['j/k', 'move'], ...(scene.inHerdr ? ([['⏎', 'attach'], ['y', 'copy attach']] as [string, string][]) : [['⏎/y', 'copy attach'] as [string, string]]), ['x', 'close'], ['n', 'open'], ['h/l', 'tabs'], ['s', 'keys']]
@@ -1520,7 +1522,7 @@ function ChangesBody(draw: Draw, scene: Scene, actions: PaneActions, area: numbe
     )
     if (checkout?.isReading) note('changes-reading', isRunning ? 'Reading the changes…' : 'Waking the pylon…')
     else if (!isRunning) note('changes-paused', `The pylon is ${pylon}. r wakes it and reads the changes again.`)
-    if (changes.files.length === 0) note('changes-none', changes.base.kind === 'head' ? 'No uncommitted changes.' : 'Nothing has changed since the pylon booted.')
+    if (changes.files.length === 0) note('changes-none', BASES[changes.base.kind].none)
     const rows = changeTree(changes.files, scene.pane.toggled)
     const keys = rows.map(row => row.key)
     const cursor = keys.find(key => key === scene.pane.changesCursor) ?? keys[0] ?? null
@@ -1549,7 +1551,7 @@ function ChangesBody(draw: Draw, scene: Scene, actions: PaneActions, area: numbe
     }
   } else if (checkout?.failure && !checkout.isReading) {
     note('changes-failure', sentence(checkout.failure.message), 'error')
-    if (checkout.failure.isNoBase) note('changes-no-base', 'c shows the uncommitted changes instead, since the last commit.')
+    if (checkout.failure.isNoBase) note('changes-no-base', `c shows ${BASES[BASES[scene.changesBase].next].shows} instead.`)
     if (isRunning) note('changes-again', 'r reads them again.')
     else wakeButton()
   } else if (checkout?.isReading) note('changes-reading', isRunning ? 'Reading the changes…' : 'Waking the pylon. Its changes show once it runs.')
@@ -1619,10 +1621,9 @@ function DiffBody(draw: Draw, scene: Scene, area: number, canInsert: boolean, op
   const { id, status, facts, checkout } = checkoutOf(scene)
   const shown = scene.diff?.thread === id && scene.diff.file.path === open.path ? scene.diff : null
   const file = shown?.file ?? checkout?.changes?.files.find(one => one.path === open.path) ?? null
-  const isUncommitted = shown?.isUncommitted ?? scene.uncommitted
   const head: RenderChildren[] = []
   const counts = file ? countsText(file.additions, file.deletions) : ''
-  const against = isUncommitted ? 'vs last commit' : 'vs boot'
+  const { against } = BASES[shown?.base ?? scene.changesBase]
   const room = scene.width - 2 - cells(against) - 2 - cells(counts) - 2
   const path = clip(open.path, Math.max(8, room))
   head.push(

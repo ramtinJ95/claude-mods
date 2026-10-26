@@ -160,7 +160,7 @@ export type Fake = {
   /** What `projects` lists; `project add` adds to it, as the control plane does. */
   projects: unknown[]
   detail: unknown
-  /** What `changes` answers; `--uncommitted` gets the same files against HEAD. */
+  /** What `changes` answers; `--uncommitted` and `--turn` get the same files against HEAD or the latest turn. */
   changes: unknown
   /** What `diff` answers, for any file. */
   diff: unknown
@@ -263,6 +263,10 @@ export async function boot(...[$, on, cli]: [...Body, Fake]) {
     cli.store[e.key] = e.value
     return { value: undefined }
   })
+  on('store.delete', (_, e) => {
+    delete cli.store[e.key]
+    return { value: undefined }
+  })
   const answers: Record<string, () => unknown> = {
     nodes: () => NODES,
     projects: () => cli.projects,
@@ -353,10 +357,11 @@ export async function boot(...[$, on, cli]: [...Body, Fake]) {
       if (cli.publishes && (argv[0] === 'preview' || argv[0] === 'unpreview')) {
         cli.detail = withPreview(cli.detail, Number(argv[3]), argv[0] === 'preview' ? OPENED : null)
       }
-      // `--uncommitted` compares with HEAD instead of the commit the pylon booted on.
-      if ((argv[0] === 'changes' || argv[0] === 'diff') && argv.includes('--uncommitted') && !(argv[0] in cli.printed)) {
+      // `--uncommitted` compares with HEAD instead of the commit the pylon booted on, and `--turn` with the latest turn's snapshot.
+      const base = argv.includes('--uncommitted') ? { kind: 'head', commit: 'f00d123' } : argv.includes('--turn') ? { kind: 'turn', commit: '7e1f00d' } : null
+      if ((argv[0] === 'changes' || argv[0] === 'diff') && base && !(argv[0] in cli.printed)) {
         const answer = answers[argv[0]]!() as { base: unknown }
-        yield { stream: 'stdout' as const, text: JSON.stringify({ ...answer, base: { kind: 'head', commit: 'f00d123' } }) }
+        yield { stream: 'stdout' as const, text: JSON.stringify({ ...answer, base }) }
         return { value: { code: 0, signal: null } }
       }
       yield { stream: 'stdout' as const, text: JSON.stringify(argv[0]! in cli.printed ? cli.printed[argv[0]!] : (answers[argv[0]!]?.() ?? null)) }

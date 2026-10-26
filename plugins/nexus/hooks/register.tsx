@@ -4,6 +4,7 @@ import type { EngineInterface, Register, RenderSurface, Timer } from 'claude-cod
 import type {
   NexusCatalog,
   NexusChangedFile,
+  NexusBase,
   NexusCheckout,
   NexusDetail,
   NexusDiffShown,
@@ -31,6 +32,7 @@ import type {
 import {
   ACTIONS,
   ATTACH_HINT,
+  BASES,
   type Action,
   type Reply,
   FULL_ID,
@@ -165,9 +167,9 @@ const CHECKOUT = { plugin: 'nexus', key: 'checkout' } as const
 const checkoutAtom = atom(CHECKOUT, null)
 const DIFF = { plugin: 'nexus', key: 'diff' } as const
 const diffAtom = atom(DIFF, null)
-const UNCOMMITTED = { plugin: 'nexus', key: 'uncommitted' } as const
-/** What `$.store` keeps under `uncommitted`, mirrored here so a change draws the Changes tab again. */
-const uncommittedAtom = atom(UNCOMMITTED, false)
+const CHANGES_BASE = { plugin: 'nexus', key: 'changesBase' } as const
+/** What `$.store` keeps under `changesBase`, mirrored here so a change draws the Changes tab again. */
+const changesBaseAtom = atom(CHANGES_BASE, 'start')
 
 /** The CLI to run, from the `cli` option. */
 let cli = 'nexus'
@@ -1056,9 +1058,25 @@ const emptyCheckout = (thread: string): NexusCheckout => ({ thread, changes: nul
 const changeCheckout = ($: EngineInterface, thread: string, change: (was: NexusCheckout) => NexusCheckout) =>
   update($, checkoutAtom, was => (was?.thread === thread ? change(was) : was))
 
-/** The Show only uncommitted choice as `$.store` kept it. */
-async function loadUncommitted($: EngineInterface) {
-  await $.state.set(UNCOMMITTED, (await $.store.get('uncommitted')) === true)
+/** What Changes compares with, as `$.store` kept it. A store from before the latest turn kept only whether to show the uncommitted changes. */
+async function loadChangesBase($: EngineInterface) {
+  const stored = await $.store.get('changesBase')
+  const old = await $.store.get('uncommitted')
+  const base = stored === 'start' || stored === 'turn' || stored === 'head' ? stored : old === true ? 'head' : 'start'
+  await $.state.set(CHANGES_BASE, base)
+  if (old === undefined) return
+  await $.store.set('changesBase', base)
+  await $.store.delete('uncommitted')
+}
+
+/**
+ * A failed checkout read: a CLI too old for the command names the version it needs, and one too old for `--turn`,
+ * which its parseArgs refuses as an unknown option, the version that added it.
+ */
+async function checkoutFailure($: EngineInterface, failure: NexusFailure, base: NexusBase['kind'], command: string, doing: string): Promise<NexusFailure> {
+  const older = newer(failure, command, doing, '0.6.0')
+  if (older !== failure || base !== 'turn' || failure.kind !== 'invalid') return older
+  return olderThan($, failure, [0, 11, 0], "comparing with the latest turn")
 }
 
 /**
@@ -1080,7 +1098,7 @@ async function readChanges($: EngineInterface, thread: string, wake: boolean): P
     if (!wake && !checkout?.isWanted) return
     if (!checkout?.isWanted) await changeCheckout($, thread, was => ({ ...was, isWanted: true }))
   }
-  const uncommitted = await read($, uncommittedAtom)
+  const base = await read($, changesBaseAtom)
   // The check and the claim are one synchronous step, so two asks at once never start two children.
   if (changesChild?.thread === thread) return
   changesChild?.stop()
@@ -1088,18 +1106,18 @@ async function readChanges($: EngineInterface, thread: string, wake: boolean): P
   const mine = { thread, stop }
   changesChild = mine
   await changeCheckout($, thread, was => ({ ...was, isReading: true }))
-  const got = await childJson($, changesArgv(thread, uncommitted), Promise.race([current.stopped, promise]))
+  const got = await childJson($, changesArgv(thread, base), Promise.race([current.stopped, promise]))
   if (changesChild === mine) changesChild = undefined
-  const isStale = got !== undefined && (await read($, uncommittedAtom)) !== uncommitted
+  const isStale = got !== undefined && (await read($, changesBaseAtom)) !== base
   if (!got || isStale) {
     await changeCheckout($, thread, was => ({ ...was, isReading: false }))
     if (isStale) await readChanges($, thread, false)
     return
   }
-  const changes = got.ok ? parsed(got, parseChanges) : { ok: false as const, failure: newer(got.failure, 'changes', 'reading the changes', '0.6.0') }
+  const changes = got.ok ? parsed(got, parseChanges) : { ok: false as const, failure: await checkoutFailure($, got.failure, base, 'changes', 'reading the changes') }
   if (!changes.ok) {
     const { message } = changes.failure
-    await changeCheckout($, thread, was => ({ ...was, changes: null, failure: { message, isNoBase: !uncommitted && isNoBase(message) }, isReading: false, isWanted: false }))
+    await changeCheckout($, thread, was => ({ ...was, changes: null, failure: { message, isNoBase: base !== 'head' && isNoBase(message) }, isReading: false, isWanted: false }))
     return
   }
   await changeCheckout($, thread, () => ({ thread, changes: changes.value, failure: null, isReading: false, isWanted: false }))
@@ -1121,9 +1139,9 @@ async function readDiff($: EngineInterface, thread: string, file: NexusChangedFi
   if (!current || (await read($, paneAtom)).selected !== thread) return
   const shown = await read($, shownAtom)
   const detail = shown?.thread === thread ? shown.detail : null
-  const uncommitted = await read($, uncommittedAtom)
-  const fresh: NexusDiffShown = { thread, file, isUncommitted: uncommitted, rows: null, meta: [], isBinary: false, isCut: false, failure: null, isReading: false }
-  const kept = (was: NexusDiffShown | null): NexusDiffShown => (was?.thread === thread && was.file.path === file.path && was.isUncommitted === uncommitted ? { ...was, file } : fresh)
+  const base = await read($, changesBaseAtom)
+  const fresh: NexusDiffShown = { thread, file, base, rows: null, meta: [], isBinary: false, isCut: false, failure: null, isReading: false }
+  const kept = (was: NexusDiffShown | null): NexusDiffShown => (was?.thread === thread && was.file.path === file.path && was.base === base ? { ...was, file } : fresh)
   const facts = detail && checkoutFacts(detail)
   const isOpen = facts?.status === 'active' || facts?.status === 'idle'
   if (!facts || !isOpen || (!isAwake && !canReadCheckout(facts))) {
@@ -1135,16 +1153,16 @@ async function readDiff($: EngineInterface, thread: string, file: NexusChangedFi
   const mine = { thread, stop }
   diffChild = mine
   await update($, diffAtom, was => ({ ...kept(was), isReading: true }))
-  const got = await childJson($, diffArgv(thread, file, uncommitted), Promise.race([current.stopped, promise]))
+  const got = await childJson($, diffArgv(thread, file, base), Promise.race([current.stopped, promise]))
   // A newer read took this one's place, and writes its own.
   if (diffChild !== mine) return
   diffChild = undefined
-  const isOurs = (was: NexusDiffShown | null) => was?.thread === thread && was.file.path === file.path && was.isUncommitted === uncommitted
-  if (!got || (await read($, uncommittedAtom)) !== uncommitted) {
+  const isOurs = (was: NexusDiffShown | null) => was?.thread === thread && was.file.path === file.path && was.base === base
+  if (!got || (await read($, changesBaseAtom)) !== base) {
     await update($, diffAtom, was => (isOurs(was) ? { ...was!, isReading: false } : was))
     return
   }
-  const reply = got.ok ? parsed(got, parseDiffReply) : { ok: false as const, failure: newer(got.failure, 'diff', 'reading a diff', '0.6.0') }
+  const reply = got.ok ? parsed(got, parseDiffReply) : { ok: false as const, failure: await checkoutFailure($, got.failure, base, 'diff', 'reading a diff') }
   await update($, diffAtom, was => {
     if (!isOurs(was)) return was
     if (!reply.ok) return { ...was!, isReading: false, failure: reply.failure.message }
@@ -1153,11 +1171,11 @@ async function readDiff($: EngineInterface, thread: string, file: NexusChangedFi
   })
 }
 
-/** c: only the uncommitted changes, or all since the pylon booted again; kept between sessions, and read again. */
-async function toggleUncommitted($: EngineInterface) {
-  const next = !(await read($, uncommittedAtom))
-  await $.state.set(UNCOMMITTED, next)
-  await $.store.set('uncommitted', next)
+/** c: the next of what Changes compares with (`BASES`); kept between sessions, and read again. */
+async function nextChangesBase($: EngineInterface) {
+  const next = BASES[await read($, changesBaseAtom)].next
+  await $.state.set(CHANGES_BASE, next)
+  await $.store.set('changesBase', next)
   const { selected } = await read($, paneAtom)
   if (selected) await readChanges($, selected, false)
 }
@@ -2105,8 +2123,8 @@ function paneActions($: EngineInterface, surface: RenderSurface): PaneActions {
         return refresh()
       case 'read-changes':
         return readChanges($, effect.thread, true)
-      case 'uncommitted':
-        return toggleUncommitted($)
+      case 'base':
+        return nextChangesBase($)
       case 'open-diff':
         await setPane($, pane => (pane.selected === effect.thread ? { diff: { path: effect.file.path, top: 0 }, changesCursor: fileKey(effect.file.path) } : {}))
         return readDiff($, effect.thread, effect.file)
@@ -2225,7 +2243,7 @@ export const register: Register = (on, options) => {
       ...Object.values(TOOLS).map(spec => $.tool.register(spec)),
       loadStrip($),
       loadScope($),
-      loadUncommitted($),
+      loadChangesBase($),
       readHerdr($),
     ])
     stripper?.cancel()
@@ -2298,7 +2316,7 @@ export const register: Register = (on, options) => {
       return <Text dimColor>The Nexus pane needs a surface with text fields.</Text>
     }
     const draw: Draw = $.ui.resolve(e)
-    const [list, watch, live, shown, catalog, pane, now, scope, checkout, diff, uncommitted] = await Promise.all([
+    const [list, watch, live, shown, catalog, pane, now, scope, checkout, diff, changesBase] = await Promise.all([
       read($, listAtom),
       read($, watchAtom),
       read($, liveAtom),
@@ -2309,7 +2327,7 @@ export const register: Register = (on, options) => {
       read($, scopeAtom),
       read($, checkoutAtom),
       read($, diffAtom),
-      read($, uncommittedAtom),
+      read($, changesBaseAtom),
     ])
     // A drawing may not write: Esc out of a field or an overlay is taken up after it.
     if (!e.props.isFocused && (pane.mode !== 'normal' || pane.overlay) && !recovering) recovering = $.clock.after(0, () => void recover($))
@@ -2331,7 +2349,7 @@ export const register: Register = (on, options) => {
       cli,
       checkout,
       diff,
-      uncommitted,
+      changesBase,
     }
     const actions = paneActions($, e.surface)
     const tree =
