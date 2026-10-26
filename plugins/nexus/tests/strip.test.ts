@@ -169,4 +169,7 @@ test('a mark the control plane refuses says so in the pane, and the reply stays 
   const ui = await mount()
   expect(await ui.find({ type: 'Text', text: `The reply in ${REPLIED.id} was not marked seen, so it still shows as new: connect ECONNREFUSED.` })).toBeDefined()
   expect((await chips(await strip())).map(([key]) => key)).toContain(REPLIED.id)
+  // The polls after it leave that reply alone rather than ask again every five seconds.
+  await clock.advance(15_000)
+  expect(cli.runs.filter(argv => argv[0] === 'seen')).toHaveLength(1)
 })

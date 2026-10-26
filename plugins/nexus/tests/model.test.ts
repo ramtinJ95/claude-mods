@@ -26,6 +26,7 @@ import {
   parseClaudeConversation,
   parseCommand,
   parseSent,
+  parseStarted,
   parseDetail,
   parseFailure,
   parseHerdrTab,
@@ -217,6 +218,9 @@ describe('the console', () => {
     expect(isUnread({ lastReplyAt: 5, seenAt: null })).toBe(true)
     expect(isUnread({ lastReplyAt: 5, seenAt: 5 })).toBe(false)
     expect(isUnread({ lastReplyAt: null, seenAt: null })).toBe(false)
+    // A start is read only for its ID and title: a CLI before 0.10.0 still starts a thread.
+    const { lastReplyAt: _, seenAt: __, ...old } = THREADS[0]!
+    expect(parseStarted(old)).toMatchObject({ id: THREADS[0]!.id, lastReplyAt: null, seenAt: null })
   })
 
   test("previews keep the CLI's url and ports their preview; either missing is a contract error, and null ports mean unknown", () => {

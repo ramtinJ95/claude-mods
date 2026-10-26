@@ -113,7 +113,8 @@ export function parseThreads(json: unknown): NexusThreadRow[] {
 }
 
 export function parseStarted(json: unknown): NexusThread {
-  const thread = parseThread(json, 'start')
+  // Only the started thread's ID and title are read, so a CLI before 0.10.0 starts a thread without its stamps rather than failing after it.
+  const thread = parseThread(isRecord(json) ? { lastReplyAt: null, seenAt: null, ...json } : json, 'start')
   if (!thread) throw new Error('nexus start did not print a thread')
   return thread
 }

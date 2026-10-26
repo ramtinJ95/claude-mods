@@ -343,3 +343,17 @@ test('wait on an idle worker settles only when a second reading agrees, since a 
   expect(JSON.parse(String((await waiting).result))).toMatchObject({ settled: true, run: 'idle', reply: 'Adding `/healthz`.' })
   expect(reads()).toBe(2)
 })
+
+test('wait on a worker reads on through a failed reading, as a watch outlives an outage, and says so while it lasts', async ($, on) => {
+  const turn = CONVERSATION.entries.slice(0, 6)
+  const cli = fake({ threads: [WORKER], detail: WORKER_DETAIL, conversation: { ...CONVERSATION, entries: turn, working: true } })
+  const { clock } = await boot($, on, cli)
+  const waiting = $.tool.call({ tool: 'mcp__nexus__wait', thread: WORKER.id, timeout_seconds: 60 } as never)
+  await clock.settle()
+  cli.fail = { conversation: { exitCode: 2, error: 'connect ECONNREFUSED' } }
+  await clock.advance(2_000)
+  cli.fail = {}
+  cli.conversation = { ...CONVERSATION, entries: [...turn, { kind: 'reply', at: T0, text: 'Done.' }], working: false }
+  await clock.advance(2_000)
+  expect(JSON.parse(String((await waiting).result))).toMatchObject({ settled: true, run: 'idle' })
+})

@@ -516,8 +516,6 @@ async function poll($: EngineInterface) {
     if (detail.ok) {
       void recordVisit($, detail.value.thread)
       await patchRow($, detail.value)
-      // The person reads the reply in the pane: once every client counts it seen, the details read again drop it.
-      if (isUnread(detail.value.thread)) void markSeen($, thread).then(seen => seen && pollAgain($))
     }
     await update($, shownAtom, (shown): NexusShown =>
       detail.ok
@@ -532,7 +530,12 @@ async function poll($: EngineInterface) {
     if (detail.ok && changes && settleSessions(changes, detail.value.sessions, now) !== changes) {
       await changeSessions($, thread, was => settleSessions(was, detail.value.sessions, now))
     }
-    if (detail.ok && detail.value.conversation === 'claude') await readClaude($, thread, current)
+    // A worker's reply is drawn only once its transcript is read: until then the person has not seen it.
+    const isDrawn = !detail.ok || detail.value.conversation !== 'claude' || (await readClaude($, thread, current))
+    // The person reads the reply in the pane: once every client counts it seen, the details read again drop it.
+    if (detail.ok && isDrawn && isUnread(detail.value.thread) && refusedSeen.get(thread) !== detail.value.thread.lastReplyAt) {
+      void markSeen($, thread, detail.value.thread.lastReplyAt).then(seen => seen && pollAgain($))
+    }
   } finally {
     current.isBusy = false
     if (current.isAgain && poller === current) {
@@ -546,15 +549,16 @@ async function poll($: EngineInterface) {
  * The Claude Code worker transcript of the thread shown, as part of its poll, since `nexus watch` streams none: one
  * `nexus conversation`, which never wakes the pylon and reads it only while it runs. A failed read keeps the rows it had.
  */
-async function readClaude($: EngineInterface, thread: string, current: NonNullable<typeof poller>) {
+async function readClaude($: EngineInterface, thread: string, current: NonNullable<typeof poller>): Promise<boolean> {
   const got = await childJson($, ['conversation', thread], current.stopped)
-  if (!got || poller !== current || (await read($, paneAtom)).selected !== thread) return
+  if (!got || poller !== current || (await read($, paneAtom)).selected !== thread) return false
   const reading = parsed(got, parseClaudeConversation)
   await update($, claudeAtom, (was): NexusClaudeShown =>
     reading.ok
       ? { thread, ...reading.value, failure: null }
       : { ...(was?.thread === thread ? was : { thread, rows: [], dropped: 0, working: false, queued: [] }), failure: reading.failure.message },
   )
+  return reading.ok
 }
 
 /** Polls now, or once the poll under way ends, since that one may have read what was there before a change. */
@@ -781,6 +785,7 @@ async function showThread($: EngineInterface, thread: string) {
     return threadView(pane, thread)
   })
   if (left) void markSeen($, left)
+  refusedSeen.delete(thread)
   await followThread($, thread)
 }
 
@@ -801,18 +806,24 @@ async function saveStrip($: EngineInterface, change: (strip: NexusStrip) => Nexu
 
 /** The threads whose `nexus seen` runs, so a poll that comes again before it ends does not start a second. */
 const seeing = new Set<string>()
+/** The reply whose mark failed, by thread: polls leave it until another reply comes or the thread is opened again. */
+const refusedSeen = new Map<string, number | null>()
 
 /**
  * Marks the thread's latest reply seen on the control plane, for every client. `nexus seen` marks the reply latest when
  * it runs, since the CLI takes no reply time to hold the mark to; the pane draws a reply within a moment of its arrival.
- * A failure says so in the pane, as the reply stays new everywhere. Whether it marked.
+ * A failure says so in the pane, as the reply stays new everywhere, and polls do not ask again for that reply. Whether it marked.
  */
-async function markSeen($: EngineInterface, thread: string): Promise<boolean> {
+async function markSeen($: EngineInterface, thread: string, reply: number | null = null): Promise<boolean> {
   if (seeing.has(thread)) return false
   seeing.add(thread)
   try {
     const got = await nexus($, ['seen', thread])
-    if (got.ok) return true
+    if (got.ok) {
+      refusedSeen.delete(thread)
+      return true
+    }
+    refusedSeen.set(thread, reply)
     const failure = newer(got.failure, 'seen', 'marking a reply seen', '0.10.0')
     await setPane($, () => ({ notice: { text: `The reply in ${thread} was not marked seen, so it still shows as new: ${sentence(failure.message)}`, tone: 'error' } }))
     return false
@@ -1707,10 +1718,12 @@ async function waitForClaude($: EngineInterface, thread: string, first: ClaudeTh
   let { detail, reading } = first
   let sawWorking = false
   let wasSettled = false
+  /** Why the last reading failed, while it fails: the wait goes on with the reading before, as a watch outlives an outage. */
+  let outage: string | null = null
   for (;;) {
     const state = claudeState(detail, reading)
     sawWorking ||= reading.working
-    const isDone = detail.worker?.state === 'failed' || detail.worker?.state === 'stalled' || isSettled(state, reading.rows, sawWorking)
+    const isDone = outage === null && (detail.worker?.state === 'failed' || detail.worker?.state === 'stalled' || isSettled(state, reading.rows, sawWorking))
     const settled = isDone && (wasSettled || sawWorking)
     const now = await $.clock.now()
     if (settled || signal.aborted || now >= until) {
@@ -1725,6 +1738,7 @@ async function waitForClaude($: EngineInterface, thread: string, first: ClaudeTh
           ...(signal.aborted ? { cancelled: true } : {}),
           ...stateFields(state),
           ...workerFields(detail),
+          ...(outage ? { outage } : {}),
           ...(human ? { needs_human: human } : {}),
           reply: reply ? leftOut(reply.tail, reply.dropped) : null,
         },
@@ -1739,7 +1753,13 @@ async function waitForClaude($: EngineInterface, thread: string, first: ClaudeTh
     signal.removeEventListener('abort', stop)
     if (signal.aborted) continue
     const next = await claudeThread($, thread, signal)
-    if (!next.ok) return signal.aborted ? { ok: true, value: { thread, settled: false, cancelled: true } } : next
+    if (!next.ok && signal.aborted) return { ok: true, value: { thread, settled: false, cancelled: true } }
+    if (!next.ok && next.failure.kind !== 'unreachable' && next.failure.kind !== 'failed') return next
+    if (!next.ok) {
+      outage = next.failure.message
+      continue
+    }
+    outage = null
     if (!next.value) return failed(`${thread} is no longer a Claude Code worker thread`)
     detail = next.value.detail
     reading = next.value.reading

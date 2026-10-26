@@ -62,6 +62,16 @@ test("a worker's Actions menu offers no harness abort or retry, and Pylon shows 
   expect(diagnostic?.props.color).toBe('error')
 })
 
+test("a worker's new reply is marked seen only once its transcript is read and drawn", async ($, on) => {
+  const unread = { ...WORKER_DETAIL, attention: 'reply', thread: { ...WORKER, lastReplyAt: T0, seenAt: T0 - 60_000 } }
+  const { cli, clock } = await opened($, on, { detail: unread, fail: { conversation: { exitCode: 2, error: 'connect ECONNREFUSED' } } })
+  expect(conversations(cli.spawns)).toHaveLength(1)
+  expect(cli.runs.filter(argv => argv[0] === 'seen')).toEqual([])
+  cli.fail = {}
+  await clock.advance(5_000)
+  expect(cli.runs.filter(argv => argv[0] === 'seen')).toEqual([['seen', '--json', WORKER.id]])
+})
+
 test('a harness thread reads no transcript: its watch streams the conversation', async ($, on) => {
   const cli = fake()
   const { nexus, clock } = await boot($, on, cli)
