@@ -10,6 +10,7 @@ type Draw = { Box: ElementConstructor<BoxProps>; Text: ElementConstructor<TextPr
 
 const LOOK: Record<Chip['kind'], { glyph: string; color: string }> = {
   failed: { glyph: '✕', color: 'error' },
+  decision: { glyph: '!', color: 'warning' },
   parked: { glyph: '✕', color: 'error' },
   reply: { glyph: '●', color: 'success' },
   working: { glyph: '◉', color: 'planMode' },

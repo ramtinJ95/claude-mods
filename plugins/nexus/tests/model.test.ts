@@ -522,7 +522,7 @@ describe('Claude Code worker threads', () => {
     expect(taken.queued).toEqual([])
   })
 
-  test('a prompt from elsewhere, a background task, a notice and a record Nexus does not know show as notices; the entries left out count', () => {
+  test('a prompt from elsewhere, a background task, a notice, a pull request once by its URL and a record Nexus does not know show as notices; the entries left out count', () => {
     const reading = parseClaudeConversation({
       kind: 'claude',
       session: null,
@@ -535,6 +535,9 @@ describe('Claude Code worker threads', () => {
         { kind: 'notice', at: 3, tone: 'error', text: 'API Error: 529 overloaded' },
         { kind: 'record', at: null, type: 'mystery', summary: 'mystery: {"a":1}' },
         { kind: 'turn', at: 4, durationMs: 9_000 },
+        { kind: 'pull-request', at: 5, number: 41, url: 'https://github.com/me/web/pull/41', repository: 'me/web' },
+        { kind: 'pull-request', at: 6, number: 41, url: 'https://github.com/me/web/pull/41', repository: 'me/web' },
+        { kind: 'pull-request', at: 7, number: 42, url: 'https://github.com/me/web/pull/42', repository: 'me/web' },
       ],
     })
     expect(reading.rows).toEqual([
@@ -542,6 +545,8 @@ describe('Claude Code worker threads', () => {
       { kind: 'notice', tone: 'dim', text: 'Background task completed: Agent "review" finished\nLooks good.', entry: 13 },
       { kind: 'notice', tone: 'error', text: 'API Error: 529 overloaded', entry: 14 },
       { kind: 'notice', tone: 'dim', text: 'mystery: {"a":1}', entry: 15 },
+      { kind: 'notice', tone: 'dim', text: 'Opened pull request #41: https://github.com/me/web/pull/41', entry: 17 },
+      { kind: 'notice', tone: 'dim', text: 'Opened pull request #42: https://github.com/me/web/pull/42', entry: 19 },
     ])
     expect(reading.dropped).toBe(12)
     expect(() => parseClaudeConversation({ entries: [] })).toThrow("nexus conversation printed a Claude worker's conversation, which docs/cli.md requires")

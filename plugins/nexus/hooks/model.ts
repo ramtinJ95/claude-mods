@@ -87,7 +87,7 @@ function parseThread(raw: unknown, command: string): NexusThread | undefined {
   }
 }
 
-const ATTENTION = new Set<string>(['failed', 'parked', 'reply', 'working', 'waiting'])
+const ATTENTION = new Set<string>(['failed', 'decision', 'parked', 'reply', 'working', 'waiting'])
 
 /** A row's or a detail's `attention`, required since CLI 0.10.0. A value this mod does not know asks nothing of it. */
 function parseAttention(raw: Raw, command: string, id: string): NexusAttention {
@@ -190,6 +190,7 @@ export function parseDetail(json: unknown): NexusDetail {
     agent: isRecord(json.agent) ? { parkedTasks: num(json.agent.parkedTasks) } : null,
     conversation: isRecord(json.claudeWorker) ? 'claude' : isRecord(json.thread) && typeof json.thread.conversationId === 'string' ? 'agent' : null,
     worker: isRecord(json.claudeWorker) ? { state: str(json.claudeWorker.state), model: strOrNull(json.claudeWorker.model), message: strOrNull(json.claudeWorker.message) } : null,
+    decisions: isRecord(json.review) && isRecord(json.review.phase) && json.review.phase.kind === 'needs-person' ? list(json.review.phase.reasons).filter((reason): reason is string => typeof reason === 'string') : [],
     desired: wants,
     attach: json.attach,
   }
@@ -443,8 +444,8 @@ export function appendEntry(rows: readonly NexusRow[], entry: WatchEntry): Nexus
 }
 
 /** `rows` with the call `id` settled by its result, in place. A result whose call is not in the context still shows, as the dashboard shows it. */
-function settle(rows: NexusRow[], id: string, name: string, output: string, isError: boolean, patch: string | null, entry?: number): NexusRow[] {
-  const settled = { outcome: isError ? ('error' as const) : ('ok' as const), output: keepTail(output, OUTPUT_CHARS), lines: lineCount(output), patch }
+function settle(rows: NexusRow[], id: string, name: string, output: string, isError: boolean, patch: string | null, entry?: number, outputChars = OUTPUT_CHARS): NexusRow[] {
+  const settled = { outcome: isError ? ('error' as const) : ('ok' as const), output: keepTail(output, outputChars), lines: lineCount(output), patch }
   const at = rows.findLastIndex(row => row.kind === 'tool' && row.id === id)
   const row = rows[at]
   if (row?.kind === 'tool') rows[at] = { ...row, ...settled }
@@ -466,7 +467,7 @@ function modelIn(model: string | null, entry: WatchEntry): string | null {
 const KEPT_ROWS = 400
 
 /** `rows` cut to the tail kept, counting what the cut dropped onto `dropped`. */
-function kept(rows: NexusRow[], dropped: number): Pick<NexusWatch, 'rows' | 'dropped'> {
+export function kept(rows: NexusRow[], dropped: number): Pick<NexusWatch, 'rows' | 'dropped'> {
   const cut = Math.max(0, rows.length - KEPT_ROWS)
   return { rows: rows.slice(cut), dropped: dropped + cut }
 }
@@ -547,19 +548,27 @@ const CLAUDE_TOOLS: Record<string, (input: Raw) => { name: string; args: Raw }> 
   Glob: input => ({ name: 'find', args: input }),
 }
 
-/** A Claude Code worker's transcript as the pane keeps it: the rows, the entries left out before them, the run and its queue. */
-export type ClaudeReading = { rows: NexusRow[]; dropped: number; working: boolean; queued: string[]; readAt: number | null }
+/**
+ * A Claude Code worker's transcript: every row of the CLI's window, the entries left out before it, the run and its
+ * queue, and whether a turn shows in it (`hasTurn`: a prompt Claude took, a reply, a tool call or a turn's end).
+ */
+export type ClaudeReading = { rows: NexusRow[]; dropped: number; working: boolean; queued: string[]; readAt: number | null; hasTurn: boolean }
+
+const TURN_KINDS = new Set(['prompt', 'reply', 'tool', 'turn'])
 
 /**
  * `conversation --json` for a Claude Code worker thread (CLI 0.17.0), its entries folded into rows as a watch's are: a
  * prompt from the person or a slash command as theirs, a reply as an answer, a tool call settled by the result that
- * names it, and the rest as notices, a record of a kind the CLI does not know included. A queue operation moves only
- * the queue, which Claude takes from by text, or its oldest without one. An entry kind this mod does not know is skipped.
+ * names it, and the rest as notices, a record of a kind the CLI does not know included. A pull request Claude opened
+ * shows once, by its URL, since Claude Code writes its record again with each save of the session (CLI 0.19.0). A queue
+ * operation moves only the queue, which Claude takes from by text, or its oldest without one. An entry kind this mod
+ * does not know is skipped. Each tool result keeps its last `outputChars`, the pane's bound unless a caller asks for more.
  */
-export function parseClaudeConversation(json: unknown): ClaudeReading {
+export function parseClaudeConversation(json: unknown, outputChars = OUTPUT_CHARS): ClaudeReading {
   if (!isRecord(json) || json.kind !== 'claude' || !Array.isArray(json.entries)) throw contractError('conversation', "a Claude worker's conversation")
   const rows: NexusRow[] = []
   const queued: string[] = []
+  const opened = new Set<string>()
   const dropped = num(json.dropped)
   // Each row is keyed by its entry's place in the whole transcript, so a window that slides past an entry no row shows moves no key.
   const push = (at: number, row: NexusRow) => rows.push({ ...row, entry: dropped + at })
@@ -580,7 +589,7 @@ export function parseClaudeConversation(json: unknown): ClaudeReading {
         break
       }
       case 'result':
-        settle(rows, str(entry.toolUseId), 'tool', str(entry.output), entry.isError === true, null, dropped + at)
+        settle(rows, str(entry.toolUseId), 'tool', str(entry.output), entry.isError === true, null, dropped + at, outputChars)
         break
       case 'task':
         push(at, { kind: 'notice', tone: 'dim', text: [`Background task ${str(entry.status)}: ${str(entry.summary)}`, strOrNull(entry.result)].filter(Boolean).join('\n') })
@@ -601,10 +610,15 @@ export function parseClaudeConversation(json: unknown): ClaudeReading {
       case 'record':
         push(at, { kind: 'notice', tone: 'dim', text: str(entry.summary) })
         break
+      case 'pull-request':
+        if (opened.has(str(entry.url))) break
+        opened.add(str(entry.url))
+        push(at, { kind: 'notice', tone: 'dim', text: `Opened pull request #${num(entry.number)}: ${str(entry.url)}` })
+        break
     }
   }
-  const tail = kept(rows, dropped)
-  return { ...tail, working: json.working === true, queued, readAt: typeof json.readAt === 'number' ? json.readAt : null }
+  const hasTurn = dropped > 0 || json.entries.some(entry => isRecord(entry) && TURN_KINDS.has(str(entry.kind)))
+  return { rows, dropped, working: json.working === true, queued, readAt: typeof json.readAt === 'number' ? json.readAt : null, hasTurn }
 }
 
 /**
@@ -631,10 +645,11 @@ export function claudeWatch(watch: NexusWatch, claude: NexusClaudeShown | null, 
  * Whether a worker's reading means it is done for now: it can no longer run (archived, deleted, parked, a failed
  * pylon), or its session's turn is over with nothing queued, even when the transcript ends at a prompt it never answered.
  */
-export function isWorkerIdle(state: NexusRunState): boolean {
-  if (state.status === 'archived' || state.status === 'deleted' || state.run === 'parked' || state.pylon === 'failed' || state.failed !== null) return true
-  return state.run === 'idle' && state.queued === 0
-}
+export const isWorkerIdle = (state: NexusRunState) => isWorkerDone(state) || (state.run === 'idle' && state.queued === 0)
+
+/** Whether a worker can no longer run: archived, deleted, parked or its pylon failed, whatever its launch says. */
+export const isWorkerDone = (state: NexusRunState) =>
+  state.status === 'archived' || state.status === 'deleted' || state.run === 'parked' || state.pylon === 'failed' || state.failed !== null
 
 /**
  * Whether the pane's watch of `thread` has drawn the reply the details name, as pi-nexus judges it: the watch runs on
@@ -790,6 +805,7 @@ export function threadState(thread: Pick<NexusThread, 'status' | 'agentTurnRunni
 /** The word a list row shows for what an open thread asks of the person; working is the thread's state's own. */
 const ATTENTION_LOOK: Partial<Record<Exclude<NexusAttention, null>, [label: string, tone: Tone]>> = {
   failed: ['failed', 'bad'],
+  decision: ['needs you', 'busy'],
   parked: ['parked', 'bad'],
   reply: ['new reply', 'ok'],
   waiting: ['waiting', 'busy'],
@@ -1493,12 +1509,13 @@ function addProject(args: readonly string[], invalid: (reason: string) => NexusC
 export type Chip = { thread: NexusThreadRow; kind: Exclude<NexusAttention, null>; note: string }
 
 /** docs/cli.md's order of attention, most urgent first, which the strip keeps. */
-const ATTENTION_RANK: Record<Chip['kind'], number> = { failed: 0, parked: 1, reply: 2, working: 3, waiting: 4 }
+const ATTENTION_RANK: Record<Chip['kind'], number> = { failed: 0, decision: 1, parked: 2, reply: 3, working: 4, waiting: 5 }
 
 /**
  * The open threads whose attention the control plane says asks for the person or is busy, in its order: a failed pylon
- * or Claude worker launch and parked tasks, a reply no client marked seen, the agents at work with how long since the
- * person's message started them, and a session waiting for input. The rest stay out of the strip.
+ * or Claude worker launch, a review that ended for the person's decision and parked tasks, a reply no client marked
+ * seen, the agents at work with how long since the person's message started them, and a session waiting for input. The
+ * rest stay out of the strip.
  */
 export function stripChips(threads: readonly NexusThreadRow[], now: number): Chip[] {
   const note = (thread: NexusThreadRow, kind: Chip['kind']) =>

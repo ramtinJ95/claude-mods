@@ -551,7 +551,7 @@ export function ListView(draw: Draw, scene: Scene, actions: PaneActions) {
         <Button key={thread.id} plain autoFocus={isCursor && !isFiltering ? true : undefined} onPress={() => actions.effect({ kind: 'open', thread: thread.id })}>
           {Pointer(draw, isCursor)}
           {Dot(draw, tone)}
-          <Text bold={isCursor || label === 'new reply'} color={isCursor ? 'suggestion' : 'text'}>{` ${title}`}</Text>
+          <Text bold={isCursor || label === 'new reply' || label === 'needs you'} color={isCursor ? 'suggestion' : 'text'}>{` ${title}`}</Text>
           {' '.repeat(Math.max(1, room - cells(title)))}
           {hasWord ? <Text color={LOOK[tone]}>{`  ${word}`}</Text> : ''}
           <Text color="subtle">{`  ${age.padStart(6)}`}</Text>
@@ -1899,6 +1899,9 @@ function PylonBody(draw: Draw, scene: Scene, actions: PaneActions, area: number,
       {kv('Agent', thread.agentTurnRunning ? 'turn running' : since(thread.lastAgentActivityAt, scene.now), 'agent')}
       {detail.worker && kv('Worker', `Claude Code · ${detail.worker.model ?? 'model unknown'} · ${detail.worker.state}`, 'worker')}
       {detail.worker?.message && <Text color={detail.worker.state === 'started' ? 'subtle' : 'error'}>{detail.worker.message.trimEnd().split('\n').slice(-WORKER_LINES).join('\n')}</Text>}
+      {detail.decisions.map((reason, at) => (
+        <Text key={`decision-${at}`} color="warning">{`Needs you: ${reason}`}</Text>
+      ))}
       <Text color="subtle">{pylon.id}</Text>
       {pylon.failed && <Text color="error">{`The planner gave up: ${pylon.failed}`}</Text>}
     </Box>,

@@ -219,6 +219,8 @@ export type Fake = {
   nextPane: string
   /** What `nexus --version` prints after `nexus `. */
   version: string
+  /** What the next `nexus --version` calls print in turn, before `version`; null fails the call. */
+  versions?: (string | null)[]
   /** Every herdr argv, `herdr` dropped. */
   herdr: string[][]
   /** A herdr command, by its two words, that fails with this message. */
@@ -273,10 +275,15 @@ function withPreview(detail: unknown, port: number, preview: typeof OPENED | nul
   }
 }
 
-/** `thread` as the control plane leaves it once `seen` marks its latest reply: its attention what follows `reply`. */
-function markedSeen<T>(thread: T): T {
+/**
+ * `thread` as the control plane leaves it once `seen` marks its latest reply, or with `upTo` (`--last-reply-at`) no reply
+ * after that one and never lower than it was: its attention what follows `reply` once nothing is left unread.
+ */
+function markedSeen<T>(thread: T, upTo: number | null): T {
   const one = thread as typeof THREAD
-  return { ...one, seenAt: one.lastReplyAt, attention: one.attention === 'reply' ? (one.agentTurnRunning ? 'working' : null) : one.attention } as T
+  const seenAt = upTo === null ? one.lastReplyAt : Math.max(one.seenAt ?? upTo, Math.min(upTo, one.lastReplyAt ?? upTo))
+  const isRead = seenAt === one.lastReplyAt
+  return { ...one, seenAt, attention: one.attention === 'reply' && isRead ? (one.agentTurnRunning ? 'working' : null) : one.attention } as T
 }
 
 const reply = (json: unknown) => ({ value: { exitCode: 0, stdout: JSON.stringify(json), stderr: '', isStdoutTruncated: false, isStderrTruncated: false } })
@@ -328,7 +335,13 @@ export async function boot(...[$, on, cli]: [...Body, Fake]) {
       return reply(argv[0] === 'tab' ? { id: 'cli:tab:create', result: { tab: { tab_id: 'w9:t3' }, root_pane: { pane_id: 'w9:p7' } } } : { id: 'cli:pane:run', result: { type: 'ok' } })
     }
     cli.runs.push(argv)
-    if (argv[0] === '--version') return { value: { exitCode: 0, stdout: `nexus ${cli.version}\n`, stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
+    if (argv[0] === '--version') {
+      const late = cli.slow['--version']
+      if (late) await clock.sleep(Math.min(late, e.init?.timeoutMs ?? 30_000))
+      if (late && late > (e.init?.timeoutMs ?? 30_000)) throw new Error(`timed out after ${e.init?.timeoutMs} ms`)
+      const printed = cli.versions?.length ? (cli.versions.shift() as string | null) : cli.version
+      return { value: printed === null ? { exitCode: 1, stdout: '', stderr: 'nexus: cannot run\n', isStdoutTruncated: false, isStderrTruncated: false } : { exitCode: 0, stdout: `nexus ${printed}\n`, stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
+    }
     // `session open` and `session close` are slowed or failed by both words.
     const verb = argv[0] === 'session' ? `session ${argv[1]}` : argv[0]!
     const late = cli.slow[verb]
@@ -342,10 +355,13 @@ export async function boot(...[$, on, cli]: [...Body, Fake]) {
     const failure = cli.fail[verb]
     if (failure) return { value: { exitCode: failure.exitCode, stdout: '', stderr: `${JSON.stringify({ error: failure.error, kind: 'failed', status: 500 })}\n`, isStdoutTruncated: false, isStderrTruncated: false } }
     if (argv[0] === 'seen') {
-      const id = argv.at(-1)
-      cli.threads = cli.threads.map(one => ((one as typeof THREAD).id === id ? markedSeen(one) : one))
+      // `nexus seen --json <thread> [--last-reply-at=<ms>]`.
+      const id = argv.find(arg => arg.startsWith('th-'))
+      const flag = argv.find(arg => arg.startsWith('--last-reply-at='))
+      const upTo = flag === undefined ? null : Number(flag.slice('--last-reply-at='.length))
+      cli.threads = cli.threads.map(one => ((one as typeof THREAD).id === id ? markedSeen(one, upTo) : one))
       const detail = cli.detail as typeof DETAIL
-      if (detail.thread.id === id) cli.detail = { ...markedSeen(detail), thread: markedSeen(detail.thread) }
+      if (detail.thread.id === id) cli.detail = { ...markedSeen(detail, upTo), thread: markedSeen(detail.thread, upTo) }
     }
     if (argv[0] === 'project') {
       // `nexus project add`, read as the CLI's strict parseArgs reads it, its project built from its arguments.

@@ -1,5 +1,6 @@
 import { expect, mock, test, type TestBody } from 'claude-code/testing'
 
+import { parseClaudeConversation } from '../hooks/model'
 import { projectArgs } from '../hooks/tools'
 import { register } from '../hooks/register'
 
@@ -245,10 +246,10 @@ test('project tools reject malformed contracts, skip unknown node states, and ex
   expect(await add({ node: 'chosen' })).toMatchObject({ deny: 'nexus (invalid): nexus has no project add command: adding a project needs Nexus CLI 0.7.0 or later (nexus --version). Update the nexus CLI.' })
 })
 
-function projectHandler() {
-  let handler: (engine: unknown, input: Record<string, unknown>, next: { signal: AbortSignal }) => Promise<unknown> = async () => { throw new Error('project_add was not registered') }
+function projectHandler(tool = 'mcp__nexus__project_add') {
+  let handler: (engine: unknown, input: Record<string, unknown>, next: { signal: AbortSignal }) => Promise<unknown> = async () => { throw new Error(`${tool} was not registered`) }
   register(((event: string, matcher: unknown, run: typeof handler) => {
-    if (event === 'tool.call' && (matcher as { tool: string }).tool === 'mcp__nexus__project_add') handler = run
+    if (event === 'tool.call' && (matcher as { tool: string }).tool === tool) handler = run
     return { catch() {} }
   }) as never, {})
   return handler
@@ -375,4 +376,147 @@ test('a deadline too near for the second reading ends the wait unsettled, never 
   const waited = JSON.parse(String((await waiting).result))
   expect(waited).toMatchObject({ settled: false, timed_out: true })
   expect(cli.spawns.filter(argv => argv[0] === 'conversation')).toHaveLength(1)
+})
+
+const waitResult = async (call: Promise<unknown>) => JSON.parse(String(((await call) as { result: string }).result)) as Record<string, unknown>
+
+test('wait on a worker still launching waits for a first turn, and a stalled launch ends the wait with its diagnostic', async ($, on) => {
+  const launching = { ...WORKER_DETAIL, claudeWorker: { model: 'claude-opus-5-5', state: 'starting' } }
+  const cli = fake({ threads: [WORKER], detail: launching, conversation: { ...CONVERSATION, entries: [], working: false, readAt: null } })
+  const { clock } = await boot($, on, cli)
+  let isDone = false
+  const waiting = $.tool.call({ tool: 'mcp__nexus__wait', thread: WORKER.id, timeout_seconds: 60 } as never).then(got => ((isDone = true), got))
+  await clock.advance(6_000)
+  expect(isDone).toBe(false)
+  // Started, but no turn in the transcript yet: still idle for want of one.
+  cli.detail = WORKER_DETAIL
+  await clock.advance(4_000)
+  expect(isDone).toBe(false)
+  cli.conversation = { ...CONVERSATION, entries: CONVERSATION.entries.slice(0, 2), working: false }
+  await clock.advance(4_000)
+  expect(await waitResult(waiting)).toMatchObject({ settled: true, run: 'idle', worker: { state: 'started' }, reply: 'Adding `/healthz`.' })
+  cli.detail = { ...WORKER_DETAIL, claudeWorker: { model: 'claude-opus-5-5', state: 'stalled', message: 'pane line 20' } }
+  cli.conversation = { ...CONVERSATION, entries: [], working: false, readAt: null }
+  const reads = cli.spawns.length
+  expect(await waitResult($.tool.call({ tool: 'mcp__nexus__wait', thread: WORKER.id, timeout_seconds: 60 } as never))).toMatchObject({ settled: true, worker: { state: 'stalled', message: 'pane line 20' }, reply: null })
+  expect(cli.spawns.slice(reads).map(argv => argv[0])).toEqual(['show', 'conversation'])
+})
+
+test('a reading that outlasts the deadline ends the wait timed out with the last state, and the first reading counts inside it', async ($, on) => {
+  const cli = fake({ threads: [WORKER], detail: WORKER_DETAIL, conversation: { ...CONVERSATION, working: true } })
+  const { clock } = await boot($, on, cli)
+  let isDone = false
+  const waiting = $.tool.call({ tool: 'mcp__nexus__wait', thread: WORKER.id, timeout_seconds: 5 } as never).then(got => ((isDone = true), got))
+  await clock.settle()
+  cli.slow = { conversation: 30_000 }
+  await clock.advance(4_900)
+  expect(isDone).toBe(false)
+  await clock.advance(100)
+  expect(await waitResult(waiting)).toMatchObject({ thread: WORKER.id, settled: false, timed_out: true, run: 'working', worker: { state: 'started' } })
+  cli.slow = { show: 4_000 }
+  const late = $.tool.call({ tool: 'mcp__nexus__wait', thread: WORKER.id, timeout_seconds: 5 } as never)
+  await clock.advance(4_000)
+  expect(await waitResult(late)).toMatchObject({ settled: false, timed_out: true, run: 'working' })
+})
+
+test('cancelling a wait on a worker, asleep or mid-reading, returns it unsettled with the last state and reply', async () => {
+  // The kit's $.tool.call has no abort option; give the registered handler a real signal at its process boundary.
+  const handler = projectHandler('mcp__nexus__wait')
+  const idle = { ...CONVERSATION, entries: CONVERSATION.entries.slice(0, 2), working: false }
+  for (const phase of ['asleep', 'reading']) {
+    const controller = new AbortController()
+    let spawned = 0
+    let reading = () => {}
+    const third = new Promise<void>(resolve => { reading = resolve })
+    const engine = {
+      clock: {
+        now: async () => T0,
+        // Only the wait between readings ends, and only when the cancel is to come during the next reading.
+        after: (ms: number, fire: () => void) => (phase === 'reading' && ms === 2_000 && void Promise.resolve().then(fire), { cancel() {} }),
+      },
+      process: { spawn: ({ argv }: { argv: string[] }) => {
+        spawned++
+        if (spawned > 2) {
+          reading()
+          return { next: () => new Promise(() => {}), return: async () => ({ done: true }) }
+        }
+        return (async function* () {
+          yield { stream: 'stdout' as const, text: JSON.stringify(argv[1] === 'show' ? WORKER_DETAIL : idle) }
+          return { code: 0, signal: null }
+        })()
+      } },
+    }
+    const call = handler(engine, { thread: WORKER.id, timeout_seconds: 60 }, { signal: controller.signal })
+    if (phase === 'reading') await third
+    else for (let tick = 0; tick < 200; tick++) await Promise.resolve()
+    controller.abort()
+    const got = JSON.parse(String(((await call) as { result: string }).result))
+    expect(got).toMatchObject({ thread: WORKER.id, settled: false, cancelled: true, status: 'active', run: 'idle', worker: { state: 'started' }, reply: 'Adding `/healthz`.' })
+    expect(got.timed_out).toBeUndefined()
+  }
+})
+
+test("read and wait on a worker use the CLI's whole transcript window, not the rows the pane keeps", async ($, on) => {
+  const notices = Array.from({ length: 401 }, (_, at) => ({ kind: 'notice', at: T0 - 50_000 + at, tone: 'info', text: `n${at}` }))
+  const entries = [CONVERSATION.entries[0], ...notices, { kind: 'reply', at: T0, text: 'All done.' }]
+  const cli = fake({ threads: [WORKER], detail: WORKER_DETAIL, conversation: { ...CONVERSATION, entries, working: false } })
+  const { clock } = await boot($, on, cli)
+  const read = await waitResult($.tool.call({ tool: 'mcp__nexus__read', thread: WORKER.id } as never))
+  expect(read.conversation).toMatch(/^> \/poteto-mode add a health check\n\nn0\n/)
+  const waiting = $.tool.call({ tool: 'mcp__nexus__wait', thread: WORKER.id, timeout_seconds: 60 } as never)
+  await clock.advance(2_000)
+  expect(await waitResult(waiting)).toMatchObject({ settled: true, reply: 'All done.' })
+})
+
+test('a worker that can no longer run settles at once, even while its launch is still starting', async ($, on) => {
+  const starting = { ...WORKER_DETAIL, claudeWorker: { model: 'claude-opus-5-5', state: 'starting' } }
+  const empty = { ...CONVERSATION, entries: [], working: false, readAt: null }
+  const failedPylon = { ...starting, pylon: { ...WORKER_DETAIL.pylon, actualState: 'failed', failed: 'the VM did not boot' } }
+  const cli = fake({ threads: [WORKER], detail: failedPylon, conversation: empty })
+  await boot($, on, cli)
+  const wait = () => waitResult($.tool.call({ tool: 'mcp__nexus__wait', thread: WORKER.id, timeout_seconds: 60 } as never))
+  expect(await wait()).toMatchObject({ settled: true, pylon: 'failed', worker: { state: 'starting' }, needs_human: 'The pylon failed. A human must retry it with /nexus retry-pylon.' })
+  cli.detail = { ...starting, thread: { ...WORKER, status: 'archived' } }
+  expect(await wait()).toMatchObject({ settled: true, status: 'archived' })
+})
+
+test("a malformed show's version check stays inside the wait's deadline", async ($, on) => {
+  const { attention: _, ...malformed } = WORKER_DETAIL
+  const cli = fake({ threads: [WORKER], printed: { show: malformed }, slow: { '--version': 4_000 } })
+  const { clock } = await boot($, on, cli)
+  let isDone = false
+  const waiting = $.tool.call({ tool: 'mcp__nexus__wait', thread: WORKER.id, timeout_seconds: 1 } as never).then(got => ((isDone = true), got))
+  await clock.advance(1_000)
+  expect(isDone).toBe(true)
+  expect(await waitResult(waiting)).toEqual({ thread: WORKER.id, settled: false, timed_out: true })
+})
+
+test('read gives a long tool result whole within the overall tail, which the pane still cuts to its own bound', async ($, on) => {
+  const output = `DIAG: first line of the failure\n${'x'.repeat(3_990)}`
+  const entries = [
+    CONVERSATION.entries[0],
+    { kind: 'tool', at: T0 - 5_000, id: 'toolu_9', name: 'Bash', input: { command: 'npm test' } },
+    { kind: 'result', at: T0 - 4_000, toolUseId: 'toolu_9', output, isError: true },
+    { kind: 'reply', at: T0, text: 'The tests fail.' },
+  ]
+  const cli = fake({ threads: [WORKER], detail: WORKER_DETAIL, conversation: { ...CONVERSATION, entries, working: false } })
+  await boot($, on, cli)
+  const read = await waitResult($.tool.call({ tool: 'mcp__nexus__read', thread: WORKER.id } as never))
+  expect(read.conversation).toContain(`Bash(npm test)\n${output}`)
+  expect((parseClaudeConversation({ ...CONVERSATION, entries }).rows[1] as { output: string }).output).not.toContain('DIAG')
+})
+
+test('start begins a Claude Code worker with its model on the node asked for, and names the CLI an old one needs', async ($, on) => {
+  const cli = fake()
+  await boot($, on, cli)
+  const start = (input: Record<string, unknown>) => $.tool.call({ tool: 'mcp__nexus__start', project: 'web', ...input } as never)
+  const started = (await start({ message: 'add a health check', claude: true, model: 'claude-sonnet-5-5', node: 'testbench' })) as { result: string }
+  expect(JSON.parse(started.result)).toEqual({ id: 'th-123456789abc', project: 'web', title: 'New one' })
+  expect(cli.runs.filter(argv => argv[0] === 'start')).toEqual([['start', '--json', '--project=web', '--claude=add a health check', '--model=claude-sonnet-5-5', '--node=testbench']])
+  await start({ message: 'fix the login form', title: 'Login' })
+  expect(cli.runs.filter(argv => argv[0] === 'start').at(-1)).toEqual(['start', '--json', '--project=web', '--title=Login', '--message=fix the login form'])
+  expect(await start({ message: 'fix it', model: 'claude-sonnet-5-5' })).toEqual({ deny: 'model needs claude: true' })
+  cli.version = '0.14.0'
+  cli.fail.start = { exitCode: 64, error: "Unknown option '--claude'" }
+  expect(await start({ message: 'add a health check', claude: true })).toEqual({ deny: 'nexus (invalid): nexus is 0.14.0: starting a Claude Code worker needs Nexus CLI 0.15.0 or later (nexus --version)' })
 })

@@ -24,7 +24,7 @@ export type NexusThread = {
 }
 
 /** What a thread asks of the person, the first that holds in this order: `attention` in docs/cli.md. */
-export type NexusAttention = 'failed' | 'parked' | 'reply' | 'working' | 'waiting' | null
+export type NexusAttention = 'failed' | 'decision' | 'parked' | 'reply' | 'working' | 'waiting' | null
 
 /** A `threads` row: the thread with its pylon's state and what the planner wants of the pylon. */
 export type NexusThreadRow = NexusThread & {
@@ -193,6 +193,8 @@ export type NexusDetail = {
   conversation: 'agent' | 'claude' | null
   /** A Claude Code worker thread's launch: its state, such as `started` or `stalled`, the model asked for, and a failure's diagnostic. */
   worker: { state: string; model: string | null; message: string | null } | null
+  /** Why the thread's review ended for the person (CLI 0.18.0), its attention then `decision`; empty otherwise. */
+  decisions: string[]
   desired: NexusDesired
   /** The command that attaches to the pylon's Herdr sessions from a shell in the pylon. */
   attach: string
