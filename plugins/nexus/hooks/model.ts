@@ -87,7 +87,7 @@ function parseThread(raw: unknown, command: string): NexusThread | undefined {
   }
 }
 
-const ATTENTION = new Set<string>(['failed', 'parked', 'reply', 'working', 'waiting'])
+const ATTENTION = new Set<string>(['failed', 'decision', 'parked', 'reply', 'working', 'waiting'])
 
 /** A row's or a detail's `attention`, required since CLI 0.10.0. A value this mod does not know asks nothing of it. */
 function parseAttention(raw: Raw, command: string, id: string): NexusAttention {
@@ -190,6 +190,7 @@ export function parseDetail(json: unknown): NexusDetail {
     agent: isRecord(json.agent) ? { parkedTasks: num(json.agent.parkedTasks) } : null,
     conversation: isRecord(json.claudeWorker) ? 'claude' : isRecord(json.thread) && typeof json.thread.conversationId === 'string' ? 'agent' : null,
     worker: isRecord(json.claudeWorker) ? { state: str(json.claudeWorker.state), model: strOrNull(json.claudeWorker.model), message: strOrNull(json.claudeWorker.message) } : null,
+    decisions: isRecord(json.review) && isRecord(json.review.phase) && json.review.phase.kind === 'needs-person' ? list(json.review.phase.reasons).filter((reason): reason is string => typeof reason === 'string') : [],
     desired: wants,
     attach: json.attach,
   }
@@ -790,6 +791,7 @@ export function threadState(thread: Pick<NexusThread, 'status' | 'agentTurnRunni
 /** The word a list row shows for what an open thread asks of the person; working is the thread's state's own. */
 const ATTENTION_LOOK: Partial<Record<Exclude<NexusAttention, null>, [label: string, tone: Tone]>> = {
   failed: ['failed', 'bad'],
+  decision: ['needs you', 'busy'],
   parked: ['parked', 'bad'],
   reply: ['new reply', 'ok'],
   waiting: ['waiting', 'busy'],
@@ -1493,12 +1495,13 @@ function addProject(args: readonly string[], invalid: (reason: string) => NexusC
 export type Chip = { thread: NexusThreadRow; kind: Exclude<NexusAttention, null>; note: string }
 
 /** docs/cli.md's order of attention, most urgent first, which the strip keeps. */
-const ATTENTION_RANK: Record<Chip['kind'], number> = { failed: 0, parked: 1, reply: 2, working: 3, waiting: 4 }
+const ATTENTION_RANK: Record<Chip['kind'], number> = { failed: 0, decision: 1, parked: 2, reply: 3, working: 4, waiting: 5 }
 
 /**
  * The open threads whose attention the control plane says asks for the person or is busy, in its order: a failed pylon
- * or Claude worker launch and parked tasks, a reply no client marked seen, the agents at work with how long since the
- * person's message started them, and a session waiting for input. The rest stay out of the strip.
+ * or Claude worker launch, a review that ended for the person's decision and parked tasks, a reply no client marked
+ * seen, the agents at work with how long since the person's message started them, and a session waiting for input. The
+ * rest stay out of the strip.
  */
 export function stripChips(threads: readonly NexusThreadRow[], now: number): Chip[] {
   const note = (thread: NexusThreadRow, kind: Chip['kind']) =>
