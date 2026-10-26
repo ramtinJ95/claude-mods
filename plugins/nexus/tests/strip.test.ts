@@ -192,6 +192,19 @@ test('a reply is not marked seen before the watch has drawn the conversation, no
   expect(cli.runs.filter(argv => argv[0] === 'seen')).toEqual([['seen', '--json', REPLIED.id]])
 })
 
+test("an earlier answer on screen marks nothing while the watch has the run working: the details' newer reply has not arrived", async ($, on) => {
+  const unread = { ...DETAIL, thread: REPLIED, attention: 'reply', seenAt: REPLIED.seenAt, lastReplyAt: REPLIED.lastReplyAt }
+  const answer = { type: 'entry', thread: ID, entry: { id: 12, model: [{ role: 'assistant', content: [{ type: 'text', text: 'All green now.' }] }] }, text: 'All green now.' }
+  const cli = fake({ threads: [...THREADS, REPLIED], detail: unread, store: STORE })
+  cli.watch = [{ type: 'reset', thread: ID, entries: ENTRIES.slice(0, -1) }, state('working'), { delay: 20_000 }, answer, state('idle')]
+  const { clock, nexus } = await boot($, on, cli)
+  await nexus('open e000')
+  await clock.advance(15_000)
+  expect(cli.runs.filter(argv => argv[0] === 'seen')).toEqual([])
+  await clock.advance(10_000)
+  expect(cli.runs.filter(argv => argv[0] === 'seen')).toEqual([['seen', '--json', REPLIED.id]])
+})
+
 test('leaving a thread marks nothing once a newer reply than the one shown has come', async ($, on) => {
   const read = { ...DETAIL, thread: { ...REPLIED, seenAt: REPLIED.lastReplyAt }, attention: null, seenAt: REPLIED.lastReplyAt, lastReplyAt: REPLIED.lastReplyAt }
   const cli = fake({ threads: [...THREADS, REPLIED], detail: read, store: STORE })

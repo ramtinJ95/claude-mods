@@ -202,7 +202,7 @@ export type NexusDetail = {
  * A Claude Code worker thread's conversation, as `nexus conversation` last printed it, in the rows a watch gives:
  * `nexus watch` streams none of it. `queued` holds the messages Claude has not taken yet.
  */
-export type NexusClaudeShown = { thread: string; rows: NexusRow[]; dropped: number; working: boolean; queued: string[]; failure: string | null }
+export type NexusClaudeShown = { thread: string; rows: NexusRow[]; dropped: number; working: boolean; queued: string[]; readAt: number | null; failure: string | null }
 
 /** The `show` poll of the thread open in the pane. */
 export type NexusShown = {

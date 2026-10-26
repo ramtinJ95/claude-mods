@@ -92,6 +92,7 @@ import {
   isPaneRunning,
   isWorkerIdle,
   hasDrawnReply,
+  transcriptHolds,
   isUnread,
   resumesOn,
   sessionPlace,
@@ -539,7 +540,10 @@ async function poll($: EngineInterface) {
     }
     if (!detail.ok) return
     // While the person is attached to the pylon in a Herdr tab, the worker's transcript is not read: they see it there.
-    const isDrawn = detail.value.conversation === 'claude' ? !(await isAttached($, thread)) && (await readClaude($, thread, current)) : hasDrawnReply(await read($, watchAtom), thread)
+    const isDrawn =
+      detail.value.conversation === 'claude'
+        ? !(await isAttached($, thread)) && transcriptHolds(await readClaude($, thread, current), detail.value.thread.lastReplyAt)
+        : hasDrawnReply(await read($, watchAtom), thread)
     const { selected: still, view: on, tab, overlay } = await read($, paneAtom)
     if (!isDrawn || still !== thread || on !== 'thread' || tab !== 'conversation' || overlay) return
     // The person reads the reply in the pane: once every client counts it seen, the details read again drop it.
@@ -558,17 +562,18 @@ async function poll($: EngineInterface) {
 /**
  * The Claude Code worker transcript of the thread shown, as part of its poll, since `nexus watch` streams none: one
  * `nexus conversation`, which never wakes the pylon and reads it only while it runs. A failed read keeps the rows it had.
+ * Says when the transcript was read from the pylon, null when it never was or the read failed.
  */
-async function readClaude($: EngineInterface, thread: string, current: NonNullable<typeof poller>): Promise<boolean> {
+async function readClaude($: EngineInterface, thread: string, current: NonNullable<typeof poller>): Promise<number | null> {
   const got = await childJson($, ['conversation', thread], current.stopped)
-  if (!got || poller !== current || (await read($, paneAtom)).selected !== thread) return false
+  if (!got || poller !== current || (await read($, paneAtom)).selected !== thread) return null
   const reading = parsed(got, parseClaudeConversation)
   await update($, claudeAtom, (was): NexusClaudeShown =>
     reading.ok
       ? { thread, ...reading.value, failure: null }
-      : { ...(was?.thread === thread ? was : { thread, rows: [], dropped: 0, working: false, queued: [] }), failure: reading.failure.message },
+      : { ...(was?.thread === thread ? was : { thread, rows: [], dropped: 0, working: false, queued: [], readAt: null }), failure: reading.failure.message },
   )
-  return reading.ok
+  return reading.ok ? reading.value.readAt : null
 }
 
 /** Polls now, or once the poll under way ends, since that one may have read what was there before a change. */

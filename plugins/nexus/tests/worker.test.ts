@@ -72,6 +72,18 @@ test("a worker's new reply is marked seen only once its transcript is read and d
   expect(cli.runs.filter(argv => argv[0] === 'seen')).toEqual([['seen', '--json', WORKER.id]])
 })
 
+test("a worker's reply is marked only from a transcript read at or after it, which a later turn running does not change", async ($, on) => {
+  const unread = { ...WORKER_DETAIL, attention: 'reply', thread: { ...WORKER, lastReplyAt: T0, seenAt: T0 - 60_000 } }
+  // The pylon cannot be read, so the control plane answers with the transcript it stored before the reply.
+  const { cli, clock } = await opened($, on, { detail: unread, conversation: { ...CONVERSATION, entries: CONVERSATION.entries.slice(0, 2), readAt: T0 - 80_000, working: false } })
+  await clock.advance(10_000)
+  expect(conversations(cli.spawns).length).toBeGreaterThan(1)
+  expect(cli.runs.filter(argv => argv[0] === 'seen')).toEqual([])
+  cli.conversation = { ...CONVERSATION, readAt: T0, working: true }
+  await clock.advance(5_000)
+  expect(cli.runs.filter(argv => argv[0] === 'seen')).toEqual([['seen', '--json', WORKER.id]])
+})
+
 test('a harness thread reads no transcript: its watch streams the conversation', async ($, on) => {
   const cli = fake()
   const { nexus, clock } = await boot($, on, cli)

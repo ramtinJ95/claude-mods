@@ -548,7 +548,7 @@ const CLAUDE_TOOLS: Record<string, (input: Raw) => { name: string; args: Raw }> 
 }
 
 /** A Claude Code worker's transcript as the pane keeps it: the rows, the entries left out before them, the run and its queue. */
-export type ClaudeReading = { rows: NexusRow[]; dropped: number; working: boolean; queued: string[] }
+export type ClaudeReading = { rows: NexusRow[]; dropped: number; working: boolean; queued: string[]; readAt: number | null }
 
 /**
  * `conversation --json` for a Claude Code worker thread (CLI 0.17.0), its entries folded into rows as a watch's are: a
@@ -604,7 +604,7 @@ export function parseClaudeConversation(json: unknown): ClaudeReading {
     }
   }
   const tail = kept(rows, dropped)
-  return { ...tail, working: json.working === true, queued }
+  return { ...tail, working: json.working === true, queued, readAt: typeof json.readAt === 'number' ? json.readAt : null }
 }
 
 /**
@@ -636,9 +636,19 @@ export function isWorkerIdle(state: NexusRunState): boolean {
   return state.run === 'idle' && state.queued === 0
 }
 
-/** Whether the pane's watch of `thread` has drawn its conversation: its first state has come, it runs on, and an answer is among its rows. */
+/**
+ * Whether the pane's watch of `thread` has drawn the reply the details name, as pi-nexus judges it: the watch runs on
+ * with no outage and reports the run not working, since it prints an answer's entries before the state that ends its turn.
+ */
 export const hasDrawnReply = (watch: NexusWatch | null, thread: string) =>
-  watch?.thread === thread && watch.state !== null && watch.ended === null && watch.rows.some(row => row.kind === 'assistant')
+  watch?.thread === thread && watch.state !== null && watch.state.run !== 'working' && watch.ended === null && watch.outage === null
+
+/**
+ * Whether a worker's transcript holds the reply that ended at `reply`, the details' `lastReplyAt` read before it: only a
+ * transcript read from the pylon at or after it does, since the control plane answers with the one it stored when the
+ * pylon cannot be read. A later turn running does not matter.
+ */
+export const transcriptHolds = (readAt: number | null, reply: number | null) => reply !== null && readAt !== null && readAt >= reply
 
 /** Whether `herdr pane process-info` shows a program in front of the pane's shell, such as a `nexus attach` not yet detached. */
 export function isPaneRunning(stdout: string): boolean {
