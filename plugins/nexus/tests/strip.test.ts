@@ -237,3 +237,22 @@ test("a review that ended for the person reads needs you in the list, and Pylon 
   await ui.press({ key: 'tab-pylon' })
   for (const reason of reasons) expect((await ui.find({ type: 'Text', text: `Needs you: ${reason}` }))?.props.color).toBe('warning')
 })
+
+test('CLI 0.19.0 marks only the reply the pane showed: leaving after a newer one came reads no details and leaves the newer one new', async ($, on) => {
+  const unread = { ...DETAIL, thread: REPLIED, attention: 'reply', seenAt: REPLIED.seenAt, lastReplyAt: REPLIED.lastReplyAt }
+  const cli = fake({ threads: [...THREADS, REPLIED], detail: unread, store: STORE, version: '0.19.0' })
+  cli.watch = [{ type: 'reset', thread: ID, entries: ENTRIES.slice(0, -1) }, state('idle')]
+  const { clock, nexus, mount } = await boot($, on, cli)
+  await nexus('open e000')
+  await clock.advance(5_000)
+  expect(cli.runs.filter(argv => argv[0] === 'seen')).toEqual([['seen', '--json', REPLIED.id, `--last-reply-at=${REPLIED.lastReplyAt}`]])
+  const ui = await mount()
+  const newer = { ...REPLIED, seenAt: REPLIED.lastReplyAt, lastReplyAt: T0 + 4_000 }
+  cli.detail = { ...DETAIL, thread: newer, attention: 'reply', seenAt: newer.seenAt, lastReplyAt: newer.lastReplyAt }
+  cli.threads = [...THREADS, newer]
+  const before = cli.runs.length
+  await ui.press({ key: 'key-h' })
+  await clock.settle()
+  expect(cli.runs.slice(before).filter(argv => argv[0] === 'seen' || argv[0] === 'show')).toEqual([['seen', '--json', REPLIED.id, `--last-reply-at=${REPLIED.lastReplyAt}`]])
+  expect((await ui.find({ type: 'Button', key: REPLIED.id }))?.text).toMatch(/Docs pass\s+ new reply/)
+})

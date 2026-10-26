@@ -826,30 +826,40 @@ const refusedSeen = new Map<string, number | null>()
 /** The latest reply the pane showed in each thread's conversation, by its `lastReplyAt`: what leaving the thread may mark. */
 const displayed = new Map<string, number | null>()
 
+/** The CLI whose `seen` takes the reply shown (`--last-reply-at`), so a mark never passes it. */
+const SEEN_AT_CLI = [0, 19, 0]
+
 /**
- * Leaving `thread` marks the reply the pane showed there, if its details read now still name it as the latest and
- * unread: a reply newer than the one drawn, or none drawn, is left new.
+ * Leaving `thread` marks the reply the pane showed there, and no newer one. A CLI before 0.19.0 marks the latest reply,
+ * so it reads the details first and marks only while they still name the reply shown as the latest and unread.
  */
 async function markLeft($: EngineInterface, thread: string): Promise<boolean> {
   if (!displayed.has(thread)) return false
   const reply = displayed.get(thread) ?? null
   displayed.delete(thread)
-  const detail = await detailFrom($, await nexus($, ['show', thread]))
-  if (!detail.ok || detail.value.thread.lastReplyAt !== reply || !isUnread(detail.value.thread)) return false
+  if (reply === null) return false
+  if (!(await takesReplyAt($))) {
+    const detail = await detailFrom($, await nexus($, ['show', thread]))
+    if (!detail.ok || detail.value.thread.lastReplyAt !== reply || !isUnread(detail.value.thread)) return false
+  }
   return markSeen($, thread, reply)
 }
 
+const takesReplyAt = async ($: EngineInterface) => {
+  const found = await cliVersion($)
+  return found !== null && !isOlder(found, SEEN_AT_CLI)
+}
+
 /**
- * Marks the thread's latest reply seen on the control plane, for every client. `nexus seen` marks the reply latest when
- * it runs, since the CLI takes no reply time to hold the mark to; the pane draws a reply within a moment of its arrival.
- * A failure says so in the pane, as the reply stays new everywhere, and polls do not ask again for that reply. Whether it marked.
+ * Marks the reply the pane showed, `reply`, seen on the control plane, for every client. A CLI before 0.19.0 takes no
+ * reply time and marks the reply latest when it runs, which the pane draws within a moment of its arrival. A failure
+ * says so in the pane, as the reply stays new everywhere, and polls do not ask again for that reply. Whether it marked.
  */
 async function markSeen($: EngineInterface, thread: string, reply: number | null): Promise<boolean> {
   if (seeing.has(thread)) return false
   seeing.add(thread)
   try {
-    // CLI 0.17.0's `seen` takes no reply time; once it takes `--last-reply-at`, pass `reply` so the mark never passes what was drawn.
-    const got = await nexus($, ['seen', thread])
+    const got = await nexus($, ['seen', thread, ...(reply !== null && (await takesReplyAt($)) ? [`--last-reply-at=${reply}`] : [])])
     if (got.ok) {
       refusedSeen.delete(thread)
       return true
