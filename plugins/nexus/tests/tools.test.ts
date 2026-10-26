@@ -357,3 +357,22 @@ test('wait on a worker reads on through a failed reading, as a watch outlives an
   await clock.advance(2_000)
   expect(JSON.parse(String((await waiting).result))).toMatchObject({ settled: true, run: 'idle' })
 })
+
+test('wait on an idle worker whose transcript ends at a prompt it never answered settles after the second reading, its reply null', async ($, on) => {
+  const cli = fake({ threads: [WORKER], detail: WORKER_DETAIL, conversation: { ...CONVERSATION, entries: [...CONVERSATION.entries.slice(0, 2), { kind: 'prompt', at: T0, text: 'and then?', from: 'person' }], working: false } })
+  const { clock } = await boot($, on, cli)
+  const waiting = $.tool.call({ tool: 'mcp__nexus__wait', thread: WORKER.id, timeout_seconds: 60 } as never)
+  await clock.settle()
+  await clock.advance(2_000)
+  expect(JSON.parse(String((await waiting).result))).toMatchObject({ settled: true, run: 'idle', reply: null })
+})
+
+test('a deadline too near for the second reading ends the wait unsettled, never taking the last answer as the reply to a new message', async ($, on) => {
+  const cli = fake({ threads: [WORKER], detail: WORKER_DETAIL, conversation: { ...CONVERSATION, entries: CONVERSATION.entries.slice(0, 2), working: false } })
+  const { clock } = await boot($, on, cli)
+  const waiting = $.tool.call({ tool: 'mcp__nexus__wait', thread: WORKER.id, timeout_seconds: 1 } as never)
+  await clock.advance(1_000)
+  const waited = JSON.parse(String((await waiting).result))
+  expect(waited).toMatchObject({ settled: false, timed_out: true })
+  expect(cli.spawns.filter(argv => argv[0] === 'conversation')).toHaveLength(1)
+})

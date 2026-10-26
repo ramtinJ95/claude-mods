@@ -79,3 +79,39 @@ test('a harness thread reads no transcript: its watch streams the conversation',
   await clock.advance(10_000)
   expect(conversations(cli.spawns)).toEqual([])
 })
+
+test("a worker's reply is not marked while Changes is shown, and leaving after a failed transcript read marks nothing", async ($, on) => {
+  const unread = { ...WORKER_DETAIL, attention: 'reply', thread: { ...WORKER, lastReplyAt: T0, seenAt: T0 - 60_000 } }
+  const { cli, clock, ui } = await opened($, on, { detail: unread, fail: { conversation: { exitCode: 2, error: 'connect ECONNREFUSED' } } })
+  await ui.press({ key: 'tab-changes' })
+  cli.fail = {}
+  await clock.advance(10_000)
+  expect(conversations(cli.spawns).length).toBeGreaterThan(1)
+  expect(cli.runs.filter(argv => argv[0] === 'seen')).toEqual([])
+  await keys(ui, 'hh')
+  await clock.settle()
+  expect(cli.runs.filter(argv => argv[0] === 'seen')).toEqual([])
+})
+
+test("while the person is attached in a Herdr tab, the worker's transcript is not read; it is again once they detach", async ($, on) => {
+  const { cli, clock, nexus } = await opened($, on, { env: { HERDR_ENV: '1', HERDR_WORKSPACE_ID: 'w9' } })
+  await nexus(`session attach ${WORKER.id}`)
+  expect(cli.herdr.some(argv => argv[0] === 'pane' && argv[1] === 'run')).toBe(true)
+  cli.attaching = true
+  const before = conversations(cli.spawns).length
+  await clock.advance(15_000)
+  expect(conversations(cli.spawns)).toHaveLength(before)
+  cli.attaching = false
+  await clock.advance(5_000)
+  expect(conversations(cli.spawns).length).toBeGreaterThan(before)
+})
+
+test("a send to a worker outlasts the CLI's two minutes of waking a paused pylon", async ($, on) => {
+  const { cli, clock, ui } = await opened($, on, { sent: { claude: { session: '5e55-10n', outcome: 'sent', resumed: true } }, slow: { send: 80_000 } })
+  await keys(ui, 'i')
+  const sending = ui.input({ key: await field(ui, 'compose'), text: 'wake up and continue' })
+  await clock.advance(80_000)
+  await sending
+  expect(cli.runs).toContainEqual(['send', '--json', WORKER.id, '--', 'wake up and continue'])
+  expect(await shows(ui, `Sent to the Claude Code session of ${WORKER.id}. Nexus resumed the session first, as no pane ran it.`)).toBe(true)
+})

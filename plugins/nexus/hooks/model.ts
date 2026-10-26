@@ -443,12 +443,12 @@ export function appendEntry(rows: readonly NexusRow[], entry: WatchEntry): Nexus
 }
 
 /** `rows` with the call `id` settled by its result, in place. A result whose call is not in the context still shows, as the dashboard shows it. */
-function settle(rows: NexusRow[], id: string, name: string, output: string, isError: boolean, patch: string | null): NexusRow[] {
+function settle(rows: NexusRow[], id: string, name: string, output: string, isError: boolean, patch: string | null, entry?: number): NexusRow[] {
   const settled = { outcome: isError ? ('error' as const) : ('ok' as const), output: keepTail(output, OUTPUT_CHARS), lines: lineCount(output), patch }
   const at = rows.findLastIndex(row => row.kind === 'tool' && row.id === id)
   const row = rows[at]
   if (row?.kind === 'tool') rows[at] = { ...row, ...settled }
-  else rows.push({ ...toolRow(id, name, {}), ...settled })
+  else rows.push({ ...toolRow(id, name, {}), ...settled, ...(entry === undefined ? {} : { entry }) })
   return rows
 }
 
@@ -560,27 +560,30 @@ export function parseClaudeConversation(json: unknown): ClaudeReading {
   if (!isRecord(json) || json.kind !== 'claude' || !Array.isArray(json.entries)) throw contractError('conversation', "a Claude worker's conversation")
   const rows: NexusRow[] = []
   const queued: string[] = []
-  for (const entry of json.entries) {
+  const dropped = num(json.dropped)
+  // Each row is keyed by its entry's place in the whole transcript, so a window that slides past an entry no row shows moves no key.
+  const push = (at: number, row: NexusRow) => rows.push({ ...row, entry: dropped + at })
+  for (const [at, entry] of json.entries.entries()) {
     if (!isRecord(entry)) continue
     switch (entry.kind) {
       case 'prompt':
         if (!str(entry.text).trim()) break
-        rows.push(entry.from === 'other' ? { kind: 'notice', tone: 'dim', text: str(entry.text).trim() } : { kind: 'user', text: str(entry.text).trim(), at: typeof entry.at === 'number' ? entry.at : null })
+        push(at, entry.from === 'other' ? { kind: 'notice', tone: 'dim', text: str(entry.text).trim() } : { kind: 'user', text: str(entry.text).trim(), at: typeof entry.at === 'number' ? entry.at : null })
         break
       case 'reply':
-        if (str(entry.text).trim()) rows.push({ kind: 'assistant', text: str(entry.text).trim() })
+        if (str(entry.text).trim()) push(at, { kind: 'assistant', text: str(entry.text).trim() })
         break
       case 'tool': {
         const input = isRecord(entry.input) ? entry.input : {}
         const { name, args } = CLAUDE_TOOLS[str(entry.name)]?.(input) ?? { name: str(entry.name), args: input }
-        rows.push(toolRow(str(entry.id), name, args))
+        push(at, toolRow(str(entry.id), name, args))
         break
       }
       case 'result':
-        settle(rows, str(entry.toolUseId), 'tool', str(entry.output), entry.isError === true, null)
+        settle(rows, str(entry.toolUseId), 'tool', str(entry.output), entry.isError === true, null, dropped + at)
         break
       case 'task':
-        rows.push({ kind: 'notice', tone: 'dim', text: [`Background task ${str(entry.status)}: ${str(entry.summary)}`, strOrNull(entry.result)].filter(Boolean).join('\n') })
+        push(at, { kind: 'notice', tone: 'dim', text: [`Background task ${str(entry.status)}: ${str(entry.summary)}`, strOrNull(entry.result)].filter(Boolean).join('\n') })
         break
       case 'queue': {
         const text = strOrNull(entry.text)
@@ -593,15 +596,15 @@ export function parseClaudeConversation(json: unknown): ClaudeReading {
         break
       }
       case 'notice':
-        rows.push({ kind: 'notice', tone: entry.tone === 'error' ? 'error' : 'dim', text: str(entry.text) })
+        push(at, { kind: 'notice', tone: entry.tone === 'error' ? 'error' : 'dim', text: str(entry.text) })
         break
       case 'record':
-        rows.push({ kind: 'notice', tone: 'dim', text: str(entry.summary) })
+        push(at, { kind: 'notice', tone: 'dim', text: str(entry.summary) })
         break
     }
   }
-  const { rows: tail, dropped } = kept(rows, num(json.dropped))
-  return { rows: tail, dropped, working: json.working === true, queued }
+  const tail = kept(rows, dropped)
+  return { ...tail, working: json.working === true, queued }
 }
 
 /**
@@ -621,6 +624,30 @@ export function claudeWatch(watch: NexusWatch, claude: NexusClaudeShown | null, 
       outage: claude?.failure ? `The conversation could not be read: ${sentence(claude.failure)}` : watch.outage,
     },
     live: { queued: claude?.queued.filter(Boolean) ?? [], tools: [], partial: null, retry: null },
+  }
+}
+
+/**
+ * Whether a worker's reading means it is done for now: it can no longer run (archived, deleted, parked, a failed
+ * pylon), or its session's turn is over with nothing queued, even when the transcript ends at a prompt it never answered.
+ */
+export function isWorkerIdle(state: NexusRunState): boolean {
+  if (state.status === 'archived' || state.status === 'deleted' || state.run === 'parked' || state.pylon === 'failed' || state.failed !== null) return true
+  return state.run === 'idle' && state.queued === 0
+}
+
+/** Whether the pane's watch of `thread` has drawn its conversation: its first state has come, it runs on, and an answer is among its rows. */
+export const hasDrawnReply = (watch: NexusWatch | null, thread: string) =>
+  watch?.thread === thread && watch.state !== null && watch.ended === null && watch.rows.some(row => row.kind === 'assistant')
+
+/** Whether `herdr pane process-info` shows a program in front of the pane's shell, such as a `nexus attach` not yet detached. */
+export function isPaneRunning(stdout: string): boolean {
+  try {
+    const json: unknown = JSON.parse(stdout)
+    const info = isRecord(json) && isRecord(json.result) ? json.result.process_info : undefined
+    return isRecord(info) && typeof info.shell_pid === 'number' && info.foreground_process_group_id !== info.shell_pid
+  } catch {
+    return false
   }
 }
 
@@ -1147,7 +1174,7 @@ export function blocks(rows: readonly NexusRow[], dropped: number, live: NexusLi
   const out: Block[] = []
   rows.forEach((row, index) => {
     const last = out.at(-1)
-    const key = `row-${dropped + index}`
+    const key = row.entry === undefined ? `row-${dropped + index}` : `entry-${row.entry}`
     if (row.kind === 'tool') {
       if (last?.kind === 'tools') last.tools.push(row)
       else out.push({ key, isLive: false, kind: 'tools', tools: [row] })

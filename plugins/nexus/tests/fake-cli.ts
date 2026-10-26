@@ -191,6 +191,8 @@ export type Fake = {
   conversation: unknown
   /** What `send` answers. */
   sent: unknown
+  /** Whether the Herdr tab of an attach still runs it, as `herdr pane process-info` reports. */
+  attaching: boolean
   /** The watch's lines in order; a `{ delay }` holds the stream that long on the test's clock first. */
   watch: unknown[]
   /** A verb whose answer comes that many milliseconds late on the test's clock. */
@@ -257,7 +259,7 @@ function parseProjectAdd(args: readonly string[]): { values: Record<string, stri
 export function fake(change: Partial<Fake> = {}): Fake {
   // A copy, as the mod writes the store a test reads: a fixture shared by tests would carry one's writes into the next.
   const store = structuredClone(change.store ?? { themeNotice: true })
-  return { runs: [], spawns: [], threads: THREADS, projects: PROJECTS, detail: DETAIL, changes: CHANGES, diff: DIFF, conversation: CONVERSATION, sent: { submission: 3 }, watch: [{ type: 'reset', thread: ID, entries: ENTRIES }, state('working'), live()], slow: {}, fail: {}, printed: {}, publishes: true, answer: 'Keep', asked: [], offered: [], copied: [], toasts: [], opens: 0, isOpen: false, nextPane: 'nexus:2.1', version: '0.17.0', herdr: [], herdrFail: {}, env: {}, ...change, store }
+  return { runs: [], spawns: [], threads: THREADS, projects: PROJECTS, detail: DETAIL, changes: CHANGES, diff: DIFF, conversation: CONVERSATION, sent: { submission: 3 }, attaching: false, watch: [{ type: 'reset', thread: ID, entries: ENTRIES }, state('working'), live()], slow: {}, fail: {}, printed: {}, publishes: true, answer: 'Keep', asked: [], offered: [], copied: [], toasts: [], opens: 0, isOpen: false, nextPane: 'nexus:2.1', version: '0.17.0', herdr: [], herdrFail: {}, env: {}, ...change, store }
 }
 
 /** `detail` with the linked preview of `port` published, or gone when `preview` is null. */
@@ -322,6 +324,7 @@ export async function boot(...[$, on, cli]: [...Body, Fake]) {
       cli.herdr.push(argv)
       const error = cli.herdrFail[`${argv[0]} ${argv[1]}`]
       if (error) return { value: { exitCode: 1, stdout: '', stderr: `${JSON.stringify({ error: { code: 'failed', message: error }, id: 'cli:request' })}\n`, isStdoutTruncated: false, isStderrTruncated: false } }
+      if (argv[1] === 'process-info') return reply({ id: 'cli:pane:process_info', result: { process_info: { foreground_process_group_id: cli.attaching ? 41 : 40, shell_pid: 40 } } })
       return reply(argv[0] === 'tab' ? { id: 'cli:tab:create', result: { tab: { tab_id: 'w9:t3' }, root_pane: { pane_id: 'w9:p7' } } } : { id: 'cli:pane:run', result: { type: 'ok' } })
     }
     cli.runs.push(argv)
@@ -329,6 +332,12 @@ export async function boot(...[$, on, cli]: [...Body, Fake]) {
     // `session open` and `session close` are slowed or failed by both words.
     const verb = argv[0] === 'session' ? `session ${argv[1]}` : argv[0]!
     const late = cli.slow[verb]
+    // The engine kills a run that outlasts its timeout, and the call rejects.
+    const timeout = e.init?.timeoutMs ?? 30_000
+    if (late && late > timeout) {
+      await clock.sleep(timeout)
+      throw new Error(`timed out after ${timeout} ms`)
+    }
     if (late) await clock.sleep(late)
     const failure = cli.fail[verb]
     if (failure) return { value: { exitCode: failure.exitCode, stdout: '', stderr: `${JSON.stringify({ error: failure.error, kind: 'failed', status: 500 })}\n`, isStdoutTruncated: false, isStderrTruncated: false } }

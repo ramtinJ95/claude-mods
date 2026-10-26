@@ -89,6 +89,9 @@ import {
   rowsText,
   parseVersion,
   isOlder,
+  isPaneRunning,
+  isWorkerIdle,
+  hasDrawnReply,
   isUnread,
   resumesOn,
   sessionPlace,
@@ -120,6 +123,8 @@ const RUN_MS = 70_000
  * waits up to 120 s more for the agent to start.
  */
 const SESSION_MS = 260_000
+/** A `$.process.run` of `send`: for a Claude Code worker the CLI tries a paused pylon again once a second for up to 120 s. */
+const SEND_MS = 160_000
 /** A `$.process.run` of herdr: a tab made, a command typed into it. */
 const HERDR_MS = 10_000
 const READ_CHARS = 6_000
@@ -202,6 +207,8 @@ let watcher: { thread: string; stop: () => void } | undefined
  */
 let changesChild: { thread: string; stop: () => void } | undefined
 let diffChild: { thread: string; stop: () => void } | undefined
+/** The Herdr tab's pane where the pane last started `nexus attach`, and its thread. */
+let attached: { thread: string; pane: string } | undefined
 /** The thread whose visit is still to be recorded, once its first `show` says whether it is open. */
 let visit: string | undefined
 /** The strip's poll of the list, which runs while the pane is closed or shows a thread. */
@@ -530,12 +537,15 @@ async function poll($: EngineInterface) {
     if (detail.ok && changes && settleSessions(changes, detail.value.sessions, now) !== changes) {
       await changeSessions($, thread, was => settleSessions(was, detail.value.sessions, now))
     }
-    // A worker's reply is drawn only once its transcript is read: until then the person has not seen it.
-    const isDrawn = !detail.ok || detail.value.conversation !== 'claude' || (await readClaude($, thread, current))
+    if (!detail.ok) return
+    // While the person is attached to the pylon in a Herdr tab, the worker's transcript is not read: they see it there.
+    const isDrawn = detail.value.conversation === 'claude' ? !(await isAttached($, thread)) && (await readClaude($, thread, current)) : hasDrawnReply(await read($, watchAtom), thread)
+    const { selected: still, view: on, tab, overlay } = await read($, paneAtom)
+    if (!isDrawn || still !== thread || on !== 'thread' || tab !== 'conversation' || overlay) return
     // The person reads the reply in the pane: once every client counts it seen, the details read again drop it.
-    if (detail.ok && isDrawn && isUnread(detail.value.thread) && refusedSeen.get(thread) !== detail.value.thread.lastReplyAt) {
-      void markSeen($, thread, detail.value.thread.lastReplyAt).then(seen => seen && pollAgain($))
-    }
+    const reply = detail.value.thread.lastReplyAt
+    displayed.set(thread, reply)
+    if (isUnread(detail.value.thread) && refusedSeen.get(thread) !== reply) void markSeen($, thread, reply).then(seen => seen && pollAgain($))
   } finally {
     current.isBusy = false
     if (current.isAgain && poller === current) {
@@ -784,7 +794,7 @@ async function showThread($: EngineInterface, thread: string) {
     left = pane.view === 'thread' && pane.selected !== thread ? pane.selected : null
     return threadView(pane, thread)
   })
-  if (left) void markSeen($, left)
+  if (left) void markLeft($, left)
   refusedSeen.delete(thread)
   await followThread($, thread)
 }
@@ -808,16 +818,32 @@ async function saveStrip($: EngineInterface, change: (strip: NexusStrip) => Nexu
 const seeing = new Set<string>()
 /** The reply whose mark failed, by thread: polls leave it until another reply comes or the thread is opened again. */
 const refusedSeen = new Map<string, number | null>()
+/** The latest reply the pane showed in each thread's conversation, by its `lastReplyAt`: what leaving the thread may mark. */
+const displayed = new Map<string, number | null>()
+
+/**
+ * Leaving `thread` marks the reply the pane showed there, if its details read now still name it as the latest and
+ * unread: a reply newer than the one drawn, or none drawn, is left new.
+ */
+async function markLeft($: EngineInterface, thread: string): Promise<boolean> {
+  if (!displayed.has(thread)) return false
+  const reply = displayed.get(thread) ?? null
+  displayed.delete(thread)
+  const detail = await detailFrom($, await nexus($, ['show', thread]))
+  if (!detail.ok || detail.value.thread.lastReplyAt !== reply || !isUnread(detail.value.thread)) return false
+  return markSeen($, thread, reply)
+}
 
 /**
  * Marks the thread's latest reply seen on the control plane, for every client. `nexus seen` marks the reply latest when
  * it runs, since the CLI takes no reply time to hold the mark to; the pane draws a reply within a moment of its arrival.
  * A failure says so in the pane, as the reply stays new everywhere, and polls do not ask again for that reply. Whether it marked.
  */
-async function markSeen($: EngineInterface, thread: string, reply: number | null = null): Promise<boolean> {
+async function markSeen($: EngineInterface, thread: string, reply: number | null): Promise<boolean> {
   if (seeing.has(thread)) return false
   seeing.add(thread)
   try {
+    // CLI 0.17.0's `seen` takes no reply time; once it takes `--last-reply-at`, pass `reply` so the mark never passes what was drawn.
     const got = await nexus($, ['seen', thread])
     if (got.ok) {
       refusedSeen.delete(thread)
@@ -1446,7 +1472,17 @@ async function attachInHerdr($: EngineInterface, workspace: string, thread: stri
   const pane = parseHerdrTab(created.value)
   if (!pane) return failed('herdr tab create printed no pane')
   const ran = await herdr($, ['pane', 'run', pane, attachCommand(cli, thread)])
+  if (ran.ok) attached = { thread, pane }
   return ran.ok ? { ok: true, value: label } : ran
+}
+
+/** Whether the Herdr tab the pane opened for `thread` still runs its attach, which ends once the person detaches or closes it. */
+async function isAttached($: EngineInterface, thread: string): Promise<boolean> {
+  if (attached?.thread !== thread) return false
+  const info = await herdr($, ['pane', 'process-info', '--pane', attached.pane])
+  if (info.ok && isPaneRunning(info.value)) return true
+  attached = undefined
+  return false
 }
 
 /** One herdr command: its stdout, or why it failed. */
@@ -1477,7 +1513,7 @@ const say = (outcome: Outcome<string>) =>
 /** Sends `text` to the thread's agent, or types it into its Claude Code worker's session; the thread shown is read again to show it. */
 async function send($: EngineInterface, id: string, text: string): Promise<Outcome<Sent>> {
   // `--` keeps a message that starts with a dash from reading as a flag.
-  const sent = parsed(await nexus($, ['send', id, '--', text]), parseSent)
+  const sent = parsed(await nexus($, ['send', id, '--', text], SEND_MS), parseSent)
   if (sent.ok && (await read($, paneAtom)).selected === id) pollAgain($)
   return sent
 }
@@ -1708,25 +1744,26 @@ const workerFields = (detail: NexusDetail) =>
   detail.worker ? { worker: { state: detail.worker.state, model: detail.worker.model, ...(detail.worker.message ? { message: keepTail(detail.worker.message, 1_000) } : {}) } } : {}
 
 /**
- * `wait` on a Claude Code worker thread: its details and transcript read every `CLAUDE_WAIT_MS` until it settles as
- * `isSettled` judges a harness thread, its launch fails, `ms` pass or the call is cancelled. A message just typed may
- * not be in the transcript yet, nor its turn reported, so an idle reading settles only when the one before it did too,
- * unless this wait saw the turn run.
+ * `wait` on a Claude Code worker thread: its details and transcript read every `CLAUDE_WAIT_MS` until it is idle
+ * (`isWorkerIdle`), its launch fails, `ms` pass or the call is cancelled. A message just typed may not be in the
+ * transcript yet, nor its turn reported, so an idle reading settles only when the one a full `CLAUDE_WAIT_MS` before it
+ * was idle too, unless this wait saw the turn run; a deadline too near for that reading ends the wait unsettled. A
+ * transcript that ends at a prompt the worker never answered settles so too, its reply null.
  */
 async function waitForClaude($: EngineInterface, thread: string, first: ClaudeThread, ms: number, signal: AbortSignal): Promise<Outcome<unknown>> {
   const until = (await $.clock.now()) + ms
   let { detail, reading } = first
   let sawWorking = false
-  let wasSettled = false
+  let wasIdle = false
   /** Why the last reading failed, while it fails: the wait goes on with the reading before, as a watch outlives an outage. */
   let outage: string | null = null
   for (;;) {
     const state = claudeState(detail, reading)
     sawWorking ||= reading.working
-    const isDone = outage === null && (detail.worker?.state === 'failed' || detail.worker?.state === 'stalled' || isSettled(state, reading.rows, sawWorking))
-    const settled = isDone && (wasSettled || sawWorking)
-    const now = await $.clock.now()
-    if (settled || signal.aborted || now >= until) {
+    const isIdle = outage === null && (detail.worker?.state === 'failed' || detail.worker?.state === 'stalled' || isWorkerIdle(state))
+    const settled = isIdle && (wasIdle || sawWorking)
+    const isLate = (await $.clock.now()) + CLAUDE_WAIT_MS > until
+    if (settled || signal.aborted || isLate) {
       const human = needsHuman(state)
       const reply = rowsReply(reading.rows, REPLY_CHARS)
       return {
@@ -1734,7 +1771,7 @@ async function waitForClaude($: EngineInterface, thread: string, first: ClaudeTh
         value: {
           thread,
           settled,
-          ...(!settled && now >= until ? { timed_out: true } : {}),
+          ...(!settled && !signal.aborted ? { timed_out: true } : {}),
           ...(signal.aborted ? { cancelled: true } : {}),
           ...stateFields(state),
           ...workerFields(detail),
@@ -1744,9 +1781,9 @@ async function waitForClaude($: EngineInterface, thread: string, first: ClaudeTh
         },
       }
     }
-    wasSettled = isDone
+    wasIdle = isIdle
     const { promise, stop } = stopper()
-    const timer = $.clock.after(Math.min(CLAUDE_WAIT_MS, until - now), stop)
+    const timer = $.clock.after(CLAUDE_WAIT_MS, stop)
     signal.addEventListener('abort', stop)
     await promise
     timer.cancel()
@@ -2104,7 +2141,7 @@ async function listShown($: EngineInterface, left: string | null, pane: NexusPan
   await Promise.all([$.state.set(WATCH, null), $.state.set(LIVE, null), $.state.set(SHOWN, null), $.state.set(CLAUDE, null)])
   // The list read after the mark no longer shows the reply the person just read as new.
   void (async () => {
-    if (left) await markSeen($, left)
+    if (left) await markLeft($, left)
     pollAgain($)
   })()
   await focusRing($, pane)

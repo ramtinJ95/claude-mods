@@ -538,13 +538,22 @@ describe('Claude Code worker threads', () => {
       ],
     })
     expect(reading.rows).toEqual([
-      { kind: 'notice', tone: 'dim', text: 'a hook said this' },
-      { kind: 'notice', tone: 'dim', text: 'Background task completed: Agent "review" finished\nLooks good.' },
-      { kind: 'notice', tone: 'error', text: 'API Error: 529 overloaded' },
-      { kind: 'notice', tone: 'dim', text: 'mystery: {"a":1}' },
+      { kind: 'notice', tone: 'dim', text: 'a hook said this', entry: 12 },
+      { kind: 'notice', tone: 'dim', text: 'Background task completed: Agent "review" finished\nLooks good.', entry: 13 },
+      { kind: 'notice', tone: 'error', text: 'API Error: 529 overloaded', entry: 14 },
+      { kind: 'notice', tone: 'dim', text: 'mystery: {"a":1}', entry: 15 },
     ])
     expect(reading.dropped).toBe(12)
     expect(() => parseClaudeConversation({ entries: [] })).toThrow("nexus conversation printed a Claude worker's conversation, which docs/cli.md requires")
+  })
+
+  test('a row keeps its key when the transcript window slides past an entry that drew no row', () => {
+    const keys = (json: unknown) => blocks(parseClaudeConversation(json).rows, 0, null).map(block => [block.key, block.kind])
+    const entries = [{ kind: 'turn', at: 1, durationMs: 5 }, ...CONVERSATION.entries.slice(0, 2)]
+    const before = keys({ ...CONVERSATION, entries, dropped: 2997 })
+    const after = keys({ ...CONVERSATION, entries: entries.slice(1), dropped: 2998 })
+    expect(before).toEqual([['entry-2998', 'user'], ['entry-2999', 'assistant']])
+    expect(after).toEqual(before)
   })
 
   test("a worker's details say whose conversation it has and how its launch went; a reported session's turn counts as working", () => {

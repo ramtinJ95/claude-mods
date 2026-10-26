@@ -1,6 +1,6 @@
 import { expect, test } from 'claude-code/testing'
 
-import { DETAIL, ID, T0, THREAD, THREADS, boot, fake, state } from './fake-cli'
+import { DETAIL, ENTRIES, ID, T0, THREAD, THREADS, boot, fake, state } from './fake-cli'
 
 const FAILED = { ...THREAD, id: 'th-f00000000004', title: 'Broken setup', agentTurnRunning: false, lastAgentActivityAt: T0 - 600_000, pylon: { node: 'firebat', actualState: 'failed', failed: 'git clone exited 128' }, attention: 'failed' }
 const REPLIED = { ...THREAD, id: 'th-e00000000005', title: 'Docs pass', agentTurnRunning: false, lastAgentActivityAt: T0 - 1_000, lastReplyAt: T0 - 1_000, seenAt: T0 - 60_000, pylon: { node: 'firebat', actualState: 'running', failed: null }, attention: 'reply' }
@@ -39,12 +39,13 @@ test('a narrow strip keeps the chips that fit and counts the rest', async ($, on
 
 test('pressing a chip opens its thread in the pane, which marks the reply seen on the control plane, and it is no longer news', async ($, on) => {
   const cli = fake({ threads: [...THREADS, REPLIED], detail: { ...DETAIL, thread: REPLIED, attention: 'reply', seenAt: REPLIED.seenAt, lastReplyAt: REPLIED.lastReplyAt }, store: STORE })
-  cli.watch = [state('idle')]
+  cli.watch = [{ type: 'reset', thread: ID, entries: ENTRIES.slice(0, -1) }, state('idle')]
   const { clock, strip, mount } = await boot($, on, cli)
   await clock.settle()
   const ui = await strip()
   await ui.press({ key: REPLIED.id })
-  await clock.settle()
+  // The first poll reads the details before the watch has drawn the conversation; the next one marks.
+  await clock.advance(5_000)
   expect(cli.isOpen).toBe(true)
   expect(cli.spawns).toContainEqual(['watch', REPLIED.id, '--json'])
   expect(await (await mount()).find({ type: 'Text', text: REPLIED.id })).toBeDefined()
@@ -138,7 +139,7 @@ test("a project's name in a narrow strip shortens the first chip's title rather 
 test('the list marks an unread reply and counts it; going back from its thread marks it seen before the list is read again', async ($, on) => {
   const quiet = THREADS.map(thread => ({ ...thread, agentTurnRunning: false, attention: null }))
   const cli = fake({ threads: [...quiet, REPLIED], store: STORE })
-  cli.watch = [state('idle')]
+  cli.watch = [{ type: 'reset', thread: ID, entries: ENTRIES.slice(0, -1) }, state('idle')]
   const { clock, nexus, mount } = await boot($, on, cli)
   await nexus('')
   const ui = await mount()
@@ -147,9 +148,9 @@ test('the list marks an unread reply and counts it; going back from its thread m
   // The details of the thread opened were marked seen by another client already: the pane marks nothing on opening it.
   cli.detail = { ...DETAIL, thread: { ...REPLIED, seenAt: REPLIED.lastReplyAt, attention: null }, attention: null, seenAt: REPLIED.lastReplyAt, lastReplyAt: REPLIED.lastReplyAt }
   await nexus('open e000')
-  await clock.settle()
+  await clock.advance(5_000)
   expect(cli.runs.filter(argv => argv[0] === 'seen')).toEqual([])
-  // A reply lands while the person reads the thread, and the list still has it as new: leaving marks it.
+  // Another client marks the reply unread while the person reads it here: leaving marks the reply the pane showed.
   cli.detail = { ...DETAIL, thread: REPLIED, attention: 'reply', seenAt: REPLIED.seenAt, lastReplyAt: REPLIED.lastReplyAt }
   await ui.press({ key: 'key-h' })
   await clock.settle()
@@ -162,14 +163,46 @@ test('the list marks an unread reply and counts it; going back from its thread m
 
 test('a mark the control plane refuses says so in the pane, and the reply stays new', async ($, on) => {
   const cli = fake({ threads: [...THREADS, REPLIED], detail: { ...DETAIL, thread: REPLIED, attention: 'reply', seenAt: REPLIED.seenAt, lastReplyAt: REPLIED.lastReplyAt }, fail: { seen: { exitCode: 2, error: 'connect ECONNREFUSED' } }, store: STORE })
-  cli.watch = [state('idle')]
+  cli.watch = [{ type: 'reset', thread: ID, entries: ENTRIES.slice(0, -1) }, state('idle')]
   const { clock, nexus, mount, strip } = await boot($, on, cli)
   await nexus('open e000')
-  await clock.settle()
+  await clock.advance(5_000)
   const ui = await mount()
   expect(await ui.find({ type: 'Text', text: `The reply in ${REPLIED.id} was not marked seen, so it still shows as new: connect ECONNREFUSED.` })).toBeDefined()
   expect((await chips(await strip())).map(([key]) => key)).toContain(REPLIED.id)
   // The polls after it leave that reply alone rather than ask again every five seconds.
   await clock.advance(15_000)
   expect(cli.runs.filter(argv => argv[0] === 'seen')).toHaveLength(1)
+})
+
+test('a reply is not marked seen before the watch has drawn the conversation, nor while another tab is shown', async ($, on) => {
+  const unread = { ...DETAIL, thread: REPLIED, attention: 'reply', seenAt: REPLIED.seenAt, lastReplyAt: REPLIED.lastReplyAt }
+  const cli = fake({ threads: [...THREADS, REPLIED], detail: unread, store: STORE })
+  cli.watch = [{ delay: 60_000 }, { type: 'reset', thread: ID, entries: ENTRIES.slice(0, -1) }, state('idle')]
+  const { clock, nexus, mount } = await boot($, on, cli)
+  await nexus('open e000')
+  await clock.advance(30_000)
+  expect(cli.runs.filter(argv => argv[0] === 'seen')).toEqual([])
+  const ui = await mount()
+  await ui.press({ key: 'tab-changes' })
+  await clock.advance(40_000)
+  expect(cli.runs.filter(argv => argv[0] === 'seen')).toEqual([])
+  await ui.press({ key: 'tab-conversation' })
+  await clock.advance(5_000)
+  expect(cli.runs.filter(argv => argv[0] === 'seen')).toEqual([['seen', '--json', REPLIED.id]])
+})
+
+test('leaving a thread marks nothing once a newer reply than the one shown has come', async ($, on) => {
+  const read = { ...DETAIL, thread: { ...REPLIED, seenAt: REPLIED.lastReplyAt }, attention: null, seenAt: REPLIED.lastReplyAt, lastReplyAt: REPLIED.lastReplyAt }
+  const cli = fake({ threads: [...THREADS, REPLIED], detail: read, store: STORE })
+  cli.watch = [{ type: 'reset', thread: ID, entries: ENTRIES.slice(0, -1) }, state('idle')]
+  const { clock, nexus, mount } = await boot($, on, cli)
+  await nexus('open e000')
+  await clock.advance(5_000)
+  const ui = await mount()
+  const newer = { ...REPLIED, lastReplyAt: T0 + 4_000 }
+  cli.detail = { ...DETAIL, thread: newer, attention: 'reply', seenAt: newer.seenAt, lastReplyAt: newer.lastReplyAt }
+  await ui.press({ key: 'key-h' })
+  await clock.settle()
+  expect(cli.runs.filter(argv => argv[0] === 'seen')).toEqual([])
 })

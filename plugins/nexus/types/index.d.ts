@@ -78,8 +78,11 @@ export type NexusLive = {
   retry: string | null
 }
 
-/** One drawn row of a conversation. A tool call and its result are one row. */
-export type NexusRow =
+/**
+ * One drawn row of a conversation. A tool call and its result are one row. `entry` is the position of the entry that
+ * made it in a Claude Code worker's transcript, counted through the entries the control plane dropped: the row's key.
+ */
+export type NexusRow = { entry?: number } & (
   | { kind: 'user'; text: string; at: number | null }
   | { kind: 'assistant'; text: string }
   | {
@@ -97,6 +100,7 @@ export type NexusRow =
       patch: string | null
     }
   | { kind: 'notice'; tone: 'error' | 'dim'; text: string }
+)
 
 /** The latest `threads` poll. A failed poll keeps the threads it had and says why. */
 export type NexusList = { threads: NexusThreadRow[] | null; failure: NexusFailure | null; polledAt: number | null }
