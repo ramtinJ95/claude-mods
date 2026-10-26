@@ -19,16 +19,19 @@ export const THREAD = {
   createdAt: T0 - 12 * MIN,
   lastHumanActivityAt: T0 - 2 * MIN,
   lastAgentActivityAt: T0,
+  lastReplyAt: T0 - 60_000,
+  seenAt: T0 - 60_000,
   pylonId: 'pylon-7f3a',
   conversationId: '7',
   pylon: { node: 'firebat', actualState: 'running', failed: null },
   desired: 'running',
+  attention: 'working',
 }
 
 export const THREADS = [
   THREAD,
-  { ...THREAD, id: 'th-9b0000000002', title: 'Old idea', status: 'archived', agentTurnRunning: false, createdAt: T0 - 90 * MIN, pylon: { node: 'firebat', actualState: 'paused', failed: null }, desired: 'paused' },
-  { id: 'th-7c0000000003', title: 'API docs', project: 'api', status: 'idle', agentTurnRunning: false, createdAt: T0 - 3 * 60 * MIN, lastHumanActivityAt: T0 - 3 * 60 * MIN, lastAgentActivityAt: T0 - 3 * 60 * MIN, pylonId: 'p3', conversationId: '9', pylon: { node: 'testbench', actualState: 'paused', failed: null }, desired: 'paused' },
+  { ...THREAD, id: 'th-9b0000000002', title: 'Old idea', status: 'archived', agentTurnRunning: false, createdAt: T0 - 90 * MIN, pylon: { node: 'firebat', actualState: 'paused', failed: null }, desired: 'paused', attention: null },
+  { id: 'th-7c0000000003', title: 'API docs', project: 'api', status: 'idle', agentTurnRunning: false, createdAt: T0 - 3 * 60 * MIN, lastHumanActivityAt: T0 - 3 * 60 * MIN, lastAgentActivityAt: T0 - 3 * 60 * MIN, lastReplyAt: T0 - 3 * 60 * MIN, seenAt: T0 - 3 * 60 * MIN, pylonId: 'p3', conversationId: '9', pylon: { node: 'testbench', actualState: 'paused', failed: null }, desired: 'paused', attention: null },
 ]
 
 export const WEB_PREVIEW = { pylon: 'pylon-7f3a', service: 'web', httpsPort: 10201, ready: true, url: 'https://rj-firebat.example.ts.net:10201/' }
@@ -44,6 +47,9 @@ export const OPENED = { pylon: 'pylon-7f3a', service: 'port-5173', httpsPort: 10
 
 export const DETAIL = {
   thread: THREAD,
+  attention: 'working',
+  seenAt: THREAD.seenAt,
+  lastReplyAt: THREAD.lastReplyAt,
   pylon: { id: 'pylon-7f3a', node: 'firebat', actualState: 'running', failed: null, observedAt: new Date(T0 - 12_000).toISOString(), retryRefused: null },
   sessions: [{ herdrPane: 'nexus:1.2', harness: 'claude-code', harnessSessionId: '9c1e', status: 'working', pylon: 'pylon-7f3a' }],
   previews: [WEB_PREVIEW, API_PREVIEW],
@@ -224,7 +230,7 @@ function parseProjectAdd(args: readonly string[]): { values: Record<string, stri
 export function fake(change: Partial<Fake> = {}): Fake {
   // A copy, as the mod writes the store a test reads: a fixture shared by tests would carry one's writes into the next.
   const store = structuredClone(change.store ?? { themeNotice: true })
-  return { runs: [], spawns: [], threads: THREADS, projects: PROJECTS, detail: DETAIL, changes: CHANGES, diff: DIFF, watch: [{ type: 'reset', thread: ID, entries: ENTRIES }, state('working'), live()], slow: {}, fail: {}, printed: {}, publishes: true, answer: 'Keep', asked: [], offered: [], copied: [], toasts: [], opens: 0, isOpen: false, nextPane: 'nexus:2.1', version: '0.8.0', herdr: [], herdrFail: {}, env: {}, ...change, store }
+  return { runs: [], spawns: [], threads: THREADS, projects: PROJECTS, detail: DETAIL, changes: CHANGES, diff: DIFF, watch: [{ type: 'reset', thread: ID, entries: ENTRIES }, state('working'), live()], slow: {}, fail: {}, printed: {}, publishes: true, answer: 'Keep', asked: [], offered: [], copied: [], toasts: [], opens: 0, isOpen: false, nextPane: 'nexus:2.1', version: '0.17.0', herdr: [], herdrFail: {}, env: {}, ...change, store }
 }
 
 /** `detail` with the linked preview of `port` published, or gone when `preview` is null. */
@@ -236,6 +242,12 @@ function withPreview(detail: unknown, port: number, preview: typeof OPENED | nul
     previews: [...shown.previews.filter(one => one.service !== service), ...(preview ? [preview] : [])],
     ports: shown.ports?.map(one => (one.port === port ? { ...one, preview } : one)) ?? null,
   }
+}
+
+/** `thread` as the control plane leaves it once `seen` marks its latest reply: its attention what follows `reply`. */
+function markedSeen<T>(thread: T): T {
+  const one = thread as typeof THREAD
+  return { ...one, seenAt: one.lastReplyAt, attention: one.attention === 'reply' ? (one.agentTurnRunning ? 'working' : null) : one.attention } as T
 }
 
 const reply = (json: unknown) => ({ value: { exitCode: 0, stdout: JSON.stringify(json), stderr: '', isStdoutTruncated: false, isStderrTruncated: false } })
@@ -257,6 +269,7 @@ export async function boot(...[$, on, cli]: [...Body, Fake]) {
     threads: () => cli.threads,
     show: () => cli.detail,
     wake: () => null,
+    seen: () => null,
     send: () => ({ submission: 3 }),
     abort: () => null,
     retry: () => null,
@@ -287,6 +300,12 @@ export async function boot(...[$, on, cli]: [...Body, Fake]) {
     if (late) await clock.sleep(late)
     const failure = cli.fail[verb]
     if (failure) return { value: { exitCode: failure.exitCode, stdout: '', stderr: `${JSON.stringify({ error: failure.error, kind: 'failed', status: 500 })}\n`, isStdoutTruncated: false, isStderrTruncated: false } }
+    if (argv[0] === 'seen') {
+      const id = argv.at(-1)
+      cli.threads = cli.threads.map(one => ((one as typeof THREAD).id === id ? markedSeen(one) : one))
+      const detail = cli.detail as typeof DETAIL
+      if (detail.thread.id === id) cli.detail = { ...markedSeen(detail), thread: markedSeen(detail.thread) }
+    }
     if (argv[0] === 'project') {
       // `nexus project add`, read as the CLI's strict parseArgs reads it, its project built from its arguments.
       const added = parseProjectAdd(argv.slice(2))

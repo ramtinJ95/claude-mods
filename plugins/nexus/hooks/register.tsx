@@ -76,6 +76,7 @@ import {
   parseSessionClosed,
   parseVersion,
   isOlder,
+  isUnread,
   resumesOn,
   sessionPlace,
   parseStarted,
@@ -154,7 +155,7 @@ const paneAtom = atom({ plugin: 'nexus', key: 'pane' } as const, {
 })
 const STRIP = { plugin: 'nexus', key: 'strip' } as const
 /** What `$.store` keeps under `strip`, mirrored here so a change draws the strip again. */
-const stripAtom = atom(STRIP, { isOn: true, seen: {}, since: 0 })
+const stripAtom = atom(STRIP, { isOn: true })
 const SCOPE = { plugin: 'nexus', key: 'scope' } as const
 /** What `$.store` keeps under `project`, mirrored here so a change draws the list and the strip again. */
 const scopeAtom = atom(SCOPE, null)
@@ -176,7 +177,7 @@ let herdrWorkspace: string | null = null
  * The pane's two processes at most: one poll at a time, of `threads` for the list or `show` for the thread shown,
  * and one watch of that thread. The ticker only reads the watch's state, to move the run clock while it works.
  */
-let poller: { timer: Timer; ticker: Timer; isBusy: boolean; stop: () => void; stopped: Promise<void> } | undefined
+let poller: { timer: Timer; ticker: Timer; isBusy: boolean; isAgain: boolean; stop: () => void; stopped: Promise<void> } | undefined
 /** The second ask for the keyboard after `/nexus`, cancelled when the pane closes first. */
 let refocus: Timer | undefined
 let watcher: { thread: string; stop: () => void } | undefined
@@ -237,17 +238,21 @@ async function nexus($: EngineInterface, args: readonly string[], timeoutMs = RU
   }
 }
 
-function threadsFrom(got: Outcome<unknown>): Outcome<NexusThreadRow[]> {
-  if (!got.ok) return got
-  try {
-    return { ok: true, value: parseThreads(got.value) }
-  } catch (error) {
-    return failed(messageOf(error))
-  }
+/** The CLI that added the attention, the seen marker and the reply time to every thread, which the list and the details read. */
+const ATTENTION_CLI = [0, 10, 0]
+
+/** `parse` over `threads` or `show`, a contract error from a CLI before 0.10.0 naming the version it needs. */
+async function threadsJson<T>($: EngineInterface, got: Outcome<unknown>, parse: (json: unknown) => T): Promise<Outcome<T>> {
+  const value = parsed(got, parse)
+  if (value.ok || !got.ok) return value
+  return { ok: false, failure: await olderThan($, value.failure, ATTENTION_CLI, 'reading threads with their unread replies') }
 }
 
+const threadsFrom = ($: EngineInterface, got: Outcome<unknown>) => threadsJson($, got, parseThreads)
+const detailFrom = ($: EngineInterface, got: Outcome<unknown>) => threadsJson($, got, parseDetail)
+
 async function listThreads($: EngineInterface, project?: string): Promise<Outcome<NexusThreadRow[]>> {
-  return threadsFrom(await nexus($, ['threads', ...(project ? [`--project=${project}`] : [])]))
+  return threadsFrom($, await nexus($, ['threads', ...(project ? [`--project=${project}`] : [])]))
 }
 
 /** `parse` over a command's JSON, its throw a failure. */
@@ -485,17 +490,20 @@ async function poll($: EngineInterface) {
     if (!got || poller !== current) return
     await $.state.set(NOW, now)
     if (!thread) {
-      const threads = threadsFrom(got)
+      const threads = await threadsFrom($, got)
       await update($, listAtom, (list): NexusList => (threads.ok ? { threads: threads.value, failure: null, polledAt: now } : { ...list, failure: threads.failure }))
       return
     }
-    const detail = parsed(got, parseDetail)
+    const detail = await detailFrom($, got)
     if ((await read($, paneAtom)).selected !== thread) return
     const shownBefore = await read($, shownAtom)
     const before = shownBefore?.thread === thread ? shownBefore.detail : null
-    if (detail.ok) void recordVisit($, detail.value.thread)
-    // A reply the person sees in the pane is not news on the strip.
-    if (detail.ok && pane.isShown) void markSeen($, thread, detail.value.thread.lastAgentActivityAt)
+    if (detail.ok) {
+      void recordVisit($, detail.value.thread)
+      await patchRow($, detail.value)
+      // The person reads the reply in the pane: once every client counts it seen, the details read again drop it.
+      if (isUnread(detail.value.thread)) void markSeen($, thread).then(seen => seen && pollAgain($))
+    }
     await update($, shownAtom, (shown): NexusShown =>
       detail.ok
         ? { thread, detail: detail.value, askedSeq, failure: null }
@@ -511,7 +519,17 @@ async function poll($: EngineInterface) {
     }
   } finally {
     current.isBusy = false
+    if (current.isAgain && poller === current) {
+      current.isAgain = false
+      void poll($)
+    }
   }
+}
+
+/** Polls now, or once the poll under way ends, since that one may have read what was there before a change. */
+function pollAgain($: EngineInterface) {
+  if (poller?.isBusy) poller.isAgain = true
+  else void poll($)
 }
 
 /** Moves the run clock while the thread shown works, so its timer and spinner tick. */
@@ -609,6 +627,7 @@ async function startPane($: EngineInterface) {
       timer: $.clock.every(POLL_MS, () => void poll($)),
       ticker: $.clock.every(TICK_MS, () => void tick($)),
       isBusy: false,
+      isAgain: false,
       stop,
       stopped: promise,
     }
@@ -682,7 +701,7 @@ async function openWorking($: EngineInterface) {
   if (pane.selected || pane.view !== 'list') return
   let threads = (await read($, listAtom)).threads
   if (!threads) {
-    const got = threadsFrom(await nexus($, ['threads', '--all']))
+    const got = await threadsFrom($, await nexus($, ['threads', '--all']))
     if (!got.ok) return
     const now = await $.clock.now()
     await update($, listAtom, (): NexusList => ({ threads: got.value, failure: null, polledAt: now }))
@@ -725,35 +744,60 @@ const threadView = (pane: NexusPane, thread: string): Partial<NexusPane> => {
 
 /** Shows a thread: its watch, and its details polled, the first of which records the visit as the dashboard's page does. */
 async function showThread($: EngineInterface, thread: string) {
-  await setPane($, pane => threadView(pane, thread))
-  void markSeen($, thread)
+  let left: string | null = null
+  await setPane($, pane => {
+    left = pane.view === 'thread' && pane.selected !== thread ? pane.selected : null
+    return threadView(pane, thread)
+  })
+  if (left) void markSeen($, left)
   await followThread($, thread)
 }
 
-/** The strip's state as `$.store` kept it, and its start the first time: replies before then are not news. */
+/**
+ * Whether the strip shows, as `$.store` kept it. A store written before the control plane kept the seen marker also
+ * holds what the person saw then: it is written again without it.
+ */
 async function loadStrip($: EngineInterface) {
-  const stored = (await $.store.get('strip')) as Partial<NexusStrip> | undefined
-  const strip: NexusStrip = { isOn: stored?.isOn ?? true, seen: stored?.seen ?? {}, since: stored?.since ?? (await $.clock.now()) }
+  const stored = (await $.store.get('strip')) as Record<string, unknown> | undefined
+  const strip: NexusStrip = { isOn: stored?.isOn !== false }
   await $.state.set(STRIP, strip)
-  if (stored?.since === undefined) await $.store.set('strip', strip)
+  if (stored && Object.keys(stored).some(key => key !== 'isOn')) await $.store.set('strip', strip)
 }
 
 async function saveStrip($: EngineInterface, change: (strip: NexusStrip) => NexusStrip) {
   await $.store.set('strip', await update($, stripAtom, change))
 }
 
+/** The threads whose `nexus seen` runs, so a poll that comes again before it ends does not start a second. */
+const seeing = new Set<string>()
+
 /**
- * Records that the person saw `thread` now, so the strip shows no new reply for it. Given the thread's last reply, it
- * writes only when that is news, so a poll of the thread shown writes once a reply. The threads the list no longer
- * has are dropped, so the store does not grow.
+ * Marks the thread's latest reply seen on the control plane, for every client. `nexus seen` marks the reply latest when
+ * it runs, since the CLI takes no reply time to hold the mark to; the pane draws a reply within a moment of its arrival.
+ * A failure says so in the pane, as the reply stays new everywhere. Whether it marked.
  */
-async function markSeen($: EngineInterface, thread: string, reply?: number) {
-  const strip = await read($, stripAtom)
-  if (reply !== undefined && reply <= (strip.seen[thread] ?? strip.since)) return
-  const now = await $.clock.now()
-  const { threads } = await read($, listAtom)
-  const kept = new Set(threads?.map(one => one.id) ?? Object.keys(strip.seen))
-  await saveStrip($, was => ({ ...was, seen: { ...Object.fromEntries(Object.entries(was.seen).filter(([id]) => kept.has(id))), [thread]: Math.max(now, reply ?? 0) } }))
+async function markSeen($: EngineInterface, thread: string): Promise<boolean> {
+  if (seeing.has(thread)) return false
+  seeing.add(thread)
+  try {
+    const got = await nexus($, ['seen', thread])
+    if (got.ok) return true
+    const failure = newer(got.failure, 'seen', 'marking a reply seen', '0.10.0')
+    await setPane($, () => ({ notice: { text: `The reply in ${thread} was not marked seen, so it still shows as new: ${sentence(failure.message)}`, tone: 'error' } }))
+    return false
+  } finally {
+    seeing.delete(thread)
+  }
+}
+
+/** The thread's row in the list as its details just read it, so the list and the strip need not wait for their poll. */
+async function patchRow($: EngineInterface, detail: NexusDetail) {
+  const { thread, attention } = detail
+  await update($, listAtom, (list): NexusList =>
+    list.threads?.some(one => one.id === thread.id)
+      ? { ...list, threads: list.threads.map(one => (one.id === thread.id ? { ...one, attention, seenAt: thread.seenAt, lastReplyAt: thread.lastReplyAt } : one)) }
+      : list,
+  )
 }
 
 /**
@@ -766,7 +810,7 @@ async function pollStrip($: EngineInterface) {
   isStripBusy = true
   try {
     const asked = await $.clock.now()
-    const threads = threadsFrom(await nexus($, ['threads', '--all']))
+    const threads = await threadsFrom($, await nexus($, ['threads', '--all']))
     // The pane may have read the list while this poll ran, or the strip been turned off: then this answer is stale.
     if (!(await read($, stripAtom)).isOn) return
     await update($, listAtom, (list): NexusList => (list.polledAt !== null && list.polledAt >= asked ? list : threads.ok ? { threads: threads.value, failure: null, polledAt: asked } : { ...list, failure: threads.failure }))
@@ -1190,11 +1234,13 @@ async function closeSession($: EngineInterface, thread: string, id: string, isPa
   if (got.ok) return parsed(got, parseSessionClosed)
   const failure = newer(got.failure, 'session close', 'closing a session', '0.5.0')
   if (failure !== got.failure || !isPaneless) return { ok: false, failure }
-  const version = await cliVersion($)
-  return {
-    ok: false,
-    failure: version && isOlder(version, [0, 8, 0]) ? { kind: failure.kind, message: `${cli} is ${version.join('.')}: closing a failed session needs Nexus CLI 0.8.0 or later (nexus --version)` } : failure,
-  }
+  return { ok: false, failure: await olderThan($, failure, [0, 8, 0], 'closing a failed session') }
+}
+
+/** `failure`, or when `nexus --version` says the CLI is older than `version`, the version `doing` needs. */
+async function olderThan($: EngineInterface, failure: NexusFailure, version: readonly number[], doing: string): Promise<NexusFailure> {
+  const found = await cliVersion($)
+  return found && isOlder(found, version) ? { kind: failure.kind, message: `${cli} is ${found.join('.')}: ${doing} needs Nexus CLI ${version.join('.')} or later (nexus --version)` } : failure
 }
 
 /** The CLI's version, or null when `--version` printed none or did not run. */
@@ -1305,7 +1351,7 @@ async function closeInPane($: EngineInterface, thread: string, id: string) {
  * the dialog's default and a dismissed dialog keep them. Else what to say instead.
  */
 async function askSession($: EngineInterface, thread: string): Promise<Outcome<{ session: NexusSession } | { said: string }>> {
-  const detail = parsed(await nexus($, ['show', thread]), parseDetail)
+  const detail = await detailFrom($, await nexus($, ['show', thread]))
   if (!detail.ok) return detail
   // A paused session cannot be closed until it runs, so the dialog does not offer it.
   const sessions = detail.value.sessions.filter(one => one.state !== 'paused')
@@ -1907,10 +1953,13 @@ const listView = (was: NexusPane): NexusPane => ({
 /** After the list took the place of the thread `left`: its watch stopped, what was read of it dropped, the list polled. */
 async function listShown($: EngineInterface, left: string | null, pane: NexusPane) {
   watcher?.stop()
-  if (left) void markSeen($, left)
   await leaveCheckout($, null)
   await Promise.all([$.state.set(WATCH, null), $.state.set(LIVE, null), $.state.set(SHOWN, null)])
-  void poll($)
+  // The list read after the mark no longer shows the reply the person just read as new.
+  void (async () => {
+    if (left) await markSeen($, left)
+    pollAgain($)
+  })()
   await focusRing($, pane)
 }
 
@@ -2216,19 +2265,15 @@ export const register: Register = (on, options) => {
 
   on('ui.render', { component: 'AbovePrompt' }, async ($, e, next) => {
     if (e.props.hasSurvey) return next(e)
-    const [strip, list, watch, shown, now, cursor, scope] = await Promise.all([
+    const [strip, list, now, cursor, scope] = await Promise.all([
       read($, stripAtom),
       read($, listAtom),
-      read($, watchAtom),
-      read($, shownAtom),
       read($, nowAtom),
       read($, stripCursorAtom),
       read($, scopeAtom),
     ])
     if (!strip.isOn) return next(e)
-    // The list has no parked tasks: only the thread the pane watches is known to hold them.
-    const parked = new Set([...(watch?.state?.run === 'parked' ? [watch.thread] : []), ...(shown?.detail?.agent?.parkedTasks ? [shown.thread] : [])])
-    const chips = stripChips(inScope(list.threads ?? [], scope), strip, Math.max(now, list.polledAt ?? 0), parked)
+    const chips = stripChips(inScope(list.threads ?? [], scope), Math.max(now, list.polledAt ?? 0))
     if (chips.length === 0 && !(list.failure && !list.threads)) return next(e)
     return StripView($.ui.resolve(e), list, chips, e.props.bodyColumns, cursor, scope, id => void openFromStrip($, id))
   })

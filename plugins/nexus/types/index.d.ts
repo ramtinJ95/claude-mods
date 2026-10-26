@@ -17,12 +17,19 @@ export type NexusThread = {
   lastAgentActivityAt: number
   /** The latest of the three. */
   lastActivityAt: number
+  /** When the latest agent turn ended, a reply's identity, and when a person last marked the replies seen from any client: Unix milliseconds, null for never. */
+  lastReplyAt: number | null
+  seenAt: number | null
 }
+
+/** What a thread asks of the person, the first that holds in this order: `attention` in docs/cli.md. */
+export type NexusAttention = 'failed' | 'parked' | 'reply' | 'working' | 'waiting' | null
 
 /** A `threads` row: the thread with its pylon's state and what the planner wants of the pylon. */
 export type NexusThreadRow = NexusThread & {
   pylon: { node: string; actualState: NexusActual; failed: string | null }
   desired: NexusDesired
+  attention: NexusAttention
 }
 
 /** Why a CLI call failed: the CLI's error kind (its exit code) and message. */
@@ -168,6 +175,7 @@ export type NexusLiveShown = { thread: string; live: NexusLive }
 /** `show --json`: a thread with its pylon, sessions, previews, ports and outputs. */
 export type NexusDetail = {
   thread: NexusThread
+  attention: NexusAttention
   pylon: { id: string; node: string; actualState: NexusActual; failed: string | null; observedAt: string | null; retryRefused: string | null }
   sessions: NexusSession[]
   previews: NexusPreview[]
@@ -371,14 +379,8 @@ export type NexusPane = {
   sessionChanges: Record<string, NexusSessionChanges>
 }
 
-/** What the strip above the prompt reads besides the list: whether it shows, and when each thread was last viewed. */
-export type NexusStrip = {
-  isOn: boolean
-  /** When the person last viewed each thread, Unix milliseconds; a thread not in it counts from `since`. */
-  seen: Record<string, number>
-  /** When the strip first ran: a reply before it is not news. */
-  since: number
-}
+/** What the strip above the prompt reads besides the list: whether it shows. */
+export type NexusStrip = { isOn: boolean }
 
 declare module 'claude-code' {
   interface PluginState {

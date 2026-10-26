@@ -3,6 +3,7 @@
 // pane derives from them. docs/cli.md in the Nexus repository is the contract.
 import type {
   NexusActual,
+  NexusAttention,
   NexusBase,
   NexusChangedFile,
   NexusChanges,
@@ -23,7 +24,6 @@ import type {
   NexusOpenedSession,
   NexusSession,
   NexusSessionChanges,
-  NexusStrip,
   NexusThread,
   NexusThreadRow,
   NexusWatch,
@@ -62,7 +62,14 @@ const desired = (value: unknown): NexusDesired | undefined => (value === 'runnin
 /** A field docs/cli.md requires is missing: the CLI and this mod disagree on the contract. */
 const contractError = (command: string, what: string) => new Error(`nexus ${command} printed ${what}, which docs/cli.md requires: the CLI and this mod disagree on the contract`)
 
-function parseThread(raw: unknown): NexusThread | undefined {
+/** A thread's reply time or seen marker: a number or null, docs/cli.md says since CLI 0.10.0, so one missing is a contract error. */
+function stamp(raw: Raw, key: 'lastReplyAt' | 'seenAt', command: string): number | null {
+  const value = raw[key]
+  if (value === null || typeof value === 'number') return value
+  throw contractError(command, `a thread (${String(raw.id)}) without ${key}`)
+}
+
+function parseThread(raw: unknown, command: string): NexusThread | undefined {
   if (!isRecord(raw) || typeof raw.id !== 'string' || typeof raw.title !== 'string' || typeof raw.project !== 'string') return undefined
   return {
     id: raw.id,
@@ -74,25 +81,38 @@ function parseThread(raw: unknown): NexusThread | undefined {
     lastHumanActivityAt: num(raw.lastHumanActivityAt),
     lastAgentActivityAt: num(raw.lastAgentActivityAt),
     lastActivityAt: Math.max(num(raw.lastAgentActivityAt), num(raw.lastHumanActivityAt), num(raw.createdAt)),
+    lastReplyAt: stamp(raw, 'lastReplyAt', command),
+    seenAt: stamp(raw, 'seenAt', command),
   }
 }
 
-/** `threads --json`, kept to the fields the mod reads. A row without its pylon or `desired` fails the whole list. */
+const ATTENTION = new Set<string>(['failed', 'parked', 'reply', 'working', 'waiting'])
+
+/** A row's or a detail's `attention`, required since CLI 0.10.0. A value this mod does not know asks nothing of it. */
+function parseAttention(raw: Raw, command: string, id: string): NexusAttention {
+  if (raw.attention === undefined) throw contractError(command, `a thread (${id}) without its attention`)
+  return typeof raw.attention === 'string' && ATTENTION.has(raw.attention) ? (raw.attention as NexusAttention) : null
+}
+
+/** Whether the thread's latest reply came after the seen marker, as docs/cli.md counts an unread reply. */
+export const isUnread = (thread: Pick<NexusThread, 'lastReplyAt' | 'seenAt'>) => thread.lastReplyAt !== null && (thread.seenAt === null || thread.lastReplyAt > thread.seenAt)
+
+/** `threads --json`, kept to the fields the mod reads. A row without its pylon, `desired` or attention fails the whole list. */
 export function parseThreads(json: unknown): NexusThreadRow[] {
   if (!Array.isArray(json)) throw new Error('nexus threads did not print a list')
   return json.flatMap(raw => {
-    const thread = parseThread(raw)
+    const thread = parseThread(raw, 'threads')
     if (!thread || !isRecord(raw)) return []
     const { pylon } = raw
     if (!isRecord(pylon) || typeof pylon.node !== 'string') throw contractError('threads', `a row (${thread.id}) without its pylon`)
     const wants = desired(raw.desired)
     if (!wants) throw contractError('threads', `a row (${thread.id}) without desired`)
-    return [{ ...thread, pylon: { node: pylon.node, actualState: actual(pylon.actualState), failed: strOrNull(pylon.failed) }, desired: wants }]
+    return [{ ...thread, pylon: { node: pylon.node, actualState: actual(pylon.actualState), failed: strOrNull(pylon.failed) }, desired: wants, attention: parseAttention(raw, 'threads', thread.id) }]
   })
 }
 
 export function parseStarted(json: unknown): NexusThread {
-  const thread = parseThread(json)
+  const thread = parseThread(json, 'start')
   if (!thread) throw new Error('nexus start did not print a thread')
   return thread
 }
@@ -142,7 +162,7 @@ const OUTPUT = new Set(['branch', 'diff', 'preview', 'file'])
 
 /** `show --json`: the ThreadDetail, kept to what the pane draws. */
 export function parseDetail(json: unknown): NexusDetail {
-  const thread = isRecord(json) ? parseThread(json.thread) : undefined
+  const thread = isRecord(json) ? parseThread(json.thread, 'show') : undefined
   if (!isRecord(json) || !thread || !isRecord(json.pylon)) throw new Error('nexus show did not print a thread')
   const { pylon } = json
   const wants = desired(json.desired)
@@ -150,6 +170,7 @@ export function parseDetail(json: unknown): NexusDetail {
   if (typeof json.attach !== 'string') throw contractError('show', 'no attach')
   return {
     thread,
+    attention: parseAttention(json, 'show', thread.id),
     pylon: {
       id: str(pylon.id),
       node: str(pylon.node),
@@ -590,6 +611,20 @@ export function threadState(thread: Pick<NexusThread, 'status' | 'agentTurnRunni
   if (thread.status === 'archived' || thread.status === 'deleted') return [thread.status, 'muted']
   if (thread.agentTurnRunning && pylon !== 'failed') return ['agent working', 'work']
   return ACTUAL_BADGE[pylon]
+}
+
+/** The word a list row shows for what an open thread asks of the person; working is the thread's state's own. */
+const ATTENTION_LOOK: Partial<Record<Exclude<NexusAttention, null>, [label: string, tone: Tone]>> = {
+  failed: ['failed', 'bad'],
+  parked: ['parked', 'bad'],
+  reply: ['new reply', 'ok'],
+  waiting: ['waiting', 'busy'],
+}
+
+/** A list row's word and tone: what the control plane's attention asks of the person, else what the thread is doing. */
+export function rowState(thread: NexusThreadRow): [label: string, tone: Tone] {
+  const isOpen = thread.status === 'active' || thread.status === 'idle'
+  return (isOpen && thread.attention && ATTENTION_LOOK[thread.attention]) || threadState(thread, thread.pylon.actualState)
 }
 
 /** "5 min", or null under 45 seconds: the dashboard's spans. */
@@ -1270,25 +1305,24 @@ function addProject(args: readonly string[], invalid: (reason: string) => NexusC
   return { verb: 'add-project', id, repoUrl, node: flags.node, ...(flags.branch ? { branch: flags.branch } : {}) }
 }
 
-/** A thread the strip shows, by what it asks of the person: most urgent first. */
-export type Chip = { thread: NexusThreadRow; kind: 'needs' | 'reply' | 'working'; note: string }
+/** A thread the strip shows, by what it asks of the person. */
+export type Chip = { thread: NexusThreadRow; kind: Exclude<NexusAttention, null>; note: string }
 
-const CHIP_RANK: Record<Chip['kind'], number> = { needs: 0, reply: 1, working: 2 }
+/** docs/cli.md's order of attention, most urgent first, which the strip keeps. */
+const ATTENTION_RANK: Record<Chip['kind'], number> = { failed: 0, parked: 1, reply: 2, working: 3, waiting: 4 }
 
 /**
- * The open threads that ask for the person or are busy: a failed pylon or parked tasks (known only for the thread
- * the pane watches, since `threads` does not carry them), an answer since the person last viewed the thread, then
- * the agents at work with how long since the person's message started them. The rest stay out of the strip.
+ * The open threads whose attention the control plane says asks for the person or is busy, in its order: a failed pylon
+ * or Claude worker launch and parked tasks, a reply no client marked seen, the agents at work with how long since the
+ * person's message started them, and a session waiting for input. The rest stay out of the strip.
  */
-export function stripChips(threads: readonly NexusThreadRow[], strip: NexusStrip, now: number, parked: ReadonlySet<string>): Chip[] {
-  const chips = threads.flatMap((thread): Chip[] => {
-    if (thread.status !== 'active' && thread.status !== 'idle') return []
-    if (thread.pylon.actualState === 'failed' || thread.pylon.failed || parked.has(thread.id)) return [{ thread, kind: 'needs', note: 'needs you' }]
-    if (thread.agentTurnRunning) return [{ thread, kind: 'working', note: `working ${span(now - thread.lastHumanActivityAt) ?? 'now'}` }]
-    if (thread.lastAgentActivityAt > (strip.seen[thread.id] ?? strip.since)) return [{ thread, kind: 'reply', note: 'new reply' }]
-    return []
-  })
-  return chips.sort((a, b) => CHIP_RANK[a.kind] - CHIP_RANK[b.kind] || b.thread.lastActivityAt - a.thread.lastActivityAt)
+export function stripChips(threads: readonly NexusThreadRow[], now: number): Chip[] {
+  const note = (thread: NexusThreadRow, kind: Chip['kind']) =>
+    kind === 'reply' ? 'new reply' : kind === 'working' ? `working ${span(now - thread.lastHumanActivityAt) ?? 'now'}` : kind === 'waiting' ? 'waiting for you' : 'needs you'
+  const chips = threads.flatMap((thread): Chip[] =>
+    thread.attention && (thread.status === 'active' || thread.status === 'idle') ? [{ thread, kind: thread.attention, note: note(thread, thread.attention) }] : [],
+  )
+  return chips.sort((a, b) => ATTENTION_RANK[a.kind] - ATTENTION_RANK[b.kind] || b.thread.lastActivityAt - a.thread.lastActivityAt)
 }
 
 /**

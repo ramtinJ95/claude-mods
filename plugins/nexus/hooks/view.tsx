@@ -90,6 +90,7 @@ import {
   sessionName,
   shownSessions,
   since,
+  rowState,
   span,
   spinner,
   subjectOf,
@@ -479,6 +480,7 @@ function TitleOfList(draw: Draw, scene: Scene) {
   const threads = inScope(list.threads ?? [], scene.scope)
   const open = threads.filter(thread => thread.status === 'active' || thread.status === 'idle').length
   const working = threads.filter(thread => thread.agentTurnRunning).length
+  const unread = threads.filter(thread => thread.attention === 'reply' && (thread.status === 'active' || thread.status === 'idle')).length
   const online = catalog.nodes?.filter(node => node.state === 'online').length
   return TitleBar(
     draw,
@@ -489,7 +491,7 @@ function TitleOfList(draw: Draw, scene: Scene) {
       </Text>
       <Text color="subtle">{` · ${scopeLabel(scene.scope)}`}</Text>
       {list.threads ? (
-        <Text color="subtle">{`   ${working} working · ${open} open`}</Text>
+        <Text color="subtle">{`   ${unread > 0 ? `${unread} new · ` : ''}${working} working · ${open} open`}</Text>
       ) : list.failure ? (
         <Text color="error">{list.failure.kind === 'unreachable' ? '   unreachable' : '   not loaded'}</Text>
       ) : (
@@ -533,7 +535,7 @@ export function ListView(draw: Draw, scene: Scene, actions: PaneActions) {
   }
   // The dashboard's sidebar: a dot by state, the title, the state's word while there is room, how long ago, dim.
   const row = (thread: NexusThreadRow) => {
-    const [label, tone] = threadState(thread, thread.pylon.actualState)
+    const [label, tone] = rowState(thread)
     const age = thread.agentTurnRunning ? 'now' : (span(now - thread.lastActivityAt) ?? 'now')
     const word = label === 'agent working' ? 'working' : label
     const hasWord = scene.width >= 44
@@ -547,7 +549,7 @@ export function ListView(draw: Draw, scene: Scene, actions: PaneActions) {
         <Button key={thread.id} plain autoFocus={isCursor && !isFiltering ? true : undefined} onPress={() => actions.effect({ kind: 'open', thread: thread.id })}>
           {Pointer(draw, isCursor)}
           {Dot(draw, tone)}
-          <Text bold={isCursor} color={isCursor ? 'suggestion' : 'text'}>{` ${title}`}</Text>
+          <Text bold={isCursor || label === 'new reply'} color={isCursor ? 'suggestion' : 'text'}>{` ${title}`}</Text>
           {' '.repeat(Math.max(1, room - cells(title)))}
           {hasWord ? <Text color={LOOK[tone]}>{`  ${word}`}</Text> : ''}
           <Text color="subtle">{`  ${age.padStart(6)}`}</Text>

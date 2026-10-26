@@ -18,6 +18,7 @@ import {
   herdrError,
   isOlder,
   isSettled,
+  isUnread,
   keepTail,
   leftOut,
   matchThread,
@@ -47,6 +48,8 @@ const thread = (over: Partial<NexusThread>): NexusThread => ({
   lastHumanActivityAt: 0,
   lastAgentActivityAt: 0,
   lastActivityAt: 0,
+  lastReplyAt: null,
+  seenAt: null,
   ...over,
 })
 
@@ -196,6 +199,20 @@ describe('the console', () => {
     expect(detail.sessions).toEqual([{ id: 'nexus:1.2', state: 'running', herdrPane: 'nexus:1.2', harness: 'claude-code', harnessSessionId: '9c1e', status: 'working', title: null, message: null }])
     expect(() => parseDetail({ ...DETAIL, desired: undefined })).toThrow('nexus show printed no desired')
     expect(() => parseDetail({ ...DETAIL, attach: undefined })).toThrow('nexus show printed no attach')
+  })
+
+  test('rows and details carry the attention and the seen marker of CLI 0.10.0; one without them throws, and an attention this mod does not know asks nothing', () => {
+    const [fresh] = parseThreads(THREADS)
+    expect(fresh).toMatchObject({ attention: 'working', lastReplyAt: THREADS[0]!.lastReplyAt, seenAt: THREADS[0]!.seenAt })
+    expect(parseDetail({ ...DETAIL, attention: 'reply' })).toMatchObject({ attention: 'reply', thread: { lastReplyAt: DETAIL.thread.lastReplyAt, seenAt: DETAIL.thread.seenAt } })
+    expect(parseThreads([{ ...THREADS[0], attention: 'pondering' }])[0]!.attention).toBeNull()
+    expect(() => parseThreads([{ ...THREADS[0], attention: undefined }])).toThrow('nexus threads printed a thread (th-4f2a00000001) without its attention')
+    expect(() => parseThreads([{ ...THREADS[0], seenAt: undefined }])).toThrow('nexus threads printed a thread (th-4f2a00000001) without seenAt')
+    expect(() => parseDetail({ ...DETAIL, thread: { ...DETAIL.thread, lastReplyAt: undefined } })).toThrow('nexus show printed a thread (th-4f2a00000001) without lastReplyAt')
+    expect(isUnread({ lastReplyAt: 5, seenAt: 4 })).toBe(true)
+    expect(isUnread({ lastReplyAt: 5, seenAt: null })).toBe(true)
+    expect(isUnread({ lastReplyAt: 5, seenAt: 5 })).toBe(false)
+    expect(isUnread({ lastReplyAt: null, seenAt: null })).toBe(false)
   })
 
   test("previews keep the CLI's url and ports their preview; either missing is a contract error, and null ports mean unknown", () => {
