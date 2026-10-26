@@ -3,7 +3,7 @@ import { expect, mock, test, type TestBody } from 'claude-code/testing'
 import { projectArgs } from '../hooks/tools'
 import { register } from '../hooks/register'
 
-import { boot, fake, OPENED } from './fake-cli'
+import { boot, fake, OPENED, PROJECTS } from './fake-cli'
 
 const ID = 'th-4f2a00000001'
 const healthy = { type: 'state', thread: ID, status: 'active', run: 'idle', parkedTasks: 0, queued: 0, pylon: 'running', failed: null, ports: [] }
@@ -209,7 +209,7 @@ test('projects lists raw JSON; adding returns the Project, refreshes the catalog
   await clock.settle()
   expect(cli.runs.filter(args => args[0] === 'projects').length).toBe(baseline + 1)
   expect(cli.isOpen).toBe(false)
-  expect(catalog).toMatchObject({ projects: cli.projects.map(({ id, repoUrl, defaultBranch, defaultNode }) => ({ id, repoUrl, defaultBranch, defaultNode })) })
+  expect(catalog).toMatchObject({ projects: (cli.projects as (typeof PROJECTS)[number][]).map(({ id, repoUrl, defaultBranch, defaultNode }) => ({ id, repoUrl, defaultBranch, defaultNode })) })
   expect(cli.store.project).toBe('web')
   cli.fail.project = { exitCode: 5, error: 'Project docs already exists' }
   expect(await call({ id: 'docs', scratch: true, node: 'offline' })).toMatchObject({ deny: 'nexus (conflict): Project docs already exists' })
