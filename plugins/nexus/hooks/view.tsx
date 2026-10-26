@@ -969,7 +969,7 @@ type Stop = { key: string; node: RenderChildren; gap: 0 | 1; indent: number; ent
 function stopsOf(draw: Draw, scene: Scene, actions: PaneActions, all: readonly Block[], isWorking: boolean, running: Map<string, string>): Stop[] {
   return all.flatMap((block): Stop[] => {
     if (block.kind !== 'tools') {
-      return [{ key: block.key, node: BlockView(draw, block), gap: block.kind === 'notice' && block.tone === 'dim' ? 0 : 1, indent: 0, y: { kind: 'copy', text: block.text } }]
+      return [{ key: block.key, node: BlockView(draw, block, threadOf(scene).detail?.conversation === 'claude'), gap: block.kind === 'notice' && block.tone === 'dim' ? 0 : 1, indent: 0, y: { kind: 'copy', text: block.text } }]
     }
     const tool = (one: ToolRow, indent: number): Stop => {
       const key = `tool-${one.id}`
@@ -1180,7 +1180,7 @@ function otherArgs(tool: ToolRow, diff: ReturnType<typeof diffOf>): string {
 }
 
 /** One text block of the conversation: the person's message, an answer or a notice. An answer streams under the key it keeps once committed. */
-function BlockView(draw: Draw, block: Extract<Block, { kind: 'user' | 'assistant' | 'notice' }>) {
+function BlockView(draw: Draw, block: Extract<Block, { kind: 'user' | 'assistant' | 'notice' }>, isClaude: boolean) {
   const { Box, Text, Markdown } = draw
   switch (block.kind) {
     case 'user':
@@ -1189,7 +1189,7 @@ function BlockView(draw: Draw, block: Extract<Block, { kind: 'user' | 'assistant
           <Text color="subtle">{'❯ '}</Text>
           <Box flexDirection="column" flexShrink={1}>
             <Text color="text">{block.text}</Text>
-            {block.isLive && <Text color="subtle">queued, sends after this run</Text>}
+            {block.isLive && <Text color="subtle">{isClaude ? 'queued, Claude reads it at its next tool step or after this turn' : 'queued, sends after this run'}</Text>}
           </Box>
         </Box>
       )

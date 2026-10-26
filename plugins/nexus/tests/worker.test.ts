@@ -29,7 +29,7 @@ test("a Claude Code worker's conversation is its transcript, read with each poll
   expect(await shows(ui, /Update\(src\/server\.ts\)/)).toBe(true)
   expect(await shows(ui, /Bash\(npm test\)/)).toBe(true)
   // The queued message shows under the turn, and the run line counts the turn's tools, with no abort, which the harness's is.
-  expect(await shows(ui, /also update the docs/)).toBe(true)
+  expect(await shows(ui, /^❯ also update the docs\.?queued, Claude reads it at its next tool step or after this turn$/, 'Box')).toBe(true)
   expect((await ui.find({ type: 'Text', text: /Working…/ }))?.text).toMatch(/^. Working… \(1m 30s · 2 tools this turn · new messages queue\)$/)
   expect(await shows(ui, /^‹ web \/ Add a health check  ◉ working$/)).toBe(true)
   cli.conversation = { ...CONVERSATION, entries: [...CONVERSATION.entries, { kind: 'reply', at: T0, text: 'Done: `/healthz` answers 200.' }], working: false }
