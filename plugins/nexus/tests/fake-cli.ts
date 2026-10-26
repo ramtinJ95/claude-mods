@@ -336,6 +336,9 @@ export async function boot(...[$, on, cli]: [...Body, Fake]) {
     }
     cli.runs.push(argv)
     if (argv[0] === '--version') {
+      const late = cli.slow['--version']
+      if (late) await clock.sleep(Math.min(late, e.init?.timeoutMs ?? 30_000))
+      if (late && late > (e.init?.timeoutMs ?? 30_000)) throw new Error(`timed out after ${e.init?.timeoutMs} ms`)
       const printed = cli.versions?.length ? (cli.versions.shift() as string | null) : cli.version
       return { value: printed === null ? { exitCode: 1, stdout: '', stderr: 'nexus: cannot run\n', isStdoutTruncated: false, isStderrTruncated: false } : { exitCode: 0, stdout: `nexus ${printed}\n`, stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
     }

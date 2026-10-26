@@ -91,6 +91,7 @@ import {
   parseVersion,
   isOlder,
   isPaneRunning,
+  isWorkerDone,
   isWorkerIdle,
   hasDrawnReply,
   transcriptHolds,
@@ -266,14 +267,14 @@ async function nexus($: EngineInterface, args: readonly string[], timeoutMs = RU
 const ATTENTION_CLI = [0, 10, 0]
 
 /** `parse` over `threads` or `show`, a contract error from a CLI before 0.10.0 naming the version it needs. */
-async function threadsJson<T>($: EngineInterface, got: Outcome<unknown>, parse: (json: unknown) => T): Promise<Outcome<T>> {
+async function threadsJson<T>($: EngineInterface, got: Outcome<unknown>, parse: (json: unknown) => T, budget?: Budget): Promise<Outcome<T>> {
   const value = parsed(got, parse)
   if (value.ok || !got.ok) return value
-  return { ok: false, failure: await olderThan($, value.failure, ATTENTION_CLI, 'reading threads with their unread replies') }
+  return { ok: false, failure: await olderThan($, value.failure, ATTENTION_CLI, 'reading threads with their unread replies', budget) }
 }
 
 const threadsFrom = ($: EngineInterface, got: Outcome<unknown>) => threadsJson($, got, parseThreads)
-const detailFrom = ($: EngineInterface, got: Outcome<unknown>) => threadsJson($, got, parseDetail)
+const detailFrom = ($: EngineInterface, got: Outcome<unknown>, budget?: Budget) => threadsJson($, got, parseDetail, budget)
 
 async function listThreads($: EngineInterface, project?: string): Promise<Outcome<NexusThreadRow[]>> {
   return threadsFrom($, await nexus($, ['threads', ...(project ? [`--project=${project}`] : [])]))
@@ -1354,18 +1355,29 @@ async function closeSession($: EngineInterface, thread: string, id: string, isPa
 }
 
 /** `failure`, or when `nexus --version` says the CLI is older than `version`, the version `doing` needs. */
-async function olderThan($: EngineInterface, failure: NexusFailure, version: readonly number[], doing: string): Promise<NexusFailure> {
-  const found = await cliVersion($)
+async function olderThan($: EngineInterface, failure: NexusFailure, version: readonly number[], doing: string, budget?: Budget): Promise<NexusFailure> {
+  const found = await cliVersion($, budget)
   return found && isOlder(found, version) ? { kind: failure.kind, message: `${cli} is ${found.join('.')}: ${doing} needs Nexus CLI ${version.join('.')} or later (nexus --version)` } : failure
 }
 
-/** The CLI's version, or null when `--version` printed none or did not run. */
-async function cliVersion($: EngineInterface): Promise<number[] | null> {
+/** What a tool call has left: the time before its deadline and the abort that cancels it. */
+type Budget = { ms: number; signal: AbortSignal }
+
+/**
+ * The CLI's version, or null when `--version` printed none, did not run, or outlasted `budget`. `$.process.run` takes no
+ * abort signal, so an abort only stops the waiting; the run itself is bounded by the time left.
+ */
+async function cliVersion($: EngineInterface, budget?: Budget): Promise<number[] | null> {
+  if (budget && (budget.signal.aborted || budget.ms <= 0)) return null
+  const { promise, stop } = stopper()
+  budget?.signal.addEventListener('abort', stop)
   try {
-    const ran = await $.process.run([cli, '--version'], { timeoutMs: RUN_MS })
-    return ran.exitCode === 0 ? parseVersion(ran.stdout) : null
+    const ran = await Promise.race([$.process.run([cli, '--version'], { timeoutMs: Math.min(RUN_MS, budget?.ms ?? RUN_MS) }), promise.then(() => null)])
+    return ran?.exitCode === 0 ? parseVersion(ran.stdout) : null
   } catch {
     return null
+  } finally {
+    budget?.signal.removeEventListener('abort', stop)
   }
 }
 
@@ -1777,9 +1789,10 @@ type ClaudeThread = { detail: NexusDetail; reading: ClaudeReading }
  */
 async function claudeThread($: EngineInterface, thread: string, signal: AbortSignal, until = Infinity): Promise<Outcome<ClaudeThread | null>> {
   const left = async () => Math.min(RUN_MS, until - (await $.clock.now()))
-  const detail = await detailFrom($, await toolJson($, ['show', thread], signal, await left()))
+  const detail = await detailFrom($, await toolJson($, ['show', thread], signal, await left()), { ms: await left(), signal })
   if (!detail.ok || detail.value.conversation !== 'claude') return detail.ok ? { ok: true, value: null } : detail
-  const reading = parsed(await toolJson($, ['conversation', thread], signal, await left()), parseClaudeConversation)
+  // The model reads the transcript's whole text cut to one tail, so no tool result is cut on its own first.
+  const reading = parsed(await toolJson($, ['conversation', thread], signal, await left()), json => parseClaudeConversation(json, Infinity))
   return reading.ok ? { ok: true, value: { detail: detail.value, reading: reading.value } } : reading
 }
 
@@ -1789,7 +1802,7 @@ const workerFields = (detail: NexusDetail) =>
 
 /**
  * `wait` on a Claude Code worker thread, from its first reading (`first`) until `until`: its details and transcript read
- * every `CLAUDE_WAIT_MS`, each read cut off at `until`. A failed or stalled launch settles at once. Being idle
+ * every `CLAUDE_WAIT_MS`, each read cut off at `until`. A failed or stalled launch, or a thread that can no longer run (`isWorkerDone`), settles at once. Being idle
  * (`isWorkerIdle`) settles only once the launch has started and a turn shows (in the transcript, or as this wait saw it
  * run), since a worker still launching is idle with nothing in its transcript. A message just typed may not be in the
  * transcript yet, nor its turn reported, so an idle reading settles only when the one a full `CLAUDE_WAIT_MS` before it
@@ -1824,7 +1837,7 @@ async function waitForClaude($: EngineInterface, thread: string, first: ClaudeTh
   for (;;) {
     sawWorking ||= reading.working
     const launch = detail.worker?.state
-    const hasEnded = outage === null && (launch === 'failed' || launch === 'stalled')
+    const hasEnded = outage === null && (launch === 'failed' || launch === 'stalled' || isWorkerDone(claudeState(detail, reading)))
     const isIdle = outage === null && launch === 'started' && (reading.hasTurn || sawWorking) && isWorkerIdle(claudeState(detail, reading))
     if (hasEnded || (isIdle && (wasIdle || sawWorking))) return result(true)
     if (signal.aborted) return result(false, 'cancelled')

@@ -444,8 +444,8 @@ export function appendEntry(rows: readonly NexusRow[], entry: WatchEntry): Nexus
 }
 
 /** `rows` with the call `id` settled by its result, in place. A result whose call is not in the context still shows, as the dashboard shows it. */
-function settle(rows: NexusRow[], id: string, name: string, output: string, isError: boolean, patch: string | null, entry?: number): NexusRow[] {
-  const settled = { outcome: isError ? ('error' as const) : ('ok' as const), output: keepTail(output, OUTPUT_CHARS), lines: lineCount(output), patch }
+function settle(rows: NexusRow[], id: string, name: string, output: string, isError: boolean, patch: string | null, entry?: number, outputChars = OUTPUT_CHARS): NexusRow[] {
+  const settled = { outcome: isError ? ('error' as const) : ('ok' as const), output: keepTail(output, outputChars), lines: lineCount(output), patch }
   const at = rows.findLastIndex(row => row.kind === 'tool' && row.id === id)
   const row = rows[at]
   if (row?.kind === 'tool') rows[at] = { ...row, ...settled }
@@ -562,9 +562,9 @@ const TURN_KINDS = new Set(['prompt', 'reply', 'tool', 'turn'])
  * names it, and the rest as notices, a record of a kind the CLI does not know included. A pull request Claude opened
  * shows once, by its URL, since Claude Code writes its record again with each save of the session (CLI 0.19.0). A queue
  * operation moves only the queue, which Claude takes from by text, or its oldest without one. An entry kind this mod
- * does not know is skipped.
+ * does not know is skipped. Each tool result keeps its last `outputChars`, the pane's bound unless a caller asks for more.
  */
-export function parseClaudeConversation(json: unknown): ClaudeReading {
+export function parseClaudeConversation(json: unknown, outputChars = OUTPUT_CHARS): ClaudeReading {
   if (!isRecord(json) || json.kind !== 'claude' || !Array.isArray(json.entries)) throw contractError('conversation', "a Claude worker's conversation")
   const rows: NexusRow[] = []
   const queued: string[] = []
@@ -589,7 +589,7 @@ export function parseClaudeConversation(json: unknown): ClaudeReading {
         break
       }
       case 'result':
-        settle(rows, str(entry.toolUseId), 'tool', str(entry.output), entry.isError === true, null, dropped + at)
+        settle(rows, str(entry.toolUseId), 'tool', str(entry.output), entry.isError === true, null, dropped + at, outputChars)
         break
       case 'task':
         push(at, { kind: 'notice', tone: 'dim', text: [`Background task ${str(entry.status)}: ${str(entry.summary)}`, strOrNull(entry.result)].filter(Boolean).join('\n') })
@@ -645,10 +645,11 @@ export function claudeWatch(watch: NexusWatch, claude: NexusClaudeShown | null, 
  * Whether a worker's reading means it is done for now: it can no longer run (archived, deleted, parked, a failed
  * pylon), or its session's turn is over with nothing queued, even when the transcript ends at a prompt it never answered.
  */
-export function isWorkerIdle(state: NexusRunState): boolean {
-  if (state.status === 'archived' || state.status === 'deleted' || state.run === 'parked' || state.pylon === 'failed' || state.failed !== null) return true
-  return state.run === 'idle' && state.queued === 0
-}
+export const isWorkerIdle = (state: NexusRunState) => isWorkerDone(state) || (state.run === 'idle' && state.queued === 0)
+
+/** Whether a worker can no longer run: archived, deleted, parked or its pylon failed, whatever its launch says. */
+export const isWorkerDone = (state: NexusRunState) =>
+  state.status === 'archived' || state.status === 'deleted' || state.run === 'parked' || state.pylon === 'failed' || state.failed !== null
 
 /**
  * Whether the pane's watch of `thread` has drawn the reply the details name, as pi-nexus judges it: the watch runs on
