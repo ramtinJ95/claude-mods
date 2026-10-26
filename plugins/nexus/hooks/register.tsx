@@ -62,6 +62,7 @@ import {
   herdrError,
   isSettled,
   keepTail,
+  kept,
   foldReply,
   inScope,
   leftOut,
@@ -380,10 +381,11 @@ async function childJson($: EngineInterface, argv: readonly string[], stop: Prom
   }
 }
 
-async function toolJson($: EngineInterface, args: readonly string[], signal: AbortSignal): Promise<Outcome<unknown>> {
+async function toolJson($: EngineInterface, args: readonly string[], signal: AbortSignal, ms = RUN_MS): Promise<Outcome<unknown>> {
   if (signal.aborted) return failed('cancelled')
+  if (ms <= 0) return failed('timed out')
   const { promise, stop } = stopper()
-  const timer = $.clock.after(RUN_MS, stop)
+  const timer = $.clock.after(ms, stop)
   signal.addEventListener('abort', stop)
   try {
     const got = await childJson($, args, promise)
@@ -570,7 +572,7 @@ async function readClaude($: EngineInterface, thread: string, current: NonNullab
   const reading = parsed(got, parseClaudeConversation)
   await update($, claudeAtom, (was): NexusClaudeShown =>
     reading.ok
-      ? { thread, ...reading.value, failure: null }
+      ? { thread, ...kept(reading.value.rows, reading.value.dropped), working: reading.value.working, queued: reading.value.queued, readAt: reading.value.readAt, failure: null }
       : { ...(was?.thread === thread ? was : { thread, rows: [], dropped: 0, working: false, queued: [], readAt: null }), failure: reading.failure.message },
   )
   return reading.ok ? reading.value.readAt : null
@@ -1769,11 +1771,15 @@ const CLAUDE_WAIT_MS = 2_000
 
 type ClaudeThread = { detail: NexusDetail; reading: ClaudeReading }
 
-/** A Claude Code worker thread's details and transcript, for a tool; null for a harness thread, which its watch reports. */
-async function claudeThread($: EngineInterface, thread: string, signal: AbortSignal): Promise<Outcome<ClaudeThread | null>> {
-  const detail = await detailFrom($, await toolJson($, ['show', thread], signal))
+/**
+ * A Claude Code worker thread's details and transcript, for a tool; null for a harness thread, which its watch reports.
+ * Each read ends by `until`, a time on `$.clock`.
+ */
+async function claudeThread($: EngineInterface, thread: string, signal: AbortSignal, until = Infinity): Promise<Outcome<ClaudeThread | null>> {
+  const left = async () => Math.min(RUN_MS, until - (await $.clock.now()))
+  const detail = await detailFrom($, await toolJson($, ['show', thread], signal, await left()))
   if (!detail.ok || detail.value.conversation !== 'claude') return detail.ok ? { ok: true, value: null } : detail
-  const reading = parsed(await toolJson($, ['conversation', thread], signal), parseClaudeConversation)
+  const reading = parsed(await toolJson($, ['conversation', thread], signal, await left()), parseClaudeConversation)
   return reading.ok ? { ok: true, value: { detail: detail.value, reading: reading.value } } : reading
 }
 
@@ -1782,43 +1788,47 @@ const workerFields = (detail: NexusDetail) =>
   detail.worker ? { worker: { state: detail.worker.state, model: detail.worker.model, ...(detail.worker.message ? { message: keepTail(detail.worker.message, 1_000) } : {}) } } : {}
 
 /**
- * `wait` on a Claude Code worker thread: its details and transcript read every `CLAUDE_WAIT_MS` until it is idle
- * (`isWorkerIdle`), its launch fails, `ms` pass or the call is cancelled. A message just typed may not be in the
+ * `wait` on a Claude Code worker thread, from its first reading (`first`) until `until`: its details and transcript read
+ * every `CLAUDE_WAIT_MS`, each read cut off at `until`. A failed or stalled launch settles at once. Being idle
+ * (`isWorkerIdle`) settles only once the launch has started and a turn shows (in the transcript, or as this wait saw it
+ * run), since a worker still launching is idle with nothing in its transcript. A message just typed may not be in the
  * transcript yet, nor its turn reported, so an idle reading settles only when the one a full `CLAUDE_WAIT_MS` before it
- * was idle too, unless this wait saw the turn run; a deadline too near for that reading ends the wait unsettled. A
- * transcript that ends at a prompt the worker never answered settles so too, its reply null.
+ * was idle too, unless this wait saw the turn run. A deadline too near for the next reading, or passed during one, ends
+ * the wait `timed_out`, and a cancel ends it `cancelled`, both unsettled and with the last reading. A transcript that
+ * ends at a prompt the worker never answered settles so too, its reply null.
  */
-async function waitForClaude($: EngineInterface, thread: string, first: ClaudeThread, ms: number, signal: AbortSignal): Promise<Outcome<unknown>> {
-  const until = (await $.clock.now()) + ms
+async function waitForClaude($: EngineInterface, thread: string, first: ClaudeThread, until: number, signal: AbortSignal): Promise<Outcome<unknown>> {
   let { detail, reading } = first
   let sawWorking = false
   let wasIdle = false
   /** Why the last reading failed, while it fails: the wait goes on with the reading before, as a watch outlives an outage. */
   let outage: string | null = null
-  for (;;) {
+  const result = (settled: boolean, end?: 'timed_out' | 'cancelled'): Outcome<unknown> => {
     const state = claudeState(detail, reading)
-    sawWorking ||= reading.working
-    const isIdle = outage === null && (detail.worker?.state === 'failed' || detail.worker?.state === 'stalled' || isWorkerIdle(state))
-    const settled = isIdle && (wasIdle || sawWorking)
-    const isLate = (await $.clock.now()) + CLAUDE_WAIT_MS > until
-    if (settled || signal.aborted || isLate) {
-      const human = needsHuman(state)
-      const reply = rowsReply(reading.rows, REPLY_CHARS)
-      return {
-        ok: true,
-        value: {
-          thread,
-          settled,
-          ...(!settled && !signal.aborted ? { timed_out: true } : {}),
-          ...(signal.aborted ? { cancelled: true } : {}),
-          ...stateFields(state),
-          ...workerFields(detail),
-          ...(outage ? { outage } : {}),
-          ...(human ? { needs_human: human } : {}),
-          reply: reply ? leftOut(reply.tail, reply.dropped) : null,
-        },
-      }
+    const human = needsHuman(state)
+    const reply = rowsReply(reading.rows, REPLY_CHARS)
+    return {
+      ok: true,
+      value: {
+        thread,
+        settled,
+        ...(end ? { [end]: true } : {}),
+        ...stateFields(state),
+        ...workerFields(detail),
+        ...(outage ? { outage } : {}),
+        ...(human ? { needs_human: human } : {}),
+        reply: reply ? leftOut(reply.tail, reply.dropped) : null,
+      },
     }
+  }
+  for (;;) {
+    sawWorking ||= reading.working
+    const launch = detail.worker?.state
+    const hasEnded = outage === null && (launch === 'failed' || launch === 'stalled')
+    const isIdle = outage === null && launch === 'started' && (reading.hasTurn || sawWorking) && isWorkerIdle(claudeState(detail, reading))
+    if (hasEnded || (isIdle && (wasIdle || sawWorking))) return result(true)
+    if (signal.aborted) return result(false, 'cancelled')
+    if ((await $.clock.now()) + CLAUDE_WAIT_MS > until) return result(false, 'timed_out')
     wasIdle = isIdle
     const { promise, stop } = stopper()
     const timer = $.clock.after(CLAUDE_WAIT_MS, stop)
@@ -1826,9 +1836,10 @@ async function waitForClaude($: EngineInterface, thread: string, first: ClaudeTh
     await promise
     timer.cancel()
     signal.removeEventListener('abort', stop)
-    if (signal.aborted) continue
-    const next = await claudeThread($, thread, signal)
-    if (!next.ok && signal.aborted) return { ok: true, value: { thread, settled: false, cancelled: true } }
+    if (signal.aborted) return result(false, 'cancelled')
+    const next = await claudeThread($, thread, signal, until)
+    if (signal.aborted) return result(false, 'cancelled')
+    if (!next.ok && (await $.clock.now()) >= until) return result(false, 'timed_out')
     if (!next.ok && next.failure.kind !== 'unreachable' && next.failure.kind !== 'failed') return next
     if (!next.ok) {
       outage = next.failure.message
@@ -1952,10 +1963,14 @@ async function runTool($: EngineInterface, tool: keyof typeof TOOLS, input: Reco
       const id = await toolThread($, input)
       if (!id.ok) return answer(id)
       const seconds = typeof input.timeout_seconds === 'number' ? Math.min(600, Math.max(1, Math.round(input.timeout_seconds))) : 300
-      const worker = await claudeThread($, id.value, signal)
+      // The first reading, which says whether the thread is a Claude Code worker's, counts inside the timeout.
+      const until = (await $.clock.now()) + seconds * 1000
+      const worker = await claudeThread($, id.value, signal, until)
+      if (!worker.ok && signal.aborted) return answer({ ok: true, value: { thread: id.value, settled: false, cancelled: true } })
+      if (!worker.ok && (await $.clock.now()) >= until) return answer({ ok: true, value: { thread: id.value, settled: false, timed_out: true } })
       if (!worker.ok) return answer(worker)
-      if (worker.value) return answer(await waitForClaude($, id.value, worker.value, seconds * 1000, signal))
-      const got = await waitFor($, id.value, seconds * 1000, signal)
+      if (worker.value) return answer(await waitForClaude($, id.value, worker.value, until, signal))
+      const got = await waitFor($, id.value, until - (await $.clock.now()), signal)
       if (!got.ok) return answer(got)
       const { watch, reply, settled, timedOut } = got.value
       const human = needsHuman(watch.state)

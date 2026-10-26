@@ -467,7 +467,7 @@ function modelIn(model: string | null, entry: WatchEntry): string | null {
 const KEPT_ROWS = 400
 
 /** `rows` cut to the tail kept, counting what the cut dropped onto `dropped`. */
-function kept(rows: NexusRow[], dropped: number): Pick<NexusWatch, 'rows' | 'dropped'> {
+export function kept(rows: NexusRow[], dropped: number): Pick<NexusWatch, 'rows' | 'dropped'> {
   const cut = Math.max(0, rows.length - KEPT_ROWS)
   return { rows: rows.slice(cut), dropped: dropped + cut }
 }
@@ -548,8 +548,13 @@ const CLAUDE_TOOLS: Record<string, (input: Raw) => { name: string; args: Raw }> 
   Glob: input => ({ name: 'find', args: input }),
 }
 
-/** A Claude Code worker's transcript as the pane keeps it: the rows, the entries left out before them, the run and its queue. */
-export type ClaudeReading = { rows: NexusRow[]; dropped: number; working: boolean; queued: string[]; readAt: number | null }
+/**
+ * A Claude Code worker's transcript: every row of the CLI's window, the entries left out before it, the run and its
+ * queue, and whether a turn shows in it (`hasTurn`: a prompt Claude took, a reply, a tool call or a turn's end).
+ */
+export type ClaudeReading = { rows: NexusRow[]; dropped: number; working: boolean; queued: string[]; readAt: number | null; hasTurn: boolean }
+
+const TURN_KINDS = new Set(['prompt', 'reply', 'tool', 'turn'])
 
 /**
  * `conversation --json` for a Claude Code worker thread (CLI 0.17.0), its entries folded into rows as a watch's are: a
@@ -612,8 +617,8 @@ export function parseClaudeConversation(json: unknown): ClaudeReading {
         break
     }
   }
-  const tail = kept(rows, dropped)
-  return { ...tail, working: json.working === true, queued, readAt: typeof json.readAt === 'number' ? json.readAt : null }
+  const hasTurn = dropped > 0 || json.entries.some(entry => isRecord(entry) && TURN_KINDS.has(str(entry.kind)))
+  return { rows, dropped, working: json.working === true, queued, readAt: typeof json.readAt === 'number' ? json.readAt : null, hasTurn }
 }
 
 /**
