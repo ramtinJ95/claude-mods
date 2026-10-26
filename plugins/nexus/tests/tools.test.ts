@@ -376,3 +376,18 @@ test('a deadline too near for the second reading ends the wait unsettled, never 
   expect(waited).toMatchObject({ settled: false, timed_out: true })
   expect(cli.spawns.filter(argv => argv[0] === 'conversation')).toHaveLength(1)
 })
+
+test('start begins a Claude Code worker with its model on the node asked for, and names the CLI an old one needs', async ($, on) => {
+  const cli = fake()
+  await boot($, on, cli)
+  const start = (input: Record<string, unknown>) => $.tool.call({ tool: 'mcp__nexus__start', project: 'web', ...input } as never)
+  const started = (await start({ message: 'add a health check', claude: true, model: 'claude-sonnet-5-5', node: 'testbench' })) as { result: string }
+  expect(JSON.parse(started.result)).toEqual({ id: 'th-123456789abc', project: 'web', title: 'New one' })
+  expect(cli.runs.filter(argv => argv[0] === 'start')).toEqual([['start', '--json', '--project=web', '--claude=add a health check', '--model=claude-sonnet-5-5', '--node=testbench']])
+  await start({ message: 'fix the login form', title: 'Login' })
+  expect(cli.runs.filter(argv => argv[0] === 'start').at(-1)).toEqual(['start', '--json', '--project=web', '--title=Login', '--message=fix the login form'])
+  expect(await start({ message: 'fix it', model: 'claude-sonnet-5-5' })).toEqual({ deny: 'model needs claude: true' })
+  cli.version = '0.14.0'
+  cli.fail.start = { exitCode: 64, error: "Unknown option '--claude'" }
+  expect(await start({ message: 'add a health check', claude: true })).toEqual({ deny: 'nexus (invalid): nexus is 0.14.0: starting a Claude Code worker needs Nexus CLI 0.15.0 or later (nexus --version)' })
+})

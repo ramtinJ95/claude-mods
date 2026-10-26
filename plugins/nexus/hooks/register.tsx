@@ -1535,17 +1535,25 @@ async function send($: EngineInterface, id: string, text: string): Promise<Outco
 
 const saySent = (id: string, sent: Outcome<Sent>): Outcome<string> => (sent.ok ? { ok: true, value: sentText(id, sent.value) } : sent)
 
-type StartFields = { project: string; title?: string | undefined; message?: string | undefined; node?: string | undefined; branch?: string | undefined }
+/** What `start` sends: `message` for the Nexus agent, or `claude`, a Claude Code worker's first prompt, with its `model`. */
+type StartFields = {
+  project: string
+  title?: string | undefined
+  message?: string | undefined
+  claude?: string | undefined
+  model?: string | undefined
+  node?: string | undefined
+  branch?: string | undefined
+}
 
-async function start($: EngineInterface, fields: StartFields) {
+async function start($: EngineInterface, fields: StartFields): Promise<Outcome<NexusThread>> {
   const got = await nexus($, [
     'start',
     `--project=${fields.project}`,
-    ...(fields.title ? [`--title=${fields.title}`] : []),
-    ...(fields.message ? [`--message=${fields.message}`] : []),
-    ...(fields.node ? [`--node=${fields.node}`] : []),
-    ...(fields.branch ? [`--branch=${fields.branch}`] : []),
+    ...(['title', 'message', 'claude', 'model', 'node', 'branch'] as const).flatMap(key => (fields[key] ? [`--${key}=${fields[key]}`] : [])),
   ])
+  // `--claude` came with CLI 0.15.0 and `--model` with 0.16.0; an older CLI refuses them as unknown options.
+  if (!got.ok && fields.claude) return { ok: false, failure: await olderThan($, got.failure, fields.model ? [0, 16, 0] : [0, 15, 0], 'starting a Claude Code worker') }
   if (!got.ok) return got
   void poll($)
   return parsed(got, parseStarted)
@@ -1899,7 +1907,10 @@ async function runTool($: EngineInterface, tool: keyof typeof TOOLS, input: Reco
       const project = str(input, 'project')
       const message = str(input, 'message')
       if (!project || !message) return { deny: 'project and message are required' }
-      const started = await start($, { project, message, title: str(input, 'title') })
+      const model = str(input, 'model')
+      const isClaude = input.claude === true
+      if (model && !isClaude) return { deny: 'model needs claude: true' }
+      const started = await start($, { project, title: str(input, 'title'), node: str(input, 'node'), ...(isClaude ? { claude: message, model } : { message }) })
       return answer(started.ok ? { ok: true, value: { id: started.value.id, project: started.value.project, title: started.value.title } } : started)
     }
     case 'send': {

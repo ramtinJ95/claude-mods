@@ -48,11 +48,19 @@ export const TOOLS = {
   },
   start: {
     name: 'start',
-    description: 'Start a Nexus thread on a project with a first message for its agent, and return its id. The agent works on its own; use wait for its reply.',
+    description:
+      'Start a Nexus thread on a project with a first message for its agent, or with claude: true a Claude Code worker, and return its id. The agent works on its own; use wait for its reply.',
     inputSchema: {
       type: 'object',
       additionalProperties: false,
-      properties: { project: { type: 'string' }, message: { type: 'string' }, title: { type: 'string', description: 'Defaults to the first line of message' } },
+      properties: {
+        project: { type: 'string' },
+        message: { type: 'string' },
+        title: { type: 'string', description: 'Defaults to the first line of message' },
+        claude: { type: 'boolean', description: 'Start a Claude Code worker with message as its first prompt instead of the Nexus agent' },
+        model: { type: 'string', description: "The Claude Code worker's model, with claude: true. Defaults to the CLI's" },
+        node: { type: 'string', description: "Defaults to the project's node" },
+      },
       required: ['project', 'message'],
     },
   },
