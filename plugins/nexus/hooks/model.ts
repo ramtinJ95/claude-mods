@@ -7,6 +7,7 @@ import type {
   NexusBase,
   NexusChangedFile,
   NexusChanges,
+  NexusClaudeShown,
   NexusDesired,
   NexusDiffRow,
   NexusFileStatus,
@@ -76,7 +77,7 @@ function parseThread(raw: unknown, command: string): NexusThread | undefined {
     title: raw.title,
     project: raw.project,
     status: raw.status as NexusThread['status'],
-    agentTurnRunning: raw.agentTurnRunning === true,
+    agentTurnRunning: raw.agentTurnRunning === true || raw.sessionTurnRunning === true,
     createdAt: num(raw.createdAt),
     lastHumanActivityAt: num(raw.lastHumanActivityAt),
     lastAgentActivityAt: num(raw.lastAgentActivityAt),
@@ -186,7 +187,8 @@ export function parseDetail(json: unknown): NexusDetail {
       isRecord(raw) && OUTPUT.has(str(raw.kind)) ? [{ kind: raw.kind as NexusDetail['outputs'][number]['kind'], ref: str(raw.ref) }] : [],
     ),
     agent: isRecord(json.agent) ? { parkedTasks: num(json.agent.parkedTasks) } : null,
-    hasConversation: isRecord(json.thread) && typeof json.thread.conversationId === 'string',
+    conversation: isRecord(json.claudeWorker) ? 'claude' : isRecord(json.thread) && typeof json.thread.conversationId === 'string' ? 'agent' : null,
+    worker: isRecord(json.claudeWorker) ? { state: str(json.claudeWorker.state), model: strOrNull(json.claudeWorker.model), message: strOrNull(json.claudeWorker.message) } : null,
     desired: wants,
     attach: json.attach,
   }
@@ -431,19 +433,22 @@ export function appendEntry(rows: readonly NexusRow[], entry: WatchEntry): Nexus
         if (message.stopReason === 'aborted') next.push({ kind: 'notice', tone: 'dim', text: 'Aborted.' })
         break
       }
-      case 'toolResult': {
-        const output = contentText(message.content)
-        const settled = { outcome: message.isError ? ('error' as const) : ('ok' as const), output: keepTail(output, OUTPUT_CHARS), lines: lineCount(output), patch: patchOf(message.details) }
-        const at = next.findLastIndex(row => row.kind === 'tool' && row.id === message.toolCallId)
-        const row = next[at]
-        // A result whose call is not in the context still shows, as the dashboard shows it.
-        if (row?.kind === 'tool') next[at] = { ...row, ...settled }
-        else next.push({ ...toolRow(message.toolCallId ?? '', message.toolName ?? 'tool', {}), ...settled })
+      case 'toolResult':
+        settle(next, message.toolCallId ?? '', message.toolName ?? 'tool', contentText(message.content), message.isError === true, patchOf(message.details))
         break
-      }
     }
   }
   return next
+}
+
+/** `rows` with the call `id` settled by its result, in place. A result whose call is not in the context still shows, as the dashboard shows it. */
+function settle(rows: NexusRow[], id: string, name: string, output: string, isError: boolean, patch: string | null): NexusRow[] {
+  const settled = { outcome: isError ? ('error' as const) : ('ok' as const), output: keepTail(output, OUTPUT_CHARS), lines: lineCount(output), patch }
+  const at = rows.findLastIndex(row => row.kind === 'tool' && row.id === id)
+  const row = rows[at]
+  if (row?.kind === 'tool') rows[at] = { ...row, ...settled }
+  else rows.push({ ...toolRow(id, name, {}), ...settled })
+  return rows
 }
 
 function toolRow(id: string, name: string, args: unknown): Extract<NexusRow, { kind: 'tool' }> {
@@ -526,6 +531,137 @@ export function leftOut(cut: string, dropped: number): string {
   if (dropped === 0) return cut
   const line = cut.indexOf('\n')
   return `[${dropped} earlier characters left out]\n${line >= 0 && line < cut.length / 4 ? cut.slice(line + 1) : cut}`
+}
+
+/** Claude Code's tools as the rows name pi's, so they draw, fold and diff alike. Any other keeps its name and input. */
+const CLAUDE_TOOLS: Record<string, (input: Raw) => { name: string; args: Raw }> = {
+  Bash: input => ({ name: 'bash', args: input }),
+  // A `!` command typed at the session's prompt.
+  shell: input => ({ name: 'bash', args: input }),
+  Read: input => ({ name: 'read', args: { ...input, path: input.file_path } }),
+  Edit: input => ({ name: 'edit', args: { path: input.file_path, edits: [{ oldText: input.old_string, newText: input.new_string }] } }),
+  MultiEdit: input => ({ name: 'edit', args: { path: input.file_path, edits: list(input.edits).map(edit => (isRecord(edit) ? { oldText: edit.old_string, newText: edit.new_string } : {})) } }),
+  Write: input => ({ name: 'write', args: { path: input.file_path, content: input.content } }),
+  Grep: input => ({ name: 'grep', args: input }),
+  Glob: input => ({ name: 'find', args: input }),
+}
+
+/** A Claude Code worker's transcript as the pane keeps it: the rows, the entries left out before them, the run and its queue. */
+export type ClaudeReading = { rows: NexusRow[]; dropped: number; working: boolean; queued: string[] }
+
+/**
+ * `conversation --json` for a Claude Code worker thread (CLI 0.17.0), its entries folded into rows as a watch's are: a
+ * prompt from the person or a slash command as theirs, a reply as an answer, a tool call settled by the result that
+ * names it, and the rest as notices, a record of a kind the CLI does not know included. A queue operation moves only
+ * the queue, which Claude takes from by text, or its oldest without one. An entry kind this mod does not know is skipped.
+ */
+export function parseClaudeConversation(json: unknown): ClaudeReading {
+  if (!isRecord(json) || json.kind !== 'claude' || !Array.isArray(json.entries)) throw contractError('conversation', "a Claude worker's conversation")
+  const rows: NexusRow[] = []
+  const queued: string[] = []
+  for (const entry of json.entries) {
+    if (!isRecord(entry)) continue
+    switch (entry.kind) {
+      case 'prompt':
+        if (!str(entry.text).trim()) break
+        rows.push(entry.from === 'other' ? { kind: 'notice', tone: 'dim', text: str(entry.text).trim() } : { kind: 'user', text: str(entry.text).trim(), at: typeof entry.at === 'number' ? entry.at : null })
+        break
+      case 'reply':
+        if (str(entry.text).trim()) rows.push({ kind: 'assistant', text: str(entry.text).trim() })
+        break
+      case 'tool': {
+        const input = isRecord(entry.input) ? entry.input : {}
+        const { name, args } = CLAUDE_TOOLS[str(entry.name)]?.(input) ?? { name: str(entry.name), args: input }
+        rows.push(toolRow(str(entry.id), name, args))
+        break
+      }
+      case 'result':
+        settle(rows, str(entry.toolUseId), 'tool', str(entry.output), entry.isError === true, null)
+        break
+      case 'task':
+        rows.push({ kind: 'notice', tone: 'dim', text: [`Background task ${str(entry.status)}: ${str(entry.summary)}`, strOrNull(entry.result)].filter(Boolean).join('\n') })
+        break
+      case 'queue': {
+        const text = strOrNull(entry.text)
+        if (entry.op === 'enqueue') {
+          queued.push(text ?? '')
+          break
+        }
+        const taken = text === null ? 0 : queued.indexOf(text)
+        if (taken !== -1) queued.splice(taken, 1)
+        break
+      }
+      case 'notice':
+        rows.push({ kind: 'notice', tone: entry.tone === 'error' ? 'error' : 'dim', text: str(entry.text) })
+        break
+      case 'record':
+        rows.push({ kind: 'notice', tone: 'dim', text: str(entry.summary) })
+        break
+    }
+  }
+  const { rows: tail, dropped } = kept(rows, num(json.dropped))
+  return { rows: tail, dropped, working: json.working === true, queued }
+}
+
+/**
+ * A Claude Code worker thread's conversation in the watch's place, since `nexus watch` streams none of it: the rows,
+ * the run and its queue from `nexus conversation`, the thread's status, pylon and ports still from the watch, the model
+ * the worker was asked for, and a failed read as the outage.
+ */
+export function claudeWatch(watch: NexusWatch, claude: NexusClaudeShown | null, model: string | null): { watch: NexusWatch; live: NexusLive } {
+  const run = watch.state?.run === 'parked' ? 'parked' : claude?.working ? 'working' : 'idle'
+  return {
+    watch: {
+      ...watch,
+      rows: claude?.rows ?? [],
+      dropped: claude?.dropped ?? 0,
+      state: watch.state && { ...watch.state, run, queued: claude?.queued.length ?? 0 },
+      model: model ?? watch.model,
+      outage: claude?.failure ? `The conversation could not be read: ${sentence(claude.failure)}` : watch.outage,
+    },
+    live: { queued: claude?.queued.filter(Boolean) ?? [], tools: [], partial: null, retry: null },
+  }
+}
+
+/** A Claude Code worker thread's state for the tools, from its details and its conversation, as a watch `state` reports a harness thread's. */
+export const claudeState = (detail: NexusDetail, reading: ClaudeReading): NexusRunState => ({
+  status: detail.thread.status,
+  run: detail.agent?.parkedTasks ? 'parked' : reading.working ? 'working' : 'idle',
+  parkedTasks: detail.agent?.parkedTasks ?? 0,
+  queued: reading.queued.length,
+  pylon: detail.pylon.actualState,
+  failed: detail.pylon.failed,
+  ports: detail.ports,
+})
+
+/** The agent's texts since the person's last message in `rows`, as `foldReply` gathers them from a watch. */
+export const rowsReply = (rows: readonly NexusRow[], max: number) => addReply(undefined, rows, max)
+
+/** Rows as plain text for the model: each message, call and notice, a call with its output, as the CLI renders a harness conversation. */
+export function rowsText(rows: readonly NexusRow[], max: number): string {
+  const text = rows
+    .map(row => (row.kind === 'user' ? `> ${row.text}` : row.kind === 'tool' ? [`${toolName(row.name)}(${row.summary})`, row.output.trimEnd()].filter(Boolean).join('\n') : row.text))
+    .join('\n\n')
+  return keepTail(text || 'No messages yet.', max)
+}
+
+/** What `send` did: a harness thread's message queued for its agent, or a Claude Code worker's typed into its session (CLI 0.17.0). */
+export type Sent = { kind: 'agent' } | { kind: 'claude'; outcome: 'sent' | 'queued'; resumed: boolean }
+
+export function parseSent(json: unknown): Sent {
+  const claude = isRecord(json) ? json.claude : undefined
+  if (claude === undefined) return { kind: 'agent' }
+  if (!isRecord(claude) || (claude.outcome !== 'sent' && claude.outcome !== 'queued')) throw contractError('send', 'a Claude send without its outcome')
+  return { kind: 'claude', outcome: claude.outcome, resumed: claude.resumed === true }
+}
+
+/** What a send says it did, in the person's words. */
+export function sentText(thread: string, sent: Sent): string {
+  if (sent.kind === 'agent') return `Sent to ${thread}.`
+  const resumed = sent.resumed ? ' Nexus resumed the session first, as no pane ran it.' : ''
+  return sent.outcome === 'sent'
+    ? `Sent to the Claude Code session of ${thread}.${resumed}`
+    : `Queued in the Claude Code session of ${thread}: Claude reads it at its next tool step, or after this turn.${resumed}`
 }
 
 /** A conversation for the model: the CLI's own rendering of each entry. */

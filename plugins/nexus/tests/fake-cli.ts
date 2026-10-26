@@ -114,6 +114,29 @@ export const ENTRIES = [
 export const state = (run: string, extra: Record<string, unknown> = {}) => ({ type: 'state', thread: ID, status: 'active', run, parkedTasks: 0, queued: 0, pylon: 'running', failed: null, ports: PORTS, ...extra })
 export const live = (extra: Record<string, unknown> = {}) => ({ type: 'live', thread: ID, queued: [], tools: [], partial: null, retry: null, ...extra })
 
+/** A Claude Code worker thread (CLI 0.17.0): no harness conversation, its turn a reported session's. */
+export const WORKER = { ...THREAD, id: 'th-c1a0de000009', title: 'Add a health check', conversationId: null, agentTurnRunning: false, sessionTurnRunning: true }
+export const WORKER_DETAIL = { ...DETAIL, thread: WORKER, agent: null, claudeWorker: { model: 'claude-opus-5-5', state: 'started' } }
+
+/** What `nexus conversation` prints for the worker: a prompt, an answer, an edit, a failed command, a message queued behind the turn. */
+export const CONVERSATION = {
+  kind: 'claude',
+  session: '5e55-10n',
+  entries: [
+    { kind: 'prompt', at: T0 - 90_000, text: '/poteto-mode add a health check', from: 'command' },
+    { kind: 'reply', at: T0 - 80_000, text: 'Adding `/healthz`.' },
+    { kind: 'tool', at: T0 - 70_000, id: 'toolu_1', name: 'Edit', input: { file_path: 'src/server.ts', old_string: 'app.listen()', new_string: "app.get('/healthz', ok)\napp.listen()" } },
+    { kind: 'result', at: T0 - 69_000, toolUseId: 'toolu_1', output: 'The file src/server.ts has been updated.', isError: false },
+    { kind: 'tool', at: T0 - 60_000, id: 'toolu_2', name: 'Bash', input: { command: 'npm test', description: 'Run the tests' } },
+    { kind: 'result', at: T0 - 50_000, toolUseId: 'toolu_2', output: 'FAIL server.test.ts', isError: true },
+    { kind: 'queue', at: T0 - 40_000, op: 'enqueue', text: 'also update the docs' },
+    { kind: 'sparkle', at: T0 - 30_000, text: 'a kind from a newer CLI' },
+  ],
+  dropped: 0,
+  readAt: T0,
+  working: true,
+}
+
 /** `changes --json` since the pylon booted: a nested folder, a rename, a deletion, a binary file and a file at the root. */
 export const CHANGES = {
   base: { kind: 'start', commit: 'a1b2c3d' },
@@ -164,6 +187,10 @@ export type Fake = {
   changes: unknown
   /** What `diff` answers, for any file. */
   diff: unknown
+  /** What `conversation` answers: a Claude Code worker's transcript. */
+  conversation: unknown
+  /** What `send` answers. */
+  sent: unknown
   /** The watch's lines in order; a `{ delay }` holds the stream that long on the test's clock first. */
   watch: unknown[]
   /** A verb whose answer comes that many milliseconds late on the test's clock. */
@@ -230,7 +257,7 @@ function parseProjectAdd(args: readonly string[]): { values: Record<string, stri
 export function fake(change: Partial<Fake> = {}): Fake {
   // A copy, as the mod writes the store a test reads: a fixture shared by tests would carry one's writes into the next.
   const store = structuredClone(change.store ?? { themeNotice: true })
-  return { runs: [], spawns: [], threads: THREADS, projects: PROJECTS, detail: DETAIL, changes: CHANGES, diff: DIFF, watch: [{ type: 'reset', thread: ID, entries: ENTRIES }, state('working'), live()], slow: {}, fail: {}, printed: {}, publishes: true, answer: 'Keep', asked: [], offered: [], copied: [], toasts: [], opens: 0, isOpen: false, nextPane: 'nexus:2.1', version: '0.17.0', herdr: [], herdrFail: {}, env: {}, ...change, store }
+  return { runs: [], spawns: [], threads: THREADS, projects: PROJECTS, detail: DETAIL, changes: CHANGES, diff: DIFF, conversation: CONVERSATION, sent: { submission: 3 }, watch: [{ type: 'reset', thread: ID, entries: ENTRIES }, state('working'), live()], slow: {}, fail: {}, printed: {}, publishes: true, answer: 'Keep', asked: [], offered: [], copied: [], toasts: [], opens: 0, isOpen: false, nextPane: 'nexus:2.1', version: '0.17.0', herdr: [], herdrFail: {}, env: {}, ...change, store }
 }
 
 /** `detail` with the linked preview of `port` published, or gone when `preview` is null. */
@@ -274,7 +301,7 @@ export async function boot(...[$, on, cli]: [...Body, Fake]) {
     show: () => cli.detail,
     wake: () => null,
     seen: () => null,
-    send: () => ({ submission: 3 }),
+    send: () => cli.sent,
     abort: () => null,
     retry: () => null,
     'retry-pylon': () => null,
@@ -286,6 +313,7 @@ export async function boot(...[$, on, cli]: [...Body, Fake]) {
     unpreview: () => null,
     changes: () => cli.changes,
     diff: () => cli.diff,
+    conversation: () => cli.conversation,
   }
   on('process.run', async (_, e) => {
     const argv = e.argv.slice(1)

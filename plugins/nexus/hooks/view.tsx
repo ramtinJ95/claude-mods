@@ -652,6 +652,9 @@ const TAB_LABEL: Record<NexusTab, string> = { conversation: 'Conversation', chan
 /** What the body laid out for the keys, filled in once it is drawn: Enter on the active tab acts on it as o does. */
 type Holder = { nav: Nav }
 
+/** The newest lines of a Claude worker's launch diagnostic the Pylon tab shows: a stalled launch carries the pane's last 20. */
+const WORKER_LINES = 8
+
 /** What the Changes and Previews labels count: the files of the last read, and the previews. */
 type Counts = Partial<Record<NexusTab, number>>
 
@@ -745,9 +748,11 @@ function menuOf(scene: Scene): { action: MenuAction; label: string }[] {
   const status = state?.status ?? thread?.status
   const failed = detail?.pylon.failed ?? state?.failed ?? null
   const refused = detail?.pylon.retryRefused ?? null
+  // The harness's abort and retry do not reach a Claude Code worker: its run is the session's.
+  const isHarness = detail?.conversation !== 'claude'
   return [
-    ...(state?.run === 'working' ? [{ action: 'abort' as const, label: 'Abort the run' }] : []),
-    ...(state?.run === 'parked' && status !== 'archived' ? [{ action: 'retry' as const, label: 'Retry the parked tasks' }] : []),
+    ...(isHarness && state?.run === 'working' ? [{ action: 'abort' as const, label: 'Abort the run' }] : []),
+    ...(isHarness && state?.run === 'parked' && status !== 'archived' ? [{ action: 'retry' as const, label: 'Retry the parked tasks' }] : []),
     ...(failed && !refused ? [{ action: 'retry-pylon' as const, label: 'Retry the pylon' }] : []),
     ...(failed ? [{ action: 'start-again' as const, label: 'Start again from its project and title' }] : []),
     ...(status === 'active' || status === 'idle' ? [{ action: 'archive' as const, label: 'Archive' }] : []),
@@ -768,7 +773,7 @@ export function ThreadView(draw: Draw, scene: Scene, actions: PaneActions) {
   const failed = detail?.pylon.failed ?? state?.failed ?? null
   const refused = detail?.pylon.retryRefused ?? null
   // Only a live thread with a conversation and a pylon not given up on takes messages, so only it draws the composer.
-  const canInsert = status !== 'deleted' && status !== 'archived' && !failed && (!detail || detail.hasConversation)
+  const canInsert = status !== 'deleted' && status !== 'archived' && !failed && (!detail || detail.conversation !== null)
   const { pane } = scene
   const ports = detail ? portsOf(scene, detail) : null
   const holder: Holder = { nav: { context: 'none' } }
@@ -999,7 +1004,7 @@ function Conversation(draw: Draw, scene: Scene, actions: PaneActions, area: numb
   const watch = scene.watch?.thread === id ? scene.watch : null
   const empty = (text: string | null): Body => ({ nav: { context: 'conversation', items: [], total: 0, area, canInsert }, node: text && <Text color="subtle">{text}</Text> })
   if (thread?.status === 'deleted' || watch?.state?.status === 'deleted') return empty('The thread is deleted, so its conversation is gone.')
-  if (detail && !detail.hasConversation) return empty('This thread has no agent conversation.')
+  if (detail?.conversation === null) return empty('This thread has no agent conversation.')
   if (!watch?.state) return empty(null)
   const all = blocks(watch.rows, watch.dropped, scene.live)
   if (all.length === 0) return empty('No messages yet.')
@@ -1328,7 +1333,7 @@ function ResultLines(draw: Draw, tool: ToolRow, status: ToolStatus, live: string
 /** The run's line above the composer: the spinner and clock while it works, the parked tasks while they hold it. */
 function RunLine(draw: Draw, scene: Scene) {
   const { Box, Text } = draw
-  const { id, thread } = threadOf(scene)
+  const { id, thread, detail } = threadOf(scene)
   const watch = scene.watch?.thread === id ? scene.watch : null
   const state = watch?.state
   if (!state || state.status === 'deleted') return null
@@ -1348,7 +1353,7 @@ function RunLine(draw: Draw, scene: Scene) {
     run.since !== null ? clock(scene.now - run.since) : null,
     `${plural(run.tools, 'tool', 'tools')} this turn`,
     (thread?.status ?? state.status) !== 'archived' ? 'new messages queue' : null,
-    'm to abort',
+    detail?.conversation !== 'claude' ? 'm to abort' : null,
   ].filter(Boolean)
   return (
     <Box key="run" marginTop={1}>
@@ -1366,7 +1371,7 @@ function Composer(draw: Draw, scene: Scene, actions: PaneActions, pylon: { faile
   const { id, thread, detail } = threadOf(scene)
   const watch = scene.watch?.thread === id ? scene.watch : null
   const status = watch?.state?.status ?? thread?.status
-  if (status === 'deleted' || (detail && !detail.hasConversation)) return null
+  if (status === 'deleted' || detail?.conversation === null) return null
   // Only the planner giving up holds the pylon until a person acts. A pylon reported broken may still resume.
   if (pylon.failed) {
     return (
@@ -1892,6 +1897,8 @@ function PylonBody(draw: Draw, scene: Scene, actions: PaneActions, area: number,
       {kv('Last seen', observed, 'seen')}
       {kv('Human', since(thread.lastHumanActivityAt, scene.now), 'human')}
       {kv('Agent', thread.agentTurnRunning ? 'turn running' : since(thread.lastAgentActivityAt, scene.now), 'agent')}
+      {detail.worker && kv('Worker', `Claude Code · ${detail.worker.model ?? 'model unknown'} · ${detail.worker.state}`, 'worker')}
+      {detail.worker?.message && <Text color={detail.worker.state === 'started' ? 'subtle' : 'error'}>{detail.worker.message.trimEnd().split('\n').slice(-WORKER_LINES).join('\n')}</Text>}
       <Text color="subtle">{pylon.id}</Text>
       {pylon.failed && <Text color="error">{`The planner gave up: ${pylon.failed}`}</Text>}
     </Box>,

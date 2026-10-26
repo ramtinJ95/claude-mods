@@ -6,6 +6,7 @@ import type {
   NexusChangedFile,
   NexusBase,
   NexusCheckout,
+  NexusClaudeShown,
   NexusDetail,
   NexusDiffShown,
   NexusFailure,
@@ -40,6 +41,7 @@ import {
   NO_CHANGE,
   NO_SESSION_CHANGES,
   USAGE,
+  type ClaudeReading,
   type WatchEntry,
   type WatchEvent,
   ago,
@@ -59,6 +61,7 @@ import {
   groupThreads,
   herdrError,
   isSettled,
+  keepTail,
   foldReply,
   inScope,
   leftOut,
@@ -76,6 +79,14 @@ import {
   parsePreview,
   parseProjects,
   parseSessionClosed,
+  parseClaudeConversation,
+  parseSent,
+  sentText,
+  type Sent,
+  claudeWatch,
+  claudeState,
+  rowsReply,
+  rowsText,
   parseVersion,
   isOlder,
   isUnread,
@@ -127,6 +138,8 @@ const liveAtom = atom(LIVE, null)
 const SHOWN = { plugin: 'nexus', key: 'shown' } as const
 const shownAtom = atom(SHOWN, null)
 const catalogAtom = atom({ plugin: 'nexus', key: 'catalog' } as const, { projects: null, nodes: null, nodesFailure: null, projectsFailure: null })
+const CLAUDE = { plugin: 'nexus', key: 'claude' } as const
+const claudeAtom = atom(CLAUDE, null)
 const NOW = { plugin: 'nexus', key: 'now' } as const
 const nowAtom = atom(NOW, 0)
 const paneAtom = atom({ plugin: 'nexus', key: 'pane' } as const, {
@@ -519,6 +532,7 @@ async function poll($: EngineInterface) {
     if (detail.ok && changes && settleSessions(changes, detail.value.sessions, now) !== changes) {
       await changeSessions($, thread, was => settleSessions(was, detail.value.sessions, now))
     }
+    if (detail.ok && detail.value.conversation === 'claude') await readClaude($, thread, current)
   } finally {
     current.isBusy = false
     if (current.isAgain && poller === current) {
@@ -526,6 +540,21 @@ async function poll($: EngineInterface) {
       void poll($)
     }
   }
+}
+
+/**
+ * The Claude Code worker transcript of the thread shown, as part of its poll, since `nexus watch` streams none: one
+ * `nexus conversation`, which never wakes the pylon and reads it only while it runs. A failed read keeps the rows it had.
+ */
+async function readClaude($: EngineInterface, thread: string, current: NonNullable<typeof poller>) {
+  const got = await childJson($, ['conversation', thread], current.stopped)
+  if (!got || poller !== current || (await read($, paneAtom)).selected !== thread) return
+  const reading = parsed(got, parseClaudeConversation)
+  await update($, claudeAtom, (was): NexusClaudeShown =>
+    reading.ok
+      ? { thread, ...reading.value, failure: null }
+      : { ...(was?.thread === thread ? was : { thread, rows: [], dropped: 0, working: false, queued: [] }), failure: reading.failure.message },
+  )
 }
 
 /** Polls now, or once the poll under way ends, since that one may have read what was there before a change. */
@@ -536,8 +565,8 @@ function pollAgain($: EngineInterface) {
 
 /** Moves the run clock while the thread shown works, so its timer and spinner tick. */
 async function tick($: EngineInterface) {
-  const watch = await read($, watchAtom)
-  if (watch?.state?.run === 'working') await $.state.set(NOW, await $.clock.now())
+  const [watch, claude] = await Promise.all([read($, watchAtom), read($, claudeAtom)])
+  if (watch?.state?.run === 'working' || claude?.working) await $.state.set(NOW, await $.clock.now())
 }
 
 /** `projects` and `nodes` for the start form, the project picker, the list's nodes line and the previews' links. */
@@ -930,7 +959,7 @@ const focusOn = ($: EngineInterface, key: string) =>
 /** What the thread just shown runs: its details polled afresh and its watch, while the pane is open. */
 async function followThread($: EngineInterface, thread: string) {
   const shown = await read($, shownAtom)
-  if (shown?.thread !== thread) await $.state.set(SHOWN, null)
+  if (shown?.thread !== thread) await Promise.all([$.state.set(SHOWN, null), $.state.set(CLAUDE, null)])
   await leaveCheckout($, thread)
   // The person may have moved on during those awaits: only the thread still shown is followed.
   const pane = await read($, paneAtom)
@@ -1434,11 +1463,15 @@ const tabOpened = (label: string) =>
 const say = (outcome: Outcome<string>) =>
   outcome.ok ? outcome.value : sentence(outcome.failure.message.replace(/^./, first => first.toUpperCase()))
 
-async function send($: EngineInterface, id: string, text: string): Promise<Outcome<string>> {
+/** Sends `text` to the thread's agent, or types it into its Claude Code worker's session; the thread shown is read again to show it. */
+async function send($: EngineInterface, id: string, text: string): Promise<Outcome<Sent>> {
   // `--` keeps a message that starts with a dash from reading as a flag.
-  const got = await nexus($, ['send', id, '--', text])
-  return got.ok ? { ok: true, value: `Sent to ${id}.` } : got
+  const sent = parsed(await nexus($, ['send', id, '--', text]), parseSent)
+  if (sent.ok && (await read($, paneAtom)).selected === id) pollAgain($)
+  return sent
 }
+
+const saySent = (id: string, sent: Outcome<Sent>): Outcome<string> => (sent.ok ? { ok: true, value: sentText(id, sent.value) } : sent)
 
 type StartFields = { project: string; title?: string | undefined; message?: string | undefined; node?: string | undefined; branch?: string | undefined }
 
@@ -1497,7 +1530,7 @@ async function runCommand($: EngineInterface, args: string): Promise<string> {
     }
     case 'send': {
       const id = await resolveThread($, command.thread)
-      return say(id.ok ? await send($, id.value, command.text) : id)
+      return say(id.ok ? saySent(id.value, await send($, id.value, command.text)) : id)
     }
     case 'action': {
       const id = await targetOf($, command.thread)
@@ -1646,6 +1679,73 @@ async function waitFor($: EngineInterface, thread: string, ms: number, signal: A
   }
 }
 
+/** How often `wait` reads a Claude Code worker thread, whose transcript no watch streams. */
+const CLAUDE_WAIT_MS = 2_000
+
+type ClaudeThread = { detail: NexusDetail; reading: ClaudeReading }
+
+/** A Claude Code worker thread's details and transcript, for a tool; null for a harness thread, which its watch reports. */
+async function claudeThread($: EngineInterface, thread: string, signal: AbortSignal): Promise<Outcome<ClaudeThread | null>> {
+  const detail = await detailFrom($, await toolJson($, ['show', thread], signal))
+  if (!detail.ok || detail.value.conversation !== 'claude') return detail.ok ? { ok: true, value: null } : detail
+  const reading = parsed(await toolJson($, ['conversation', thread], signal), parseClaudeConversation)
+  return reading.ok ? { ok: true, value: { detail: detail.value, reading: reading.value } } : reading
+}
+
+/** A Claude Code worker's launch for the model, a failed one with the newest lines of its diagnostic. */
+const workerFields = (detail: NexusDetail) =>
+  detail.worker ? { worker: { state: detail.worker.state, model: detail.worker.model, ...(detail.worker.message ? { message: keepTail(detail.worker.message, 1_000) } : {}) } } : {}
+
+/**
+ * `wait` on a Claude Code worker thread: its details and transcript read every `CLAUDE_WAIT_MS` until it settles as
+ * `isSettled` judges a harness thread, its launch fails, `ms` pass or the call is cancelled. A message just typed may
+ * not be in the transcript yet, nor its turn reported, so an idle reading settles only when the one before it did too,
+ * unless this wait saw the turn run.
+ */
+async function waitForClaude($: EngineInterface, thread: string, first: ClaudeThread, ms: number, signal: AbortSignal): Promise<Outcome<unknown>> {
+  const until = (await $.clock.now()) + ms
+  let { detail, reading } = first
+  let sawWorking = false
+  let wasSettled = false
+  for (;;) {
+    const state = claudeState(detail, reading)
+    sawWorking ||= reading.working
+    const isDone = detail.worker?.state === 'failed' || detail.worker?.state === 'stalled' || isSettled(state, reading.rows, sawWorking)
+    const settled = isDone && (wasSettled || sawWorking)
+    const now = await $.clock.now()
+    if (settled || signal.aborted || now >= until) {
+      const human = needsHuman(state)
+      const reply = rowsReply(reading.rows, REPLY_CHARS)
+      return {
+        ok: true,
+        value: {
+          thread,
+          settled,
+          ...(!settled && now >= until ? { timed_out: true } : {}),
+          ...(signal.aborted ? { cancelled: true } : {}),
+          ...stateFields(state),
+          ...workerFields(detail),
+          ...(human ? { needs_human: human } : {}),
+          reply: reply ? leftOut(reply.tail, reply.dropped) : null,
+        },
+      }
+    }
+    wasSettled = isDone
+    const { promise, stop } = stopper()
+    const timer = $.clock.after(Math.min(CLAUDE_WAIT_MS, until - now), stop)
+    signal.addEventListener('abort', stop)
+    await promise
+    timer.cancel()
+    signal.removeEventListener('abort', stop)
+    if (signal.aborted) continue
+    const next = await claudeThread($, thread, signal)
+    if (!next.ok) return signal.aborted ? { ok: true, value: { thread, settled: false, cancelled: true } } : next
+    if (!next.value) return failed(`${thread} is no longer a Claude Code worker thread`)
+    detail = next.value.detail
+    reading = next.value.reading
+  }
+}
+
 const str = (input: Record<string, unknown>, key: string) => {
   const value = input[key]
   return typeof value === 'string' && value.trim() ? value.trim() : undefined
@@ -1735,11 +1835,17 @@ async function runTool($: EngineInterface, tool: keyof typeof TOOLS, input: Reco
       const text = str(input, 'text')
       if (!id.ok || !text) return answer(id.ok ? failed('text is required') : id)
       const sent = await send($, id.value, text)
-      return answer(sent.ok ? { ok: true, value: { thread: id.value, sent: true } } : sent)
+      return answer(sent.ok ? { ok: true, value: { thread: id.value, sent: true, ...(sent.value.kind === 'claude' ? { claude: { outcome: sent.value.outcome, resumed: sent.value.resumed } } : {}) } } : sent)
     }
     case 'read': {
       const id = await toolThread($, input)
       if (!id.ok) return answer(id)
+      const worker = await claudeThread($, id.value, signal)
+      if (!worker.ok) return answer(worker)
+      if (worker.value) {
+        const { detail, reading } = worker.value
+        return answer({ ok: true, value: { thread: id.value, ...stateFields(claudeState(detail, reading)), ...workerFields(detail), conversation: rowsText(reading.rows, READ_CHARS) } })
+      }
       const got = await snapshot($, id.value, signal)
       if (!got.ok) return answer(got)
       return answer({ ok: true, value: { thread: id.value, ...stateFields(got.value.state), conversation: transcript(got.value.entries, READ_CHARS) } })
@@ -1748,6 +1854,9 @@ async function runTool($: EngineInterface, tool: keyof typeof TOOLS, input: Reco
       const id = await toolThread($, input)
       if (!id.ok) return answer(id)
       const seconds = typeof input.timeout_seconds === 'number' ? Math.min(600, Math.max(1, Math.round(input.timeout_seconds))) : 300
+      const worker = await claudeThread($, id.value, signal)
+      if (!worker.ok) return answer(worker)
+      if (worker.value) return answer(await waitForClaude($, id.value, worker.value, seconds * 1000, signal))
       const got = await waitFor($, id.value, seconds * 1000, signal)
       if (!got.ok) return answer(got)
       const { watch, reply, settled, timedOut } = got.value
@@ -1972,7 +2081,7 @@ const listView = (was: NexusPane): NexusPane => ({
 async function listShown($: EngineInterface, left: string | null, pane: NexusPane) {
   watcher?.stop()
   await leaveCheckout($, null)
-  await Promise.all([$.state.set(WATCH, null), $.state.set(LIVE, null), $.state.set(SHOWN, null)])
+  await Promise.all([$.state.set(WATCH, null), $.state.set(LIVE, null), $.state.set(SHOWN, null), $.state.set(CLAUDE, null)])
   // The list read after the mark no longer shows the reply the person just read as new.
   void (async () => {
     if (left) await markSeen($, left)
@@ -2190,7 +2299,7 @@ function paneActions($: EngineInterface, surface: RenderSurface): PaneActions {
           return focusRing($, await read($, paneAtom))
         }
         await inTurn(() => setPane($, () => ({ draft: '' })))
-        await onShown(id => send($, id, text.trim()))
+        await onShown(async id => saySent(id, await send($, id, text.trim())))
       }),
     back: () => run(back),
     startDraft: (change, at) =>
@@ -2316,7 +2425,7 @@ export const register: Register = (on, options) => {
       return <Text dimColor>The Nexus pane needs a surface with text fields.</Text>
     }
     const draw: Draw = $.ui.resolve(e)
-    const [list, watch, live, shown, catalog, pane, now, scope, checkout, diff, changesBase] = await Promise.all([
+    const [list, watched, streamed, shown, catalog, pane, now, scope, checkout, diff, changesBase, claude] = await Promise.all([
       read($, listAtom),
       read($, watchAtom),
       read($, liveAtom),
@@ -2328,7 +2437,13 @@ export const register: Register = (on, options) => {
       read($, checkoutAtom),
       read($, diffAtom),
       read($, changesBaseAtom),
+      read($, claudeAtom),
     ])
+    const detail = shown?.thread === pane.selected ? shown.detail : null
+    // A Claude Code worker's conversation comes from `nexus conversation`, its watch carrying only the thread's state.
+    const worker = detail?.conversation === 'claude' && watched?.thread === pane.selected ? claudeWatch(watched, claude?.thread === pane.selected ? claude : null, detail.worker?.model ?? null) : null
+    const watch = worker?.watch ?? watched
+    const live = worker && watched ? { thread: watched.thread, live: worker.live } : streamed
     // A drawing may not write: Esc out of a field or an overlay is taken up after it.
     if (!e.props.isFocused && (pane.mode !== 'normal' || pane.overlay) && !recovering) recovering = $.clock.after(0, () => void recover($))
     const scene: Scene = {
