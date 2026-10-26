@@ -1,4 +1,4 @@
-import { expect, test } from 'claude-code/testing'
+import { expect, test, type TestBody } from 'claude-code/testing'
 
 import { DETAIL, ENTRIES, ID, T0, THREAD, THREADS, boot, fake, state } from './fake-cli'
 
@@ -254,5 +254,52 @@ test('CLI 0.19.0 marks only the reply the pane showed: leaving after a newer one
   await ui.press({ key: 'key-h' })
   await clock.settle()
   expect(cli.runs.slice(before).filter(argv => argv[0] === 'seen' || argv[0] === 'show')).toEqual([['seen', '--json', REPLIED.id, `--last-reply-at=${REPLIED.lastReplyAt}`]])
+  expect((await ui.find({ type: 'Button', key: REPLIED.id }))?.text).toMatch(/Docs pass\s+ new reply/)
+})
+
+/** A thread with a new reply opened and left while every `nexus --version` prints `version`, or fails for null. */
+async function unknownVersion(...[$, on, version]: [...Parameters<TestBody>, string | null]) {
+  const unread = { ...DETAIL, thread: REPLIED, attention: 'reply', seenAt: REPLIED.seenAt, lastReplyAt: REPLIED.lastReplyAt }
+  const cli = fake({ threads: [...THREADS, REPLIED], detail: unread, store: STORE, versions: Array.from({ length: 20 }, () => version) })
+  cli.watch = [{ type: 'reset', thread: ID, entries: ENTRIES.slice(0, -1) }, state('idle')]
+  const notices: string[] = []
+  on('state.set', (_, e, next) => {
+    const notice = (e.value as { notice?: { text: string } | null } | null)?.notice
+    if (e.key === 'pane' && notice && !notices.includes(notice.text)) notices.push(notice.text)
+    return next(e)
+  })
+  const { clock, nexus, mount } = await boot($, on, cli)
+  await nexus('open e000')
+  await clock.advance(15_000)
+  const ui = await mount()
+  await ui.press({ key: 'key-h' })
+  await clock.settle()
+  expect(cli.runs.filter(argv => argv[0] === 'seen')).toEqual([])
+  expect(notices).toEqual([`The reply in ${REPLIED.id} was not marked seen, so it still shows as new: nexus --version gave no version, so the pane cannot mark only the reply it showed.`])
+  expect((await ui.find({ type: 'Button', key: REPLIED.id }))?.text).toMatch(/Docs pass\s+ new reply/)
+}
+
+test('a version check that fails marks nothing, opening or leaving, and says so once for the reply', ($, on) => unknownVersion($, on, null))
+
+test('a version check that prints no version marks nothing, opening or leaving, and says so once for the reply', ($, on) => unknownVersion($, on, 'garbage'))
+
+test('leaving reads the version once for its mark: a check that says 0.19.0 and a later one that fails cannot widen the mark to a newer reply', async ($, on) => {
+  const read = { ...DETAIL, thread: { ...REPLIED, seenAt: REPLIED.lastReplyAt }, attention: null, seenAt: REPLIED.lastReplyAt, lastReplyAt: REPLIED.lastReplyAt }
+  const cli = fake({ threads: [...THREADS, REPLIED], detail: read, store: STORE, version: '0.19.0' })
+  cli.watch = [{ type: 'reset', thread: ID, entries: ENTRIES.slice(0, -1) }, state('idle')]
+  const { clock, nexus, mount } = await boot($, on, cli)
+  await nexus('open e000')
+  await clock.advance(5_000)
+  const ui = await mount()
+  const newer = { ...REPLIED, seenAt: REPLIED.lastReplyAt, lastReplyAt: T0 + 4_000 }
+  cli.detail = { ...DETAIL, thread: newer, attention: 'reply', seenAt: newer.seenAt, lastReplyAt: newer.lastReplyAt }
+  cli.threads = [...THREADS, newer]
+  cli.versions = ['0.19.0', null]
+  const before = cli.runs.length
+  await ui.press({ key: 'key-h' })
+  await clock.settle()
+  const since = cli.runs.slice(before)
+  expect(since.filter(argv => argv[0] === 'seen')).toEqual([['seen', '--json', REPLIED.id, `--last-reply-at=${REPLIED.lastReplyAt}`]])
+  expect(since.filter(argv => argv[0] === '--version')).toHaveLength(1)
   expect((await ui.find({ type: 'Button', key: REPLIED.id }))?.text).toMatch(/Docs pass\s+ new reply/)
 })

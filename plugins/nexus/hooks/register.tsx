@@ -549,7 +549,7 @@ async function poll($: EngineInterface) {
     // The person reads the reply in the pane: once every client counts it seen, the details read again drop it.
     const reply = detail.value.thread.lastReplyAt
     displayed.set(thread, reply)
-    if (isUnread(detail.value.thread) && refusedSeen.get(thread) !== reply) void markSeen($, thread, reply).then(seen => seen && pollAgain($))
+    if (isUnread(detail.value.thread) && refusedSeen.get(thread) !== reply) void seenMark($).then(mark => markSeen($, thread, reply, mark).then(seen => seen && pollAgain($)))
   } finally {
     current.isBusy = false
     if (current.isAgain && poller === current) {
@@ -838,28 +838,43 @@ async function markLeft($: EngineInterface, thread: string): Promise<boolean> {
   const reply = displayed.get(thread) ?? null
   displayed.delete(thread)
   if (reply === null) return false
-  if (!(await takesReplyAt($))) {
+  const mark = await seenMark($)
+  if (mark === 'latest') {
     const detail = await detailFrom($, await nexus($, ['show', thread]))
     if (!detail.ok || detail.value.thread.lastReplyAt !== reply || !isUnread(detail.value.thread)) return false
   }
-  return markSeen($, thread, reply)
+  return markSeen($, thread, reply, mark)
 }
 
-const takesReplyAt = async ($: EngineInterface) => {
+/**
+ * How `seen` can mark, read once for each mark: only up to the reply shown (`exact`, CLI 0.19.0), the latest reply (an
+ * older CLI), or `unknown` when `nexus --version` failed or printed no version, which marks nothing.
+ */
+type SeenMark = 'exact' | 'latest' | 'unknown'
+
+async function seenMark($: EngineInterface): Promise<SeenMark> {
   const found = await cliVersion($)
-  return found !== null && !isOlder(found, SEEN_AT_CLI)
+  return found === null ? 'unknown' : isOlder(found, SEEN_AT_CLI) ? 'latest' : 'exact'
 }
 
 /**
  * Marks the reply the pane showed, `reply`, seen on the control plane, for every client. A CLI before 0.19.0 takes no
  * reply time and marks the reply latest when it runs, which the pane draws within a moment of its arrival. A failure
- * says so in the pane, as the reply stays new everywhere, and polls do not ask again for that reply. Whether it marked.
+ * says so in the pane, as the reply stays new everywhere, and polls do not ask again for that reply. With the CLI's
+ * version unknown it marks nothing, since a plain `seen` could mark a reply never shown, and says so once for the reply.
+ * Whether it marked.
  */
-async function markSeen($: EngineInterface, thread: string, reply: number | null): Promise<boolean> {
+async function markSeen($: EngineInterface, thread: string, reply: number | null, mark: SeenMark): Promise<boolean> {
+  if (mark === 'unknown') {
+    if (refusedSeen.get(thread) === reply) return false
+    refusedSeen.set(thread, reply)
+    await setPane($, () => ({ notice: { text: `The reply in ${thread} was not marked seen, so it still shows as new: ${cli} --version gave no version, so the pane cannot mark only the reply it showed.`, tone: 'error' } }))
+    return false
+  }
   if (seeing.has(thread)) return false
   seeing.add(thread)
   try {
-    const got = await nexus($, ['seen', thread, ...(reply !== null && (await takesReplyAt($)) ? [`--last-reply-at=${reply}`] : [])])
+    const got = await nexus($, ['seen', thread, ...(mark === 'exact' && reply !== null ? [`--last-reply-at=${reply}`] : [])])
     if (got.ok) {
       refusedSeen.delete(thread)
       return true

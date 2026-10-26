@@ -219,6 +219,8 @@ export type Fake = {
   nextPane: string
   /** What `nexus --version` prints after `nexus `. */
   version: string
+  /** What the next `nexus --version` calls print in turn, before `version`; null fails the call. */
+  versions?: (string | null)[]
   /** Every herdr argv, `herdr` dropped. */
   herdr: string[][]
   /** A herdr command, by its two words, that fails with this message. */
@@ -333,7 +335,10 @@ export async function boot(...[$, on, cli]: [...Body, Fake]) {
       return reply(argv[0] === 'tab' ? { id: 'cli:tab:create', result: { tab: { tab_id: 'w9:t3' }, root_pane: { pane_id: 'w9:p7' } } } : { id: 'cli:pane:run', result: { type: 'ok' } })
     }
     cli.runs.push(argv)
-    if (argv[0] === '--version') return { value: { exitCode: 0, stdout: `nexus ${cli.version}\n`, stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
+    if (argv[0] === '--version') {
+      const printed = cli.versions?.length ? (cli.versions.shift() as string | null) : cli.version
+      return { value: printed === null ? { exitCode: 1, stdout: '', stderr: 'nexus: cannot run\n', isStdoutTruncated: false, isStderrTruncated: false } : { exitCode: 0, stdout: `nexus ${printed}\n`, stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
+    }
     // `session open` and `session close` are slowed or failed by both words.
     const verb = argv[0] === 'session' ? `session ${argv[1]}` : argv[0]!
     const late = cli.slow[verb]
