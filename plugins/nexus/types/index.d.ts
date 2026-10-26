@@ -10,6 +10,7 @@ export type NexusThread = {
   title: string
   project: string
   status: 'active' | 'idle' | 'archived' | 'deleted'
+  /** The harness's turn runs, or a reported session's, as a Claude Code worker's does: the row's `agentTurnRunning` or `sessionTurnRunning`. */
   agentTurnRunning: boolean
   /** Unix milliseconds, as are the two after it. */
   createdAt: number
@@ -17,12 +18,19 @@ export type NexusThread = {
   lastAgentActivityAt: number
   /** The latest of the three. */
   lastActivityAt: number
+  /** When the latest agent turn ended, a reply's identity, and when a person last marked the replies seen from any client: Unix milliseconds, null for never. */
+  lastReplyAt: number | null
+  seenAt: number | null
 }
+
+/** What a thread asks of the person, the first that holds in this order: `attention` in docs/cli.md. */
+export type NexusAttention = 'failed' | 'parked' | 'reply' | 'working' | 'waiting' | null
 
 /** A `threads` row: the thread with its pylon's state and what the planner wants of the pylon. */
 export type NexusThreadRow = NexusThread & {
   pylon: { node: string; actualState: NexusActual; failed: string | null }
   desired: NexusDesired
+  attention: NexusAttention
 }
 
 /** Why a CLI call failed: the CLI's error kind (its exit code) and message. */
@@ -70,8 +78,11 @@ export type NexusLive = {
   retry: string | null
 }
 
-/** One drawn row of a conversation. A tool call and its result are one row. */
-export type NexusRow =
+/**
+ * One drawn row of a conversation. A tool call and its result are one row. `entry` is the position of the entry that
+ * made it in a Claude Code worker's transcript, counted through the entries the control plane dropped: the row's key.
+ */
+export type NexusRow = { entry?: number } & (
   | { kind: 'user'; text: string; at: number | null }
   | { kind: 'assistant'; text: string }
   | {
@@ -89,6 +100,7 @@ export type NexusRow =
       patch: string | null
     }
   | { kind: 'notice'; tone: 'error' | 'dim'; text: string }
+)
 
 /** The latest `threads` poll. A failed poll keeps the threads it had and says why. */
 export type NexusList = { threads: NexusThreadRow[] | null; failure: NexusFailure | null; polledAt: number | null }
@@ -168,6 +180,7 @@ export type NexusLiveShown = { thread: string; live: NexusLive }
 /** `show --json`: a thread with its pylon, sessions, previews, ports and outputs. */
 export type NexusDetail = {
   thread: NexusThread
+  attention: NexusAttention
   pylon: { id: string; node: string; actualState: NexusActual; failed: string | null; observedAt: string | null; retryRefused: string | null }
   sessions: NexusSession[]
   previews: NexusPreview[]
@@ -176,11 +189,20 @@ export type NexusDetail = {
   outputs: { kind: 'branch' | 'diff' | 'preview' | 'file'; ref: string }[]
   /** Null for a thread with no conversation. */
   agent: { parkedTasks: number } | null
-  hasConversation: boolean
+  /** Whose conversation the thread has: the Nexus harness's, a Claude Code worker's transcript (CLI 0.17.0), or none. */
+  conversation: 'agent' | 'claude' | null
+  /** A Claude Code worker thread's launch: its state, such as `started` or `stalled`, the model asked for, and a failure's diagnostic. */
+  worker: { state: string; model: string | null; message: string | null } | null
   desired: NexusDesired
   /** The command that attaches to the pylon's Herdr sessions from a shell in the pylon. */
   attach: string
 }
+
+/**
+ * A Claude Code worker thread's conversation, as `nexus conversation` last printed it, in the rows a watch gives:
+ * `nexus watch` streams none of it. `queued` holds the messages Claude has not taken yet.
+ */
+export type NexusClaudeShown = { thread: string; rows: NexusRow[]; dropped: number; working: boolean; queued: string[]; readAt: number | null; failure: string | null }
 
 /** The `show` poll of the thread open in the pane. */
 export type NexusShown = {
@@ -239,8 +261,11 @@ export type NexusView = 'list' | 'thread' | 'start' | 'project' | 'session'
 /** The thread view's tabs, in the order h and l walk them: the dashboard's inspector, after the conversation. */
 export type NexusTab = 'conversation' | 'changes' | 'previews' | 'pylon'
 
-/** What a checkout read compares with: `start`, what the pylon booted at, or `head`. Null `commit` is the empty tree. */
-export type NexusBase = { kind: 'start' | 'head'; commit: string | null }
+/**
+ * What a checkout read compares with: `start`, what the pylon booted at, `turn`, the snapshot taken before the latest
+ * reply's first model request (CLI 0.11.0), or `head`. Null `commit` is the empty tree; a `turn` names its snapshot.
+ */
+export type NexusBase = { kind: 'start' | 'turn' | 'head'; commit: string | null }
 
 export type NexusFileStatus = 'added' | 'modified' | 'deleted' | 'renamed' | 'copied' | 'typechange'
 
@@ -272,8 +297,8 @@ export type NexusDiffRow = { kind: 'hunk'; text: string } | { kind: 'add' | 'del
 export type NexusDiffShown = {
   thread: string
   file: NexusChangedFile
-  /** Whether it was read against HEAD. */
-  isUncommitted: boolean
+  /** What it was read against. */
+  base: NexusBase['kind']
   /** Null until a read answers. */
   rows: NexusDiffRow[] | null
   /** What git says beyond the lines: renames, modes. */
@@ -371,14 +396,8 @@ export type NexusPane = {
   sessionChanges: Record<string, NexusSessionChanges>
 }
 
-/** What the strip above the prompt reads besides the list: whether it shows, and when each thread was last viewed. */
-export type NexusStrip = {
-  isOn: boolean
-  /** When the person last viewed each thread, Unix milliseconds; a thread not in it counts from `since`. */
-  seen: Record<string, number>
-  /** When the strip first ran: a reply before it is not news. */
-  since: number
-}
+/** What the strip above the prompt reads besides the list: whether it shows. */
+export type NexusStrip = { isOn: boolean }
 
 declare module 'claude-code' {
   interface PluginState {
@@ -396,12 +415,14 @@ declare module 'claude-code' {
       stripCursor: string | null
       /** The run clock, ticked each second while a shown run works. */
       now: number
+      /** The transcript of the Claude Code worker thread shown, null for any other thread. */
+      claude: NexusClaudeShown | null
       /** The Changes tab's reads of the thread shown, null before the first. */
       checkout: NexusCheckout | null
       /** The diff the Changes tab shows, null before one is opened. */
       diff: NexusDiffShown | null
-      /** Whether Changes shows only what is uncommitted (since HEAD) rather than all since the pylon booted; kept in `$.store`. */
-      uncommitted: boolean
+      /** What Changes compares with: what the pylon booted at, the latest turn's snapshot or HEAD; kept in `$.store`. */
+      changesBase: NexusBase['kind']
     }
   }
 }

@@ -3,6 +3,7 @@ import { describe, expect, test } from 'claude-code/testing'
 import type { NexusRow, NexusRunState, NexusSession, NexusSessionChanges, NexusThread, NexusWatch } from '../types'
 import {
   type WatchEntry,
+  type ToolRow,
   type WatchEvent,
   appendEntry,
   applyEvent,
@@ -18,10 +19,14 @@ import {
   herdrError,
   isOlder,
   isSettled,
+  isUnread,
   keepTail,
   leftOut,
   matchThread,
+  parseClaudeConversation,
   parseCommand,
+  parseSent,
+  parseStarted,
   parseDetail,
   parseFailure,
   parseHerdrTab,
@@ -33,9 +38,10 @@ import {
   shellQuote,
   shownSessions,
   since,
+  sentText,
   threadState,
 } from '../hooks/model'
-import { DETAIL, ENTRIES, PATCH, T0, THREADS, WEB_PREVIEW, state } from './fake-cli'
+import { CONVERSATION, DETAIL, ENTRIES, PATCH, T0, THREADS, WEB_PREVIEW, WORKER_DETAIL, state } from './fake-cli'
 
 const thread = (over: Partial<NexusThread>): NexusThread => ({
   id: 'th-4f2a00000001',
@@ -47,6 +53,8 @@ const thread = (over: Partial<NexusThread>): NexusThread => ({
   lastHumanActivityAt: 0,
   lastAgentActivityAt: 0,
   lastActivityAt: 0,
+  lastReplyAt: null,
+  seenAt: null,
   ...over,
 })
 
@@ -192,10 +200,27 @@ describe('the console', () => {
     expect(() => parseThreads([{ ...THREADS[0], desired: undefined }])).toThrow('nexus threads printed a row (th-4f2a00000001) without desired')
     expect(() => parseThreads([{ ...THREADS[0], pylon: null }])).toThrow('without its pylon')
     const detail = parseDetail(DETAIL)
-    expect(detail).toMatchObject({ desired: 'running', attach: 'herdr --session nexus-7f3a', hasConversation: true, pylon: { retryRefused: null, observedAt: DETAIL.pylon.observedAt } })
+    expect(detail).toMatchObject({ desired: 'running', attach: 'herdr --session nexus-7f3a', conversation: 'agent', worker: null, pylon: { retryRefused: null, observedAt: DETAIL.pylon.observedAt } })
     expect(detail.sessions).toEqual([{ id: 'nexus:1.2', state: 'running', herdrPane: 'nexus:1.2', harness: 'claude-code', harnessSessionId: '9c1e', status: 'working', title: null, message: null }])
     expect(() => parseDetail({ ...DETAIL, desired: undefined })).toThrow('nexus show printed no desired')
     expect(() => parseDetail({ ...DETAIL, attach: undefined })).toThrow('nexus show printed no attach')
+  })
+
+  test('rows and details carry the attention and the seen marker of CLI 0.10.0; one without them throws, and an attention this mod does not know asks nothing', () => {
+    const [fresh] = parseThreads(THREADS)
+    expect(fresh).toMatchObject({ attention: 'working', lastReplyAt: THREADS[0]!.lastReplyAt, seenAt: THREADS[0]!.seenAt })
+    expect(parseDetail({ ...DETAIL, attention: 'reply' })).toMatchObject({ attention: 'reply', thread: { lastReplyAt: DETAIL.thread.lastReplyAt, seenAt: DETAIL.thread.seenAt } })
+    expect(parseThreads([{ ...THREADS[0], attention: 'pondering' }])[0]!.attention).toBeNull()
+    expect(() => parseThreads([{ ...THREADS[0], attention: undefined }])).toThrow('nexus threads printed a thread (th-4f2a00000001) without its attention')
+    expect(() => parseThreads([{ ...THREADS[0], seenAt: undefined }])).toThrow('nexus threads printed a thread (th-4f2a00000001) without seenAt')
+    expect(() => parseDetail({ ...DETAIL, thread: { ...DETAIL.thread, lastReplyAt: undefined } })).toThrow('nexus show printed a thread (th-4f2a00000001) without lastReplyAt')
+    expect(isUnread({ lastReplyAt: 5, seenAt: 4 })).toBe(true)
+    expect(isUnread({ lastReplyAt: 5, seenAt: null })).toBe(true)
+    expect(isUnread({ lastReplyAt: 5, seenAt: 5 })).toBe(false)
+    expect(isUnread({ lastReplyAt: null, seenAt: null })).toBe(false)
+    // A start is read only for its ID and title: a CLI before 0.10.0 still starts a thread.
+    const { lastReplyAt: _, seenAt: __, ...old } = THREADS[0]!
+    expect(parseStarted(old)).toMatchObject({ id: THREADS[0]!.id, lastReplyAt: null, seenAt: null })
   })
 
   test("previews keep the CLI's url and ports their preview; either missing is a contract error, and null ports mean unknown", () => {
@@ -474,5 +499,75 @@ describe('attaching in a Herdr tab', () => {
     expect(herdrError(1, '', '{"error":{"code":"workspace_not_found","message":"workspace w9 not found"},"id":"cli:tab:create"}\n')).toBe('workspace w9 not found')
     expect(herdrError(2, '', 'error: unexpected argument --nope\n')).toBe('error: unexpected argument --nope')
     expect(herdrError(1, '', '')).toBe('herdr exited with 1')
+  })
+})
+
+describe('Claude Code worker threads', () => {
+  test("a worker's transcript folds into the rows a watch gives: its tools named as pi's, a result settling its call, the queue apart", () => {
+    const reading = parseClaudeConversation(CONVERSATION)
+    expect(reading.working).toBe(true)
+    expect(reading.queued).toEqual(['also update the docs'])
+    expect(reading.rows.map(row => [row.kind, row.kind === 'tool' ? `${row.name} ${row.outcome}` : row.text])).toEqual([
+      ['user', '/poteto-mode add a health check'],
+      ['assistant', 'Adding `/healthz`.'],
+      ['tool', 'edit ok'],
+      ['tool', 'bash error'],
+    ])
+    const edit = reading.rows[2] as ToolRow
+    expect(edit.summary).toBe('src/server.ts')
+    expect(diffOf(edit)).toMatchObject({ source: "@@ -1,1 +1,2 @@\n-app.listen()\n+app.get('/healthz', ok)\n+app.listen()", added: 2, removed: 1, isNumbered: false })
+    expect((reading.rows[3] as ToolRow).output).toBe('FAIL server.test.ts')
+    // Claude takes a queued message by its text, or its oldest without one.
+    const taken = parseClaudeConversation({ ...CONVERSATION, entries: [...CONVERSATION.entries, { kind: 'queue', at: T0, op: 'enqueue', text: 'then a demo' }, { kind: 'queue', at: T0, op: 'remove', text: 'then a demo' }, { kind: 'queue', at: T0, op: 'dequeue', text: null }] })
+    expect(taken.queued).toEqual([])
+  })
+
+  test('a prompt from elsewhere, a background task, a notice and a record Nexus does not know show as notices; the entries left out count', () => {
+    const reading = parseClaudeConversation({
+      kind: 'claude',
+      session: null,
+      dropped: 12,
+      readAt: null,
+      working: false,
+      entries: [
+        { kind: 'prompt', at: 1, text: 'a hook said this', from: 'other' },
+        { kind: 'task', at: 2, toolUseId: 'toolu_9', status: 'completed', summary: 'Agent "review" finished', result: 'Looks good.' },
+        { kind: 'notice', at: 3, tone: 'error', text: 'API Error: 529 overloaded' },
+        { kind: 'record', at: null, type: 'mystery', summary: 'mystery: {"a":1}' },
+        { kind: 'turn', at: 4, durationMs: 9_000 },
+      ],
+    })
+    expect(reading.rows).toEqual([
+      { kind: 'notice', tone: 'dim', text: 'a hook said this', entry: 12 },
+      { kind: 'notice', tone: 'dim', text: 'Background task completed: Agent "review" finished\nLooks good.', entry: 13 },
+      { kind: 'notice', tone: 'error', text: 'API Error: 529 overloaded', entry: 14 },
+      { kind: 'notice', tone: 'dim', text: 'mystery: {"a":1}', entry: 15 },
+    ])
+    expect(reading.dropped).toBe(12)
+    expect(() => parseClaudeConversation({ entries: [] })).toThrow("nexus conversation printed a Claude worker's conversation, which docs/cli.md requires")
+  })
+
+  test('a row keeps its key when the transcript window slides past an entry that drew no row', () => {
+    const keys = (json: unknown) => blocks(parseClaudeConversation(json).rows, 0, null).map(block => [block.key, block.kind])
+    const entries = [{ kind: 'turn', at: 1, durationMs: 5 }, ...CONVERSATION.entries.slice(0, 2)]
+    const before = keys({ ...CONVERSATION, entries, dropped: 2997 })
+    const after = keys({ ...CONVERSATION, entries: entries.slice(1), dropped: 2998 })
+    expect(before).toEqual([['entry-2998', 'user'], ['entry-2999', 'assistant']])
+    expect(after).toEqual(before)
+  })
+
+  test("a worker's details say whose conversation it has and how its launch went; a reported session's turn counts as working", () => {
+    const detail = parseDetail(WORKER_DETAIL)
+    expect(detail).toMatchObject({ conversation: 'claude', worker: { state: 'started', model: 'claude-opus-5-5', message: null }, thread: { agentTurnRunning: true } })
+    expect(parseDetail({ ...WORKER_DETAIL, claudeWorker: { model: null, state: 'stalled', message: 'no launch receipt' } }).worker).toEqual({ state: 'stalled', model: null, message: 'no launch receipt' })
+    expect(parseDetail({ ...DETAIL, thread: { ...THREADS[0], conversationId: null } }).conversation).toBeNull()
+  })
+
+  test("a send says what it did: a harness thread's message queued for its agent, or typed into the worker's session, resumed first or queued behind its turn", () => {
+    expect(sentText('th-1', parseSent({ submission: 3 }))).toBe('Sent to th-1.')
+    expect(sentText('th-1', parseSent({ claude: { session: 's', outcome: 'sent', resumed: false } }))).toBe('Sent to the Claude Code session of th-1.')
+    expect(sentText('th-1', parseSent({ claude: { session: 's', outcome: 'sent', resumed: true } }))).toBe('Sent to the Claude Code session of th-1. Nexus resumed the session first, as no pane ran it.')
+    expect(sentText('th-1', parseSent({ claude: { session: 's', outcome: 'queued', resumed: false } }))).toBe('Queued in the Claude Code session of th-1: Claude reads it at its next tool step, or after this turn.')
+    expect(() => parseSent({ claude: { session: 's' } })).toThrow('without its outcome')
   })
 })

@@ -9,9 +9,11 @@ import { type Chip, cells, clip, scopeLabel } from './model'
 type Draw = { Box: ElementConstructor<BoxProps>; Text: ElementConstructor<TextProps>; Button: ElementConstructor<ButtonProps> }
 
 const LOOK: Record<Chip['kind'], { glyph: string; color: string }> = {
-  needs: { glyph: '✕', color: 'error' },
+  failed: { glyph: '✕', color: 'error' },
+  parked: { glyph: '✕', color: 'error' },
   reply: { glyph: '●', color: 'success' },
   working: { glyph: '◉', color: 'planMode' },
+  waiting: { glyph: '◇', color: 'warning' },
 }
 
 const HEAD = '◆ Nexus'

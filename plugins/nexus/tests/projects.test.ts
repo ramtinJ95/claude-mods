@@ -73,7 +73,7 @@ test('a project chosen scopes the list, its counts, the strip and the working th
 })
 
 test("the strip shows only the project's threads, and names it", async ($, on) => {
-  const working = { ...THREADS[2]!, agentTurnRunning: true }
+  const working = { ...THREADS[2]!, agentTurnRunning: true, attention: 'working' }
   const cli = fake({ threads: [THREADS[0], THREADS[1], working], store: { themeNotice: true, project: 'api' } })
   const { clock, strip } = await boot($, on, cli)
   await clock.settle()

@@ -4,7 +4,9 @@ import type { EngineInterface, Register, RenderSurface, Timer } from 'claude-cod
 import type {
   NexusCatalog,
   NexusChangedFile,
+  NexusBase,
   NexusCheckout,
+  NexusClaudeShown,
   NexusDetail,
   NexusDiffShown,
   NexusFailure,
@@ -31,6 +33,7 @@ import type {
 import {
   ACTIONS,
   ATTACH_HINT,
+  BASES,
   type Action,
   type Reply,
   FULL_ID,
@@ -38,6 +41,7 @@ import {
   NO_CHANGE,
   NO_SESSION_CHANGES,
   USAGE,
+  type ClaudeReading,
   type WatchEntry,
   type WatchEvent,
   ago,
@@ -57,6 +61,7 @@ import {
   groupThreads,
   herdrError,
   isSettled,
+  keepTail,
   foldReply,
   inScope,
   leftOut,
@@ -74,8 +79,21 @@ import {
   parsePreview,
   parseProjects,
   parseSessionClosed,
+  parseClaudeConversation,
+  parseSent,
+  sentText,
+  type Sent,
+  claudeWatch,
+  claudeState,
+  rowsReply,
+  rowsText,
   parseVersion,
   isOlder,
+  isPaneRunning,
+  isWorkerIdle,
+  hasDrawnReply,
+  transcriptHolds,
+  isUnread,
   resumesOn,
   sessionPlace,
   parseStarted,
@@ -106,6 +124,8 @@ const RUN_MS = 70_000
  * waits up to 120 s more for the agent to start.
  */
 const SESSION_MS = 260_000
+/** A `$.process.run` of `send`: for a Claude Code worker the CLI tries a paused pylon again once a second for up to 120 s. */
+const SEND_MS = 160_000
 /** A `$.process.run` of herdr: a tab made, a command typed into it. */
 const HERDR_MS = 10_000
 const READ_CHARS = 6_000
@@ -124,6 +144,8 @@ const liveAtom = atom(LIVE, null)
 const SHOWN = { plugin: 'nexus', key: 'shown' } as const
 const shownAtom = atom(SHOWN, null)
 const catalogAtom = atom({ plugin: 'nexus', key: 'catalog' } as const, { projects: null, nodes: null, nodesFailure: null, projectsFailure: null })
+const CLAUDE = { plugin: 'nexus', key: 'claude' } as const
+const claudeAtom = atom(CLAUDE, null)
 const NOW = { plugin: 'nexus', key: 'now' } as const
 const nowAtom = atom(NOW, 0)
 const paneAtom = atom({ plugin: 'nexus', key: 'pane' } as const, {
@@ -154,7 +176,7 @@ const paneAtom = atom({ plugin: 'nexus', key: 'pane' } as const, {
 })
 const STRIP = { plugin: 'nexus', key: 'strip' } as const
 /** What `$.store` keeps under `strip`, mirrored here so a change draws the strip again. */
-const stripAtom = atom(STRIP, { isOn: true, seen: {}, since: 0 })
+const stripAtom = atom(STRIP, { isOn: true })
 const SCOPE = { plugin: 'nexus', key: 'scope' } as const
 /** What `$.store` keeps under `project`, mirrored here so a change draws the list and the strip again. */
 const scopeAtom = atom(SCOPE, null)
@@ -164,9 +186,9 @@ const CHECKOUT = { plugin: 'nexus', key: 'checkout' } as const
 const checkoutAtom = atom(CHECKOUT, null)
 const DIFF = { plugin: 'nexus', key: 'diff' } as const
 const diffAtom = atom(DIFF, null)
-const UNCOMMITTED = { plugin: 'nexus', key: 'uncommitted' } as const
-/** What `$.store` keeps under `uncommitted`, mirrored here so a change draws the Changes tab again. */
-const uncommittedAtom = atom(UNCOMMITTED, false)
+const CHANGES_BASE = { plugin: 'nexus', key: 'changesBase' } as const
+/** What `$.store` keeps under `changesBase`, mirrored here so a change draws the Changes tab again. */
+const changesBaseAtom = atom(CHANGES_BASE, 'start')
 
 /** The CLI to run, from the `cli` option. */
 let cli = 'nexus'
@@ -176,7 +198,7 @@ let herdrWorkspace: string | null = null
  * The pane's two processes at most: one poll at a time, of `threads` for the list or `show` for the thread shown,
  * and one watch of that thread. The ticker only reads the watch's state, to move the run clock while it works.
  */
-let poller: { timer: Timer; ticker: Timer; isBusy: boolean; stop: () => void; stopped: Promise<void> } | undefined
+let poller: { timer: Timer; ticker: Timer; isBusy: boolean; isAgain: boolean; stop: () => void; stopped: Promise<void> } | undefined
 /** The second ask for the keyboard after `/nexus`, cancelled when the pane closes first. */
 let refocus: Timer | undefined
 let watcher: { thread: string; stop: () => void } | undefined
@@ -186,6 +208,8 @@ let watcher: { thread: string; stop: () => void } | undefined
  */
 let changesChild: { thread: string; stop: () => void } | undefined
 let diffChild: { thread: string; stop: () => void } | undefined
+/** The Herdr tab's pane where the pane last started `nexus attach`, and its thread. */
+let attached: { thread: string; pane: string } | undefined
 /** The thread whose visit is still to be recorded, once its first `show` says whether it is open. */
 let visit: string | undefined
 /** The strip's poll of the list, which runs while the pane is closed or shows a thread. */
@@ -237,17 +261,21 @@ async function nexus($: EngineInterface, args: readonly string[], timeoutMs = RU
   }
 }
 
-function threadsFrom(got: Outcome<unknown>): Outcome<NexusThreadRow[]> {
-  if (!got.ok) return got
-  try {
-    return { ok: true, value: parseThreads(got.value) }
-  } catch (error) {
-    return failed(messageOf(error))
-  }
+/** The CLI that added the attention, the seen marker and the reply time to every thread, which the list and the details read. */
+const ATTENTION_CLI = [0, 10, 0]
+
+/** `parse` over `threads` or `show`, a contract error from a CLI before 0.10.0 naming the version it needs. */
+async function threadsJson<T>($: EngineInterface, got: Outcome<unknown>, parse: (json: unknown) => T): Promise<Outcome<T>> {
+  const value = parsed(got, parse)
+  if (value.ok || !got.ok) return value
+  return { ok: false, failure: await olderThan($, value.failure, ATTENTION_CLI, 'reading threads with their unread replies') }
 }
 
+const threadsFrom = ($: EngineInterface, got: Outcome<unknown>) => threadsJson($, got, parseThreads)
+const detailFrom = ($: EngineInterface, got: Outcome<unknown>) => threadsJson($, got, parseDetail)
+
 async function listThreads($: EngineInterface, project?: string): Promise<Outcome<NexusThreadRow[]>> {
-  return threadsFrom(await nexus($, ['threads', ...(project ? [`--project=${project}`] : [])]))
+  return threadsFrom($, await nexus($, ['threads', ...(project ? [`--project=${project}`] : [])]))
 }
 
 /** `parse` over a command's JSON, its throw a failure. */
@@ -485,17 +513,18 @@ async function poll($: EngineInterface) {
     if (!got || poller !== current) return
     await $.state.set(NOW, now)
     if (!thread) {
-      const threads = threadsFrom(got)
+      const threads = await threadsFrom($, got)
       await update($, listAtom, (list): NexusList => (threads.ok ? { threads: threads.value, failure: null, polledAt: now } : { ...list, failure: threads.failure }))
       return
     }
-    const detail = parsed(got, parseDetail)
+    const detail = await detailFrom($, got)
     if ((await read($, paneAtom)).selected !== thread) return
     const shownBefore = await read($, shownAtom)
     const before = shownBefore?.thread === thread ? shownBefore.detail : null
-    if (detail.ok) void recordVisit($, detail.value.thread)
-    // A reply the person sees in the pane is not news on the strip.
-    if (detail.ok && pane.isShown) void markSeen($, thread, detail.value.thread.lastAgentActivityAt)
+    if (detail.ok) {
+      void recordVisit($, detail.value.thread)
+      await patchRow($, detail.value)
+    }
     await update($, shownAtom, (shown): NexusShown =>
       detail.ok
         ? { thread, detail: detail.value, askedSeq, failure: null }
@@ -509,15 +538,54 @@ async function poll($: EngineInterface) {
     if (detail.ok && changes && settleSessions(changes, detail.value.sessions, now) !== changes) {
       await changeSessions($, thread, was => settleSessions(was, detail.value.sessions, now))
     }
+    if (!detail.ok) return
+    // While the person is attached to the pylon in a Herdr tab, the worker's transcript is not read: they see it there.
+    const isDrawn =
+      detail.value.conversation === 'claude'
+        ? !(await isAttached($, thread)) && transcriptHolds(await readClaude($, thread, current), detail.value.thread.lastReplyAt)
+        : hasDrawnReply(await read($, watchAtom), thread)
+    const { selected: still, view: on, tab, overlay } = await read($, paneAtom)
+    if (!isDrawn || still !== thread || on !== 'thread' || tab !== 'conversation' || overlay) return
+    // The person reads the reply in the pane: once every client counts it seen, the details read again drop it.
+    const reply = detail.value.thread.lastReplyAt
+    displayed.set(thread, reply)
+    if (isUnread(detail.value.thread) && refusedSeen.get(thread) !== reply) void markSeen($, thread, reply).then(seen => seen && pollAgain($))
   } finally {
     current.isBusy = false
+    if (current.isAgain && poller === current) {
+      current.isAgain = false
+      void poll($)
+    }
   }
+}
+
+/**
+ * The Claude Code worker transcript of the thread shown, as part of its poll, since `nexus watch` streams none: one
+ * `nexus conversation`, which never wakes the pylon and reads it only while it runs. A failed read keeps the rows it had.
+ * Says when the transcript was read from the pylon, null when it never was or the read failed.
+ */
+async function readClaude($: EngineInterface, thread: string, current: NonNullable<typeof poller>): Promise<number | null> {
+  const got = await childJson($, ['conversation', thread], current.stopped)
+  if (!got || poller !== current || (await read($, paneAtom)).selected !== thread) return null
+  const reading = parsed(got, parseClaudeConversation)
+  await update($, claudeAtom, (was): NexusClaudeShown =>
+    reading.ok
+      ? { thread, ...reading.value, failure: null }
+      : { ...(was?.thread === thread ? was : { thread, rows: [], dropped: 0, working: false, queued: [], readAt: null }), failure: reading.failure.message },
+  )
+  return reading.ok ? reading.value.readAt : null
+}
+
+/** Polls now, or once the poll under way ends, since that one may have read what was there before a change. */
+function pollAgain($: EngineInterface) {
+  if (poller?.isBusy) poller.isAgain = true
+  else void poll($)
 }
 
 /** Moves the run clock while the thread shown works, so its timer and spinner tick. */
 async function tick($: EngineInterface) {
-  const watch = await read($, watchAtom)
-  if (watch?.state?.run === 'working') await $.state.set(NOW, await $.clock.now())
+  const [watch, claude] = await Promise.all([read($, watchAtom), read($, claudeAtom)])
+  if (watch?.state?.run === 'working' || claude?.working) await $.state.set(NOW, await $.clock.now())
 }
 
 /** `projects` and `nodes` for the start form, the project picker, the list's nodes line and the previews' links. */
@@ -609,6 +677,7 @@ async function startPane($: EngineInterface) {
       timer: $.clock.every(POLL_MS, () => void poll($)),
       ticker: $.clock.every(TICK_MS, () => void tick($)),
       isBusy: false,
+      isAgain: false,
       stop,
       stopped: promise,
     }
@@ -682,7 +751,7 @@ async function openWorking($: EngineInterface) {
   if (pane.selected || pane.view !== 'list') return
   let threads = (await read($, listAtom)).threads
   if (!threads) {
-    const got = threadsFrom(await nexus($, ['threads', '--all']))
+    const got = await threadsFrom($, await nexus($, ['threads', '--all']))
     if (!got.ok) return
     const now = await $.clock.now()
     await update($, listAtom, (): NexusList => ({ threads: got.value, failure: null, polledAt: now }))
@@ -725,35 +794,83 @@ const threadView = (pane: NexusPane, thread: string): Partial<NexusPane> => {
 
 /** Shows a thread: its watch, and its details polled, the first of which records the visit as the dashboard's page does. */
 async function showThread($: EngineInterface, thread: string) {
-  await setPane($, pane => threadView(pane, thread))
-  void markSeen($, thread)
+  let left: string | null = null
+  await setPane($, pane => {
+    left = pane.view === 'thread' && pane.selected !== thread ? pane.selected : null
+    return threadView(pane, thread)
+  })
+  if (left) void markLeft($, left)
+  refusedSeen.delete(thread)
   await followThread($, thread)
 }
 
-/** The strip's state as `$.store` kept it, and its start the first time: replies before then are not news. */
+/**
+ * Whether the strip shows, as `$.store` kept it. A store written before the control plane kept the seen marker also
+ * holds what the person saw then: it is written again without it.
+ */
 async function loadStrip($: EngineInterface) {
-  const stored = (await $.store.get('strip')) as Partial<NexusStrip> | undefined
-  const strip: NexusStrip = { isOn: stored?.isOn ?? true, seen: stored?.seen ?? {}, since: stored?.since ?? (await $.clock.now()) }
+  const stored = (await $.store.get('strip')) as Record<string, unknown> | undefined
+  const strip: NexusStrip = { isOn: stored?.isOn !== false }
   await $.state.set(STRIP, strip)
-  if (stored?.since === undefined) await $.store.set('strip', strip)
+  if (stored && Object.keys(stored).some(key => key !== 'isOn')) await $.store.set('strip', strip)
 }
 
 async function saveStrip($: EngineInterface, change: (strip: NexusStrip) => NexusStrip) {
   await $.store.set('strip', await update($, stripAtom, change))
 }
 
+/** The threads whose `nexus seen` runs, so a poll that comes again before it ends does not start a second. */
+const seeing = new Set<string>()
+/** The reply whose mark failed, by thread: polls leave it until another reply comes or the thread is opened again. */
+const refusedSeen = new Map<string, number | null>()
+/** The latest reply the pane showed in each thread's conversation, by its `lastReplyAt`: what leaving the thread may mark. */
+const displayed = new Map<string, number | null>()
+
 /**
- * Records that the person saw `thread` now, so the strip shows no new reply for it. Given the thread's last reply, it
- * writes only when that is news, so a poll of the thread shown writes once a reply. The threads the list no longer
- * has are dropped, so the store does not grow.
+ * Leaving `thread` marks the reply the pane showed there, if its details read now still name it as the latest and
+ * unread: a reply newer than the one drawn, or none drawn, is left new.
  */
-async function markSeen($: EngineInterface, thread: string, reply?: number) {
-  const strip = await read($, stripAtom)
-  if (reply !== undefined && reply <= (strip.seen[thread] ?? strip.since)) return
-  const now = await $.clock.now()
-  const { threads } = await read($, listAtom)
-  const kept = new Set(threads?.map(one => one.id) ?? Object.keys(strip.seen))
-  await saveStrip($, was => ({ ...was, seen: { ...Object.fromEntries(Object.entries(was.seen).filter(([id]) => kept.has(id))), [thread]: Math.max(now, reply ?? 0) } }))
+async function markLeft($: EngineInterface, thread: string): Promise<boolean> {
+  if (!displayed.has(thread)) return false
+  const reply = displayed.get(thread) ?? null
+  displayed.delete(thread)
+  const detail = await detailFrom($, await nexus($, ['show', thread]))
+  if (!detail.ok || detail.value.thread.lastReplyAt !== reply || !isUnread(detail.value.thread)) return false
+  return markSeen($, thread, reply)
+}
+
+/**
+ * Marks the thread's latest reply seen on the control plane, for every client. `nexus seen` marks the reply latest when
+ * it runs, since the CLI takes no reply time to hold the mark to; the pane draws a reply within a moment of its arrival.
+ * A failure says so in the pane, as the reply stays new everywhere, and polls do not ask again for that reply. Whether it marked.
+ */
+async function markSeen($: EngineInterface, thread: string, reply: number | null): Promise<boolean> {
+  if (seeing.has(thread)) return false
+  seeing.add(thread)
+  try {
+    // CLI 0.17.0's `seen` takes no reply time; once it takes `--last-reply-at`, pass `reply` so the mark never passes what was drawn.
+    const got = await nexus($, ['seen', thread])
+    if (got.ok) {
+      refusedSeen.delete(thread)
+      return true
+    }
+    refusedSeen.set(thread, reply)
+    const failure = newer(got.failure, 'seen', 'marking a reply seen', '0.10.0')
+    await setPane($, () => ({ notice: { text: `The reply in ${thread} was not marked seen, so it still shows as new: ${sentence(failure.message)}`, tone: 'error' } }))
+    return false
+  } finally {
+    seeing.delete(thread)
+  }
+}
+
+/** The thread's row in the list as its details just read it, so the list and the strip need not wait for their poll. */
+async function patchRow($: EngineInterface, detail: NexusDetail) {
+  const { thread, attention } = detail
+  await update($, listAtom, (list): NexusList =>
+    list.threads?.some(one => one.id === thread.id)
+      ? { ...list, threads: list.threads.map(one => (one.id === thread.id ? { ...one, attention, seenAt: thread.seenAt, lastReplyAt: thread.lastReplyAt } : one)) }
+      : list,
+  )
 }
 
 /**
@@ -766,7 +883,7 @@ async function pollStrip($: EngineInterface) {
   isStripBusy = true
   try {
     const asked = await $.clock.now()
-    const threads = threadsFrom(await nexus($, ['threads', '--all']))
+    const threads = await threadsFrom($, await nexus($, ['threads', '--all']))
     // The pane may have read the list while this poll ran, or the strip been turned off: then this answer is stale.
     if (!(await read($, stripAtom)).isOn) return
     await update($, listAtom, (list): NexusList => (list.polledAt !== null && list.polledAt >= asked ? list : threads.ok ? { threads: threads.value, failure: null, polledAt: asked } : { ...list, failure: threads.failure }))
@@ -884,7 +1001,7 @@ const focusOn = ($: EngineInterface, key: string) =>
 /** What the thread just shown runs: its details polled afresh and its watch, while the pane is open. */
 async function followThread($: EngineInterface, thread: string) {
   const shown = await read($, shownAtom)
-  if (shown?.thread !== thread) await $.state.set(SHOWN, null)
+  if (shown?.thread !== thread) await Promise.all([$.state.set(SHOWN, null), $.state.set(CLAUDE, null)])
   await leaveCheckout($, thread)
   // The person may have moved on during those awaits: only the thread still shown is followed.
   const pane = await read($, paneAtom)
@@ -1012,9 +1129,25 @@ const emptyCheckout = (thread: string): NexusCheckout => ({ thread, changes: nul
 const changeCheckout = ($: EngineInterface, thread: string, change: (was: NexusCheckout) => NexusCheckout) =>
   update($, checkoutAtom, was => (was?.thread === thread ? change(was) : was))
 
-/** The Show only uncommitted choice as `$.store` kept it. */
-async function loadUncommitted($: EngineInterface) {
-  await $.state.set(UNCOMMITTED, (await $.store.get('uncommitted')) === true)
+/** What Changes compares with, as `$.store` kept it. A store from before the latest turn kept only whether to show the uncommitted changes. */
+async function loadChangesBase($: EngineInterface) {
+  const stored = await $.store.get('changesBase')
+  const old = await $.store.get('uncommitted')
+  const base = stored === 'start' || stored === 'turn' || stored === 'head' ? stored : old === true ? 'head' : 'start'
+  await $.state.set(CHANGES_BASE, base)
+  if (old === undefined) return
+  await $.store.set('changesBase', base)
+  await $.store.delete('uncommitted')
+}
+
+/**
+ * A failed checkout read: a CLI too old for the command names the version it needs, and one too old for `--turn`,
+ * which its parseArgs refuses as an unknown option, the version that added it.
+ */
+async function checkoutFailure($: EngineInterface, failure: NexusFailure, base: NexusBase['kind'], command: string, doing: string): Promise<NexusFailure> {
+  const older = newer(failure, command, doing, '0.6.0')
+  if (older !== failure || base !== 'turn' || failure.kind !== 'invalid') return older
+  return olderThan($, failure, [0, 11, 0], "comparing with the latest turn")
 }
 
 /**
@@ -1036,7 +1169,7 @@ async function readChanges($: EngineInterface, thread: string, wake: boolean): P
     if (!wake && !checkout?.isWanted) return
     if (!checkout?.isWanted) await changeCheckout($, thread, was => ({ ...was, isWanted: true }))
   }
-  const uncommitted = await read($, uncommittedAtom)
+  const base = await read($, changesBaseAtom)
   // The check and the claim are one synchronous step, so two asks at once never start two children.
   if (changesChild?.thread === thread) return
   changesChild?.stop()
@@ -1044,18 +1177,18 @@ async function readChanges($: EngineInterface, thread: string, wake: boolean): P
   const mine = { thread, stop }
   changesChild = mine
   await changeCheckout($, thread, was => ({ ...was, isReading: true }))
-  const got = await childJson($, changesArgv(thread, uncommitted), Promise.race([current.stopped, promise]))
+  const got = await childJson($, changesArgv(thread, base), Promise.race([current.stopped, promise]))
   if (changesChild === mine) changesChild = undefined
-  const isStale = got !== undefined && (await read($, uncommittedAtom)) !== uncommitted
+  const isStale = got !== undefined && (await read($, changesBaseAtom)) !== base
   if (!got || isStale) {
     await changeCheckout($, thread, was => ({ ...was, isReading: false }))
     if (isStale) await readChanges($, thread, false)
     return
   }
-  const changes = got.ok ? parsed(got, parseChanges) : { ok: false as const, failure: newer(got.failure, 'changes', 'reading the changes', '0.6.0') }
+  const changes = got.ok ? parsed(got, parseChanges) : { ok: false as const, failure: await checkoutFailure($, got.failure, base, 'changes', 'reading the changes') }
   if (!changes.ok) {
     const { message } = changes.failure
-    await changeCheckout($, thread, was => ({ ...was, changes: null, failure: { message, isNoBase: !uncommitted && isNoBase(message) }, isReading: false, isWanted: false }))
+    await changeCheckout($, thread, was => ({ ...was, changes: null, failure: { message, isNoBase: base !== 'head' && isNoBase(message) }, isReading: false, isWanted: false }))
     return
   }
   await changeCheckout($, thread, () => ({ thread, changes: changes.value, failure: null, isReading: false, isWanted: false }))
@@ -1077,9 +1210,9 @@ async function readDiff($: EngineInterface, thread: string, file: NexusChangedFi
   if (!current || (await read($, paneAtom)).selected !== thread) return
   const shown = await read($, shownAtom)
   const detail = shown?.thread === thread ? shown.detail : null
-  const uncommitted = await read($, uncommittedAtom)
-  const fresh: NexusDiffShown = { thread, file, isUncommitted: uncommitted, rows: null, meta: [], isBinary: false, isCut: false, failure: null, isReading: false }
-  const kept = (was: NexusDiffShown | null): NexusDiffShown => (was?.thread === thread && was.file.path === file.path && was.isUncommitted === uncommitted ? { ...was, file } : fresh)
+  const base = await read($, changesBaseAtom)
+  const fresh: NexusDiffShown = { thread, file, base, rows: null, meta: [], isBinary: false, isCut: false, failure: null, isReading: false }
+  const kept = (was: NexusDiffShown | null): NexusDiffShown => (was?.thread === thread && was.file.path === file.path && was.base === base ? { ...was, file } : fresh)
   const facts = detail && checkoutFacts(detail)
   const isOpen = facts?.status === 'active' || facts?.status === 'idle'
   if (!facts || !isOpen || (!isAwake && !canReadCheckout(facts))) {
@@ -1091,16 +1224,16 @@ async function readDiff($: EngineInterface, thread: string, file: NexusChangedFi
   const mine = { thread, stop }
   diffChild = mine
   await update($, diffAtom, was => ({ ...kept(was), isReading: true }))
-  const got = await childJson($, diffArgv(thread, file, uncommitted), Promise.race([current.stopped, promise]))
+  const got = await childJson($, diffArgv(thread, file, base), Promise.race([current.stopped, promise]))
   // A newer read took this one's place, and writes its own.
   if (diffChild !== mine) return
   diffChild = undefined
-  const isOurs = (was: NexusDiffShown | null) => was?.thread === thread && was.file.path === file.path && was.isUncommitted === uncommitted
-  if (!got || (await read($, uncommittedAtom)) !== uncommitted) {
+  const isOurs = (was: NexusDiffShown | null) => was?.thread === thread && was.file.path === file.path && was.base === base
+  if (!got || (await read($, changesBaseAtom)) !== base) {
     await update($, diffAtom, was => (isOurs(was) ? { ...was!, isReading: false } : was))
     return
   }
-  const reply = got.ok ? parsed(got, parseDiffReply) : { ok: false as const, failure: newer(got.failure, 'diff', 'reading a diff', '0.6.0') }
+  const reply = got.ok ? parsed(got, parseDiffReply) : { ok: false as const, failure: await checkoutFailure($, got.failure, base, 'diff', 'reading a diff') }
   await update($, diffAtom, was => {
     if (!isOurs(was)) return was
     if (!reply.ok) return { ...was!, isReading: false, failure: reply.failure.message }
@@ -1109,11 +1242,11 @@ async function readDiff($: EngineInterface, thread: string, file: NexusChangedFi
   })
 }
 
-/** c: only the uncommitted changes, or all since the pylon booted again; kept between sessions, and read again. */
-async function toggleUncommitted($: EngineInterface) {
-  const next = !(await read($, uncommittedAtom))
-  await $.state.set(UNCOMMITTED, next)
-  await $.store.set('uncommitted', next)
+/** c: the next of what Changes compares with (`BASES`); kept between sessions, and read again. */
+async function nextChangesBase($: EngineInterface) {
+  const next = BASES[await read($, changesBaseAtom)].next
+  await $.state.set(CHANGES_BASE, next)
+  await $.store.set('changesBase', next)
   const { selected } = await read($, paneAtom)
   if (selected) await readChanges($, selected, false)
 }
@@ -1190,11 +1323,13 @@ async function closeSession($: EngineInterface, thread: string, id: string, isPa
   if (got.ok) return parsed(got, parseSessionClosed)
   const failure = newer(got.failure, 'session close', 'closing a session', '0.5.0')
   if (failure !== got.failure || !isPaneless) return { ok: false, failure }
-  const version = await cliVersion($)
-  return {
-    ok: false,
-    failure: version && isOlder(version, [0, 8, 0]) ? { kind: failure.kind, message: `${cli} is ${version.join('.')}: closing a failed session needs Nexus CLI 0.8.0 or later (nexus --version)` } : failure,
-  }
+  return { ok: false, failure: await olderThan($, failure, [0, 8, 0], 'closing a failed session') }
+}
+
+/** `failure`, or when `nexus --version` says the CLI is older than `version`, the version `doing` needs. */
+async function olderThan($: EngineInterface, failure: NexusFailure, version: readonly number[], doing: string): Promise<NexusFailure> {
+  const found = await cliVersion($)
+  return found && isOlder(found, version) ? { kind: failure.kind, message: `${cli} is ${found.join('.')}: ${doing} needs Nexus CLI ${version.join('.')} or later (nexus --version)` } : failure
 }
 
 /** The CLI's version, or null when `--version` printed none or did not run. */
@@ -1305,7 +1440,7 @@ async function closeInPane($: EngineInterface, thread: string, id: string) {
  * the dialog's default and a dismissed dialog keep them. Else what to say instead.
  */
 async function askSession($: EngineInterface, thread: string): Promise<Outcome<{ session: NexusSession } | { said: string }>> {
-  const detail = parsed(await nexus($, ['show', thread]), parseDetail)
+  const detail = await detailFrom($, await nexus($, ['show', thread]))
   if (!detail.ok) return detail
   // A paused session cannot be closed until it runs, so the dialog does not offer it.
   const sessions = detail.value.sessions.filter(one => one.state !== 'paused')
@@ -1342,7 +1477,17 @@ async function attachInHerdr($: EngineInterface, workspace: string, thread: stri
   const pane = parseHerdrTab(created.value)
   if (!pane) return failed('herdr tab create printed no pane')
   const ran = await herdr($, ['pane', 'run', pane, attachCommand(cli, thread)])
+  if (ran.ok) attached = { thread, pane }
   return ran.ok ? { ok: true, value: label } : ran
+}
+
+/** Whether the Herdr tab the pane opened for `thread` still runs its attach, which ends once the person detaches or closes it. */
+async function isAttached($: EngineInterface, thread: string): Promise<boolean> {
+  if (attached?.thread !== thread) return false
+  const info = await herdr($, ['pane', 'process-info', '--pane', attached.pane])
+  if (info.ok && isPaneRunning(info.value)) return true
+  attached = undefined
+  return false
 }
 
 /** One herdr command: its stdout, or why it failed. */
@@ -1370,11 +1515,15 @@ const tabOpened = (label: string) =>
 const say = (outcome: Outcome<string>) =>
   outcome.ok ? outcome.value : sentence(outcome.failure.message.replace(/^./, first => first.toUpperCase()))
 
-async function send($: EngineInterface, id: string, text: string): Promise<Outcome<string>> {
+/** Sends `text` to the thread's agent, or types it into its Claude Code worker's session; the thread shown is read again to show it. */
+async function send($: EngineInterface, id: string, text: string): Promise<Outcome<Sent>> {
   // `--` keeps a message that starts with a dash from reading as a flag.
-  const got = await nexus($, ['send', id, '--', text])
-  return got.ok ? { ok: true, value: `Sent to ${id}.` } : got
+  const sent = parsed(await nexus($, ['send', id, '--', text], SEND_MS), parseSent)
+  if (sent.ok && (await read($, paneAtom)).selected === id) pollAgain($)
+  return sent
 }
+
+const saySent = (id: string, sent: Outcome<Sent>): Outcome<string> => (sent.ok ? { ok: true, value: sentText(id, sent.value) } : sent)
 
 type StartFields = { project: string; title?: string | undefined; message?: string | undefined; node?: string | undefined; branch?: string | undefined }
 
@@ -1433,7 +1582,7 @@ async function runCommand($: EngineInterface, args: string): Promise<string> {
     }
     case 'send': {
       const id = await resolveThread($, command.thread)
-      return say(id.ok ? await send($, id.value, command.text) : id)
+      return say(id.ok ? saySent(id.value, await send($, id.value, command.text)) : id)
     }
     case 'action': {
       const id = await targetOf($, command.thread)
@@ -1582,6 +1731,83 @@ async function waitFor($: EngineInterface, thread: string, ms: number, signal: A
   }
 }
 
+/** How often `wait` reads a Claude Code worker thread, whose transcript no watch streams. */
+const CLAUDE_WAIT_MS = 2_000
+
+type ClaudeThread = { detail: NexusDetail; reading: ClaudeReading }
+
+/** A Claude Code worker thread's details and transcript, for a tool; null for a harness thread, which its watch reports. */
+async function claudeThread($: EngineInterface, thread: string, signal: AbortSignal): Promise<Outcome<ClaudeThread | null>> {
+  const detail = await detailFrom($, await toolJson($, ['show', thread], signal))
+  if (!detail.ok || detail.value.conversation !== 'claude') return detail.ok ? { ok: true, value: null } : detail
+  const reading = parsed(await toolJson($, ['conversation', thread], signal), parseClaudeConversation)
+  return reading.ok ? { ok: true, value: { detail: detail.value, reading: reading.value } } : reading
+}
+
+/** A Claude Code worker's launch for the model, a failed one with the newest lines of its diagnostic. */
+const workerFields = (detail: NexusDetail) =>
+  detail.worker ? { worker: { state: detail.worker.state, model: detail.worker.model, ...(detail.worker.message ? { message: keepTail(detail.worker.message, 1_000) } : {}) } } : {}
+
+/**
+ * `wait` on a Claude Code worker thread: its details and transcript read every `CLAUDE_WAIT_MS` until it is idle
+ * (`isWorkerIdle`), its launch fails, `ms` pass or the call is cancelled. A message just typed may not be in the
+ * transcript yet, nor its turn reported, so an idle reading settles only when the one a full `CLAUDE_WAIT_MS` before it
+ * was idle too, unless this wait saw the turn run; a deadline too near for that reading ends the wait unsettled. A
+ * transcript that ends at a prompt the worker never answered settles so too, its reply null.
+ */
+async function waitForClaude($: EngineInterface, thread: string, first: ClaudeThread, ms: number, signal: AbortSignal): Promise<Outcome<unknown>> {
+  const until = (await $.clock.now()) + ms
+  let { detail, reading } = first
+  let sawWorking = false
+  let wasIdle = false
+  /** Why the last reading failed, while it fails: the wait goes on with the reading before, as a watch outlives an outage. */
+  let outage: string | null = null
+  for (;;) {
+    const state = claudeState(detail, reading)
+    sawWorking ||= reading.working
+    const isIdle = outage === null && (detail.worker?.state === 'failed' || detail.worker?.state === 'stalled' || isWorkerIdle(state))
+    const settled = isIdle && (wasIdle || sawWorking)
+    const isLate = (await $.clock.now()) + CLAUDE_WAIT_MS > until
+    if (settled || signal.aborted || isLate) {
+      const human = needsHuman(state)
+      const reply = rowsReply(reading.rows, REPLY_CHARS)
+      return {
+        ok: true,
+        value: {
+          thread,
+          settled,
+          ...(!settled && !signal.aborted ? { timed_out: true } : {}),
+          ...(signal.aborted ? { cancelled: true } : {}),
+          ...stateFields(state),
+          ...workerFields(detail),
+          ...(outage ? { outage } : {}),
+          ...(human ? { needs_human: human } : {}),
+          reply: reply ? leftOut(reply.tail, reply.dropped) : null,
+        },
+      }
+    }
+    wasIdle = isIdle
+    const { promise, stop } = stopper()
+    const timer = $.clock.after(CLAUDE_WAIT_MS, stop)
+    signal.addEventListener('abort', stop)
+    await promise
+    timer.cancel()
+    signal.removeEventListener('abort', stop)
+    if (signal.aborted) continue
+    const next = await claudeThread($, thread, signal)
+    if (!next.ok && signal.aborted) return { ok: true, value: { thread, settled: false, cancelled: true } }
+    if (!next.ok && next.failure.kind !== 'unreachable' && next.failure.kind !== 'failed') return next
+    if (!next.ok) {
+      outage = next.failure.message
+      continue
+    }
+    outage = null
+    if (!next.value) return failed(`${thread} is no longer a Claude Code worker thread`)
+    detail = next.value.detail
+    reading = next.value.reading
+  }
+}
+
 const str = (input: Record<string, unknown>, key: string) => {
   const value = input[key]
   return typeof value === 'string' && value.trim() ? value.trim() : undefined
@@ -1671,11 +1897,17 @@ async function runTool($: EngineInterface, tool: keyof typeof TOOLS, input: Reco
       const text = str(input, 'text')
       if (!id.ok || !text) return answer(id.ok ? failed('text is required') : id)
       const sent = await send($, id.value, text)
-      return answer(sent.ok ? { ok: true, value: { thread: id.value, sent: true } } : sent)
+      return answer(sent.ok ? { ok: true, value: { thread: id.value, sent: true, ...(sent.value.kind === 'claude' ? { claude: { outcome: sent.value.outcome, resumed: sent.value.resumed } } : {}) } } : sent)
     }
     case 'read': {
       const id = await toolThread($, input)
       if (!id.ok) return answer(id)
+      const worker = await claudeThread($, id.value, signal)
+      if (!worker.ok) return answer(worker)
+      if (worker.value) {
+        const { detail, reading } = worker.value
+        return answer({ ok: true, value: { thread: id.value, ...stateFields(claudeState(detail, reading)), ...workerFields(detail), conversation: rowsText(reading.rows, READ_CHARS) } })
+      }
       const got = await snapshot($, id.value, signal)
       if (!got.ok) return answer(got)
       return answer({ ok: true, value: { thread: id.value, ...stateFields(got.value.state), conversation: transcript(got.value.entries, READ_CHARS) } })
@@ -1684,6 +1916,9 @@ async function runTool($: EngineInterface, tool: keyof typeof TOOLS, input: Reco
       const id = await toolThread($, input)
       if (!id.ok) return answer(id)
       const seconds = typeof input.timeout_seconds === 'number' ? Math.min(600, Math.max(1, Math.round(input.timeout_seconds))) : 300
+      const worker = await claudeThread($, id.value, signal)
+      if (!worker.ok) return answer(worker)
+      if (worker.value) return answer(await waitForClaude($, id.value, worker.value, seconds * 1000, signal))
       const got = await waitFor($, id.value, seconds * 1000, signal)
       if (!got.ok) return answer(got)
       const { watch, reply, settled, timedOut } = got.value
@@ -1907,10 +2142,13 @@ const listView = (was: NexusPane): NexusPane => ({
 /** After the list took the place of the thread `left`: its watch stopped, what was read of it dropped, the list polled. */
 async function listShown($: EngineInterface, left: string | null, pane: NexusPane) {
   watcher?.stop()
-  if (left) void markSeen($, left)
   await leaveCheckout($, null)
-  await Promise.all([$.state.set(WATCH, null), $.state.set(LIVE, null), $.state.set(SHOWN, null)])
-  void poll($)
+  await Promise.all([$.state.set(WATCH, null), $.state.set(LIVE, null), $.state.set(SHOWN, null), $.state.set(CLAUDE, null)])
+  // The list read after the mark no longer shows the reply the person just read as new.
+  void (async () => {
+    if (left) await markLeft($, left)
+    pollAgain($)
+  })()
   await focusRing($, pane)
 }
 
@@ -2056,8 +2294,8 @@ function paneActions($: EngineInterface, surface: RenderSurface): PaneActions {
         return refresh()
       case 'read-changes':
         return readChanges($, effect.thread, true)
-      case 'uncommitted':
-        return toggleUncommitted($)
+      case 'base':
+        return nextChangesBase($)
       case 'open-diff':
         await setPane($, pane => (pane.selected === effect.thread ? { diff: { path: effect.file.path, top: 0 }, changesCursor: fileKey(effect.file.path) } : {}))
         return readDiff($, effect.thread, effect.file)
@@ -2123,7 +2361,7 @@ function paneActions($: EngineInterface, surface: RenderSurface): PaneActions {
           return focusRing($, await read($, paneAtom))
         }
         await inTurn(() => setPane($, () => ({ draft: '' })))
-        await onShown(id => send($, id, text.trim()))
+        await onShown(async id => saySent(id, await send($, id, text.trim())))
       }),
     back: () => run(back),
     startDraft: (change, at) =>
@@ -2176,7 +2414,7 @@ export const register: Register = (on, options) => {
       ...Object.values(TOOLS).map(spec => $.tool.register(spec)),
       loadStrip($),
       loadScope($),
-      loadUncommitted($),
+      loadChangesBase($),
       readHerdr($),
     ])
     stripper?.cancel()
@@ -2216,19 +2454,15 @@ export const register: Register = (on, options) => {
 
   on('ui.render', { component: 'AbovePrompt' }, async ($, e, next) => {
     if (e.props.hasSurvey) return next(e)
-    const [strip, list, watch, shown, now, cursor, scope] = await Promise.all([
+    const [strip, list, now, cursor, scope] = await Promise.all([
       read($, stripAtom),
       read($, listAtom),
-      read($, watchAtom),
-      read($, shownAtom),
       read($, nowAtom),
       read($, stripCursorAtom),
       read($, scopeAtom),
     ])
     if (!strip.isOn) return next(e)
-    // The list has no parked tasks: only the thread the pane watches is known to hold them.
-    const parked = new Set([...(watch?.state?.run === 'parked' ? [watch.thread] : []), ...(shown?.detail?.agent?.parkedTasks ? [shown.thread] : [])])
-    const chips = stripChips(inScope(list.threads ?? [], scope), strip, Math.max(now, list.polledAt ?? 0), parked)
+    const chips = stripChips(inScope(list.threads ?? [], scope), Math.max(now, list.polledAt ?? 0))
     if (chips.length === 0 && !(list.failure && !list.threads)) return next(e)
     return StripView($.ui.resolve(e), list, chips, e.props.bodyColumns, cursor, scope, id => void openFromStrip($, id))
   })
@@ -2253,7 +2487,7 @@ export const register: Register = (on, options) => {
       return <Text dimColor>The Nexus pane needs a surface with text fields.</Text>
     }
     const draw: Draw = $.ui.resolve(e)
-    const [list, watch, live, shown, catalog, pane, now, scope, checkout, diff, uncommitted] = await Promise.all([
+    const [list, watched, streamed, shown, catalog, pane, now, scope, checkout, diff, changesBase, claude] = await Promise.all([
       read($, listAtom),
       read($, watchAtom),
       read($, liveAtom),
@@ -2264,8 +2498,14 @@ export const register: Register = (on, options) => {
       read($, scopeAtom),
       read($, checkoutAtom),
       read($, diffAtom),
-      read($, uncommittedAtom),
+      read($, changesBaseAtom),
+      read($, claudeAtom),
     ])
+    const detail = shown?.thread === pane.selected ? shown.detail : null
+    // A Claude Code worker's conversation comes from `nexus conversation`, its watch carrying only the thread's state.
+    const worker = detail?.conversation === 'claude' && watched?.thread === pane.selected ? claudeWatch(watched, claude?.thread === pane.selected ? claude : null, detail.worker?.model ?? null) : null
+    const watch = worker?.watch ?? watched
+    const live = worker && watched ? { thread: watched.thread, live: worker.live } : streamed
     // A drawing may not write: Esc out of a field or an overlay is taken up after it.
     if (!e.props.isFocused && (pane.mode !== 'normal' || pane.overlay) && !recovering) recovering = $.clock.after(0, () => void recover($))
     const scene: Scene = {
@@ -2286,7 +2526,7 @@ export const register: Register = (on, options) => {
       cli,
       checkout,
       diff,
-      uncommitted,
+      changesBase,
     }
     const actions = paneActions($, e.surface)
     const tree =

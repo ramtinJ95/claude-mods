@@ -24,7 +24,7 @@ export type Command =
   | 'new'
   | 'projects'
   | 'refresh'
-  | 'uncommitted'
+  | 'base'
   | 'help'
   | 'close'
 
@@ -48,7 +48,7 @@ export const KEYMAP: readonly { hotkey: string; command: Command }[] = [
   { hotkey: 'n', command: 'new' },
   { hotkey: 'p', command: 'projects' },
   { hotkey: 'r', command: 'refresh' },
-  { hotkey: 'c', command: 'uncommitted' },
+  { hotkey: 'c', command: 'base' },
   { hotkey: 's', command: 'help' },
   { hotkey: 'q', command: 'close' },
 ]
@@ -84,7 +84,7 @@ export const HELP: readonly { title: string; keys: readonly [keys: string, what:
     title: 'Changes',
     keys: [
       ['enter o', "open a file's diff, or fold a folder; on a paused pylon, wake it and read"],
-      ['c', 'only uncommitted changes, or all since the pylon booted'],
+      ['c', 'compare with what the pylon booted at, the latest turn or the last commit, in turn'],
       ['r', 'read the changes again, waking a paused pylon'],
       ['y', "copy the file's path"],
       ['h', 'from a diff, back to the files'],
@@ -132,8 +132,8 @@ export type Effect =
   | { kind: 'refresh' }
   /** Changes read again for `thread`, waking a paused pylon: `r`, or Enter on the paused note. */
   | { kind: 'read-changes'; thread: string }
-  /** Shows only the uncommitted changes, or all since the pylon booted again. */
-  | { kind: 'uncommitted' }
+  /** Compares the changes with the next base: what the pylon booted at, the latest turn, the last commit. */
+  | { kind: 'base' }
   /** A changed file's diff, in place of the tree. */
   | { kind: 'open-diff'; thread: string; file: NexusChangedFile }
   | { kind: 'close' }
@@ -337,7 +337,7 @@ export function press(before: NexusPane, pressed: Command, nav: Nav): Step {
   if (thread) {
     // In Changes, c switches what the changes compare with, and r reads them again rather than watching again.
     if (nav.context === 'changes' || nav.context === 'diff') {
-      if (command === 'uncommitted') return done({}, [{ kind: 'uncommitted' }])
+      if (command === 'base') return done({}, [{ kind: 'base' }])
       if (command === 'refresh') return done({}, [{ kind: 'read-changes', thread: nav.thread }])
     }
     // h on a diff goes back to the tree, the cursor on its file.
