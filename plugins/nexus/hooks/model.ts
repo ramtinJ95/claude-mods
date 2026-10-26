@@ -554,13 +554,16 @@ export type ClaudeReading = { rows: NexusRow[]; dropped: number; working: boolea
 /**
  * `conversation --json` for a Claude Code worker thread (CLI 0.17.0), its entries folded into rows as a watch's are: a
  * prompt from the person or a slash command as theirs, a reply as an answer, a tool call settled by the result that
- * names it, and the rest as notices, a record of a kind the CLI does not know included. A queue operation moves only
- * the queue, which Claude takes from by text, or its oldest without one. An entry kind this mod does not know is skipped.
+ * names it, and the rest as notices, a record of a kind the CLI does not know included. A pull request Claude opened
+ * shows once, by its URL, since Claude Code writes its record again with each save of the session (CLI 0.19.0). A queue
+ * operation moves only the queue, which Claude takes from by text, or its oldest without one. An entry kind this mod
+ * does not know is skipped.
  */
 export function parseClaudeConversation(json: unknown): ClaudeReading {
   if (!isRecord(json) || json.kind !== 'claude' || !Array.isArray(json.entries)) throw contractError('conversation', "a Claude worker's conversation")
   const rows: NexusRow[] = []
   const queued: string[] = []
+  const opened = new Set<string>()
   const dropped = num(json.dropped)
   // Each row is keyed by its entry's place in the whole transcript, so a window that slides past an entry no row shows moves no key.
   const push = (at: number, row: NexusRow) => rows.push({ ...row, entry: dropped + at })
@@ -601,6 +604,11 @@ export function parseClaudeConversation(json: unknown): ClaudeReading {
         break
       case 'record':
         push(at, { kind: 'notice', tone: 'dim', text: str(entry.summary) })
+        break
+      case 'pull-request':
+        if (opened.has(str(entry.url))) break
+        opened.add(str(entry.url))
+        push(at, { kind: 'notice', tone: 'dim', text: `Opened pull request #${num(entry.number)}: ${str(entry.url)}` })
         break
     }
   }
