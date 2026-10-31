@@ -69,7 +69,7 @@ test("a worker's new reply is marked seen only once its transcript is read and d
   expect(cli.runs.filter(argv => argv[0] === 'seen')).toEqual([])
   cli.fail = {}
   await clock.advance(5_000)
-  expect(cli.runs.filter(argv => argv[0] === 'seen')).toEqual([['seen', '--json', WORKER.id]])
+  expect(cli.runs.filter(argv => argv[0] === 'seen')).toEqual([['seen', '--json', WORKER.id, `--last-reply-at=${T0}`]])
 })
 
 test("a worker's reply is marked only from a transcript read at or after it, which a later turn running does not change", async ($, on) => {
@@ -81,7 +81,7 @@ test("a worker's reply is marked only from a transcript read at or after it, whi
   expect(cli.runs.filter(argv => argv[0] === 'seen')).toEqual([])
   cli.conversation = { ...CONVERSATION, readAt: T0, working: true }
   await clock.advance(5_000)
-  expect(cli.runs.filter(argv => argv[0] === 'seen')).toEqual([['seen', '--json', WORKER.id]])
+  expect(cli.runs.filter(argv => argv[0] === 'seen')).toEqual([['seen', '--json', WORKER.id, `--last-reply-at=${T0}`]])
 })
 
 test('a harness thread reads no transcript: its watch streams the conversation', async ($, on) => {
