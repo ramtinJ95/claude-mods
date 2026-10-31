@@ -51,7 +51,7 @@ test('pressing a chip opens its thread in the pane, which marks the reply seen o
   expect(cli.isOpen).toBe(true)
   expect(cli.spawns).toContainEqual(['watch', REPLIED.id, '--json'])
   expect(await (await mount()).find({ type: 'Text', text: REPLIED.id })).toBeDefined()
-  expect(cli.runs.filter(argv => argv[0] === 'seen')).toEqual([['seen', '--json', REPLIED.id]])
+  expect(cli.runs.filter(argv => argv[0] === 'seen')).toEqual([['seen', '--json', REPLIED.id, `--last-reply-at=${REPLIED.lastReplyAt}`]])
   // The details read after the mark drop the reply from the strip before the strip's own poll.
   expect(threadPolls(cli.runs)).toBe(1)
   expect((await chips(ui)).map(([key]) => key)).toEqual([ID])
@@ -156,7 +156,7 @@ test('the list marks an unread reply and counts it; going back from its thread m
   cli.detail = { ...DETAIL, thread: REPLIED, attention: 'reply', seenAt: REPLIED.seenAt, lastReplyAt: REPLIED.lastReplyAt }
   await ui.press({ key: 'key-h' })
   await clock.settle()
-  expect(cli.runs.filter(argv => argv[0] === 'seen')).toEqual([['seen', '--json', REPLIED.id]])
+  expect(cli.runs.filter(argv => argv[0] === 'seen')).toEqual([['seen', '--json', REPLIED.id, `--last-reply-at=${REPLIED.lastReplyAt}`]])
   const marked = cli.runs.findIndex(argv => argv[0] === 'seen')
   expect(cli.spawns.at(-1)).toEqual(['threads', '--json', '--all'])
   expect(cli.runs.slice(marked).some(argv => argv[0] === 'threads')).toBe(false)
@@ -191,7 +191,7 @@ test('a reply is not marked seen before the watch has drawn the conversation, no
   expect(cli.runs.filter(argv => argv[0] === 'seen')).toEqual([])
   await ui.press({ key: 'tab-conversation' })
   await clock.advance(5_000)
-  expect(cli.runs.filter(argv => argv[0] === 'seen')).toEqual([['seen', '--json', REPLIED.id]])
+  expect(cli.runs.filter(argv => argv[0] === 'seen')).toEqual([['seen', '--json', REPLIED.id, `--last-reply-at=${REPLIED.lastReplyAt}`]])
 })
 
 test("an earlier answer on screen marks nothing while the watch has the run working: the details' newer reply has not arrived", async ($, on) => {
@@ -204,22 +204,7 @@ test("an earlier answer on screen marks nothing while the watch has the run work
   await clock.advance(15_000)
   expect(cli.runs.filter(argv => argv[0] === 'seen')).toEqual([])
   await clock.advance(10_000)
-  expect(cli.runs.filter(argv => argv[0] === 'seen')).toEqual([['seen', '--json', REPLIED.id]])
-})
-
-test('leaving a thread marks nothing once a newer reply than the one shown has come', async ($, on) => {
-  const read = { ...DETAIL, thread: { ...REPLIED, seenAt: REPLIED.lastReplyAt }, attention: null, seenAt: REPLIED.lastReplyAt, lastReplyAt: REPLIED.lastReplyAt }
-  const cli = fake({ threads: [...THREADS, REPLIED], detail: read, store: STORE })
-  cli.watch = [{ type: 'reset', thread: ID, entries: ENTRIES.slice(0, -1) }, state('idle')]
-  const { clock, nexus, mount } = await boot($, on, cli)
-  await nexus('open e000')
-  await clock.advance(5_000)
-  const ui = await mount()
-  const newer = { ...REPLIED, lastReplyAt: T0 + 4_000 }
-  cli.detail = { ...DETAIL, thread: newer, attention: 'reply', seenAt: newer.seenAt, lastReplyAt: newer.lastReplyAt }
-  await ui.press({ key: 'key-h' })
-  await clock.settle()
-  expect(cli.runs.filter(argv => argv[0] === 'seen')).toEqual([])
+  expect(cli.runs.filter(argv => argv[0] === 'seen')).toEqual([['seen', '--json', REPLIED.id, `--last-reply-at=${REPLIED.lastReplyAt}`]])
 })
 
 test("a review that ended for the person reads needs you in the list, and Pylon lists the review's reasons", async ($, on) => {
@@ -257,8 +242,8 @@ test('CLI 0.19.0 marks only the reply the pane showed: leaving after a newer one
   expect((await ui.find({ type: 'Button', key: REPLIED.id }))?.text).toMatch(/Docs pass\s+ new reply/)
 })
 
-/** A thread with a new reply opened and left while every `nexus --version` prints `version`, or fails for null. */
-async function unknownVersion(...[$, on, version]: [...Parameters<TestBody>, string | null]) {
+/** A thread with a new reply opened and left while every `nexus --version` prints `version`, or fails for null: the pane marks nothing and says `why` once. */
+async function refusedVersion(...[$, on, version, why]: [...Parameters<TestBody>, string | null, string]) {
   const unread = { ...DETAIL, thread: REPLIED, attention: 'reply', seenAt: REPLIED.seenAt, lastReplyAt: REPLIED.lastReplyAt }
   const cli = fake({ threads: [...THREADS, REPLIED], detail: unread, store: STORE, versions: Array.from({ length: 20 }, () => version) })
   cli.watch = [{ type: 'reset', thread: ID, entries: ENTRIES.slice(0, -1) }, state('idle')]
@@ -275,13 +260,16 @@ async function unknownVersion(...[$, on, version]: [...Parameters<TestBody>, str
   await ui.press({ key: 'key-h' })
   await clock.settle()
   expect(cli.runs.filter(argv => argv[0] === 'seen')).toEqual([])
-  expect(notices).toEqual([`The reply in ${REPLIED.id} was not marked seen, so it still shows as new: nexus --version gave no version, so the pane cannot mark only the reply it showed.`])
+  expect(notices).toEqual([`The reply in ${REPLIED.id} was not marked seen, so it still shows as new: ${why}`])
   expect((await ui.find({ type: 'Button', key: REPLIED.id }))?.text).toMatch(/Docs pass\s+ new reply/)
 }
 
-test('a version check that fails marks nothing, opening or leaving, and says so once for the reply', ($, on) => unknownVersion($, on, null))
+test('a version check that fails marks nothing, opening or leaving, and says so once for the reply', ($, on) => refusedVersion($, on, null, 'nexus --version gave no version, so the pane cannot mark only the reply it showed.'))
 
-test('a version check that prints no version marks nothing, opening or leaving, and says so once for the reply', ($, on) => unknownVersion($, on, 'garbage'))
+test('a version check that prints no version marks nothing, opening or leaving, and says so once for the reply', ($, on) => refusedVersion($, on, 'garbage', 'nexus --version gave no version, so the pane cannot mark only the reply it showed.'))
+
+test('a CLI before 0.19.0, whose seen cannot name the reply shown, marks nothing and names the version it needs', ($, on) =>
+  refusedVersion($, on, '0.18.0', 'nexus is 0.18.0: marking only the reply shown seen needs Nexus CLI 0.19.0 or later (nexus --version).'))
 
 test('leaving reads the version once for its mark: a check that says 0.19.0 and a later one that fails cannot widen the mark to a newer reply', async ($, on) => {
   const read = { ...DETAIL, thread: { ...REPLIED, seenAt: REPLIED.lastReplyAt }, attention: null, seenAt: REPLIED.lastReplyAt, lastReplyAt: REPLIED.lastReplyAt }
