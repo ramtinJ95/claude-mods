@@ -253,14 +253,20 @@ async function refusedVersion(...[$, on, version, why]: [...Parameters<TestBody>
     if (e.key === 'pane' && notice && !notices.includes(notice.text)) notices.push(notice.text)
     return next(e)
   })
+  const refused = `The reply in ${REPLIED.id} was not marked seen, so it still shows as new: ${why}`
   const { clock, nexus, mount } = await boot($, on, cli)
   await nexus('open e000')
   await clock.advance(15_000)
   const ui = await mount()
+  expect(await ui.find({ type: 'Text', text: refused })).toBeDefined()
+  await ui.press({ key: 'key-k' })
+  await clock.advance(10_000)
+  expect(await ui.find({ type: 'Text', text: refused }), 'later polls of the same reply say nothing again').toBeUndefined()
   await ui.press({ key: 'key-h' })
   await clock.settle()
+  expect(await ui.find({ type: 'Text', text: refused }), 'leaving says nothing again').toBeUndefined()
   expect(cli.runs.filter(argv => argv[0] === 'seen')).toEqual([])
-  expect(notices).toEqual([`The reply in ${REPLIED.id} was not marked seen, so it still shows as new: ${why}`])
+  expect(notices).toEqual([refused])
   expect((await ui.find({ type: 'Button', key: REPLIED.id }))?.text).toMatch(/Docs pass\s+ new reply/)
 }
 
