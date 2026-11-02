@@ -1,5 +1,6 @@
 import { expect, test, type TestBody } from 'claude-code/testing'
 
+import { cells } from '../hooks/model'
 import { NOTICE_KEY } from '../hooks/strip'
 import { DETAIL, ENTRIES, ID, T0, THREAD, THREADS, boot, fake, state } from './fake-cli'
 
@@ -138,13 +139,22 @@ test("a strip poll that ends after the pane's newer one writes nothing", async (
   expect(await ui.find({ type: 'Button', key: NEW.id })).toBeDefined()
 })
 
-test("a project's name in a narrow strip shortens the thread's title rather than its word", async ($, on) => {
+test("a narrow strip fits its one row: the project's name goes before the thread's title, and a count says less", async ($, on) => {
   const cli = fake({ threads: [...THREADS, FAILED], store: { ...STORE, project: 'web' } })
   const { clock, strip } = await boot($, on, cli)
   await clock.settle()
+  const fits = async (ui: Awaited<ReturnType<typeof strip>>, width: number) => {
+    const row = [(await ui.find({ type: 'Text', text: /^◆ Nexus/ }))!.text, ...(await chips(ui)).map(([, text]) => text)]
+    expect(cells(row[0]!) + 2 + cells(row[1]!)).toBeLessThanOrEqual(width)
+    return row
+  }
   const ui = await strip(32)
-  expect(await ui.find({ type: 'Text', text: '◆ Nexus · web' })).toBeDefined()
-  expect(await chips(ui)).toEqual([[NOTICE_KEY, '✕ Broken …  failed']])
+  expect(await fits(ui, 32)).toEqual(['◆ Nexus', '✕ Broken setup  failed'])
+  cli.threads = [...THREADS, FAILED, REPLIED]
+  await clock.advance(10_000)
+  expect(await fits(ui, 32)).toEqual(['◆ Nexus', '✕ 2 threads need you'])
+  await ui.unmount()
+  expect(await fits(await strip(24), 24)).toEqual(['◆ Nexus', '✕ 2 need you'])
 })
 
 test('the list marks an unread reply and counts it; going back from its thread marks it seen before the list is read again', async ($, on) => {
