@@ -1,8 +1,8 @@
 /** A pylon's state as its node last reported it: `ActualState` in the Nexus repository's src/reconcile.ts. */
 export type NexusActual = 'spawning' | 'running' | 'pausing' | 'paused' | 'deleting' | 'absent' | 'failed' | 'unknown'
 
-/** What the control plane wants a pylon to be, from its thread's activity. */
-export type NexusDesired = 'running' | 'paused' | 'deleted'
+/** What the control plane wants a pylon to be, from its thread's activity: `reading` while the usage backfill reads an archived thread's pylon (CLI 0.33.0). */
+export type NexusDesired = 'running' | 'paused' | 'deleted' | 'reading'
 
 /** The fields of the CLI's `Thread` this mod reads. */
 export type NexusThread = {
@@ -24,7 +24,7 @@ export type NexusThread = {
 }
 
 /** What a thread asks of the person, the first that holds in this order: `attention` in docs/cli.md. */
-export type NexusAttention = 'failed' | 'decision' | 'parked' | 'reply' | 'working' | 'waiting' | null
+export type NexusAttention = 'failed' | 'decision' | 'parked' | 'limited' | 'reply' | 'working' | 'waiting' | null
 
 /** A `threads` row: the thread with its pylon's state and what the planner wants of the pylon. */
 export type NexusThreadRow = NexusThread & {

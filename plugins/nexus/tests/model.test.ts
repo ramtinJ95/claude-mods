@@ -28,6 +28,7 @@ import {
   parseSent,
   parseStarted,
   parseDetail,
+  rowState,
   parseFailure,
   parseHerdrTab,
   parseThreads,
@@ -204,6 +205,21 @@ describe('the console', () => {
     expect(detail.sessions).toEqual([{ id: 'nexus:1.2', state: 'running', herdrPane: 'nexus:1.2', harness: 'claude-code', harnessSessionId: '9c1e', status: 'working', title: null, message: null }])
     expect(() => parseDetail({ ...DETAIL, desired: undefined })).toThrow('nexus show printed no desired')
     expect(() => parseDetail({ ...DETAIL, attach: undefined })).toThrow('nexus show printed no attach')
+  })
+
+  test("what CLI 0.57.0 added reads: an archived thread's pylon being read for usage, a usage-limit stop, and a person's open questions beside the review's reasons", () => {
+    const [reading] = parseThreads([{ ...THREADS[0], status: 'archived', desired: 'reading', readingUsage: true }])
+    expect(reading!.desired).toBe('reading')
+    const [limited] = parseThreads([{ ...THREADS[0], agentTurnRunning: false, attention: 'limited' }])
+    expect(rowState(limited!)).toEqual(['usage limit', 'busy'])
+    const asked = (id: string, answer: unknown, answerer = 'person') => ({ id, thread: DETAIL.thread.id, text: `Rebuild the image ${id}?\nIt takes ten minutes.`, options: ['Rebuild', 'Not now'], answerer, askedAt: 1, answer })
+    const detail = parseDetail({
+      ...DETAIL,
+      attention: 'decision',
+      review: { phase: { kind: 'needs-person', reasons: ['the migration drops a column'] } },
+      questions: [asked('q1', null), asked('q2', { option: 'Rebuild', by: 'n1', at: 2 }), asked('q3', null, 'deployer')],
+    })
+    expect(detail.decisions).toEqual(['the migration drops a column', 'Rebuild the image q1? (answer it on the dashboard)'])
   })
 
   test('rows and details carry the attention and the seen marker of CLI 0.10.0; one without them throws, and an attention this mod does not know asks nothing', () => {

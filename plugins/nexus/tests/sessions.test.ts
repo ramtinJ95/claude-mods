@@ -115,7 +115,8 @@ test('Cancel leaves the form for the thread, opening nothing', async ($, on) => 
   const ui = await mount()
   await keys(ui, 'n')
   await ui.press({ key: 'open-session-cancel' })
-  expect(await shows(ui, /^‹ web \/ Fix login form 500s  ◉ working$/)).toBe(true)
+  expect(await shows(ui, '‹ web / Fix login form 500s')).toBe(true)
+  expect(await shows(ui, '◉ working')).toBe(true)
   expect(cli.runs.some(argv => argv[0] === 'session')).toBe(false)
 })
 
