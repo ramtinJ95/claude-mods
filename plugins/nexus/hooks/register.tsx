@@ -105,11 +105,11 @@ import {
   sentence,
   sessionName,
   settleSessions,
-  stripChips,
+  stripNotice,
   transcript,
 } from './model'
 import { COMPOSE, type Effect, FILTER, type MenuAction, fieldKey, fieldOf, press, putFields, ringMoved } from './keys'
-import { StripView } from './strip'
+import { NOTICE_KEY, StripView } from './strip'
 import { needsHuman, portFacts, projectArgs, TOOLS } from './tools'
 import { type Draw, ListView, PROJECT_KEYS, type PaneActions, ProjectView, SESSION_KEYS, START_KEYS, type Scene, SessionView, StartView, ThreadView, ringOf } from './view'
 
@@ -909,11 +909,12 @@ async function pollStrip($: EngineInterface) {
 }
 
 /**
- * A chip pressed: the pane opens on that thread. The band holds the keys during the press, so the open's focus is
- * refused (live test, 2.1.310) and the pane's mode line says how to hand it the keys.
+ * The notice pressed: the pane opens on its thread, or on the list when several threads need the person. The band
+ * holds the keys during the press, so the open's focus is refused (live test, 2.1.310) and the pane's mode line says
+ * how to hand it the keys.
  */
-async function openFromStrip($: EngineInterface, id: string) {
-  await showThread($, id)
+async function openFromStrip($: EngineInterface, id: string | null) {
+  await (id ? showThread($, id) : showList($))
   await openPane($)
 }
 
@@ -2506,17 +2507,16 @@ export const register: Register = (on, options) => {
 
   on('ui.render', { component: 'AbovePrompt' }, async ($, e, next) => {
     if (e.props.hasSurvey) return next(e)
-    const [strip, list, now, cursor, scope] = await Promise.all([
+    const [strip, list, cursor, scope] = await Promise.all([
       read($, stripAtom),
       read($, listAtom),
-      read($, nowAtom),
       read($, stripCursorAtom),
       read($, scopeAtom),
     ])
     if (!strip.isOn) return next(e)
-    const chips = stripChips(inScope(list.threads ?? [], scope), Math.max(now, list.polledAt ?? 0))
-    if (chips.length === 0 && !(list.failure && !list.threads)) return next(e)
-    return StripView($.ui.resolve(e), list, chips, e.props.bodyColumns, cursor, scope, id => void openFromStrip($, id))
+    const notice = stripNotice(inScope(list.threads ?? [], scope))
+    if (!notice && !(list.failure && !list.threads)) return next(e)
+    return StripView($.ui.resolve(e), list, notice, e.props.bodyColumns, cursor === NOTICE_KEY, scope, () => void openFromStrip($, notice?.count === 1 ? notice.top.id : null))
   })
 
   on('ui.focus', { component: 'AbovePrompt' }, async ($, e, next) => {

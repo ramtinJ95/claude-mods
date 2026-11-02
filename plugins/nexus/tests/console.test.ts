@@ -59,7 +59,8 @@ test('/nexus opens on the thread whose agent works; h goes back to the list with
   await nexus('')
   expect(cli.spawns).toContainEqual(['watch', ID, '--json'])
   const ui = await mount()
-  expect(await shows(ui, /^‹ web \/ Fix login form 500s  ◉ working$/)).toBe(true)
+  expect(await shows(ui, '‹ web / Fix login form 500s')).toBe(true)
+  expect(await shows(ui, '◉ working')).toBe(true)
   await keys(ui, 'h')
   expect(await cursorOn(ui)).toBe(ID)
   expect(await ui.find({ type: 'Markdown' })).toBeUndefined()
@@ -82,8 +83,8 @@ test('the list groups threads by project, folds the closed ones and opens the ro
   expect(cli.runs).toContainEqual(['nodes', '--json'])
   const ui = await mount()
   await keys(ui, 'h')
-  expect(await shows(ui, /◆ Nexus threads · All projects\s+1 working · 2 open/)).toBe(true)
-  expect(await shows(ui, '1/2 nodes online')).toBe(true)
+  expect(await shows(ui, '◆ Nexus · All projects')).toBe(true)
+  expect(await shows(ui, '1 working · 2 open · 1 node offline')).toBe(true)
   expect((await ui.find({ type: 'Button', key: ID }))?.text).toMatch(/^❯ ◉ Fix login form 500s\s+ working \s+now$/)
   // The row under the cursor opens a line of its facts.
   expect(await shows(ui, `    firebat · you 2 min · agent working · ${ID}`)).toBe(true)
@@ -105,7 +106,8 @@ test('the list groups threads by project, folds the closed ones and opens the ro
   await keys(ui, 'k')
   await keys(ui, 'k')
   await keys(ui, 'l')
-  expect(await shows(ui, /^‹ web \/ Fix login form 500s  ◉ working$/)).toBe(true)
+  expect(await shows(ui, '‹ web / Fix login form 500s')).toBe(true)
+  expect(await shows(ui, '◉ working')).toBe(true)
 })
 
 test('a pylon not yet where it is wanted says so under the cursor', async ($, on) => {
@@ -214,7 +216,8 @@ test('after the pane takes the keys back unasked, Enter on the row the ring land
   expect(await shows(ui, /^◆ Nexus\s/)).toBe(true)
   expect(await shows(ui, 'The pane took the keys back after losing them, so that Enter opened nothing. Enter again opens Fix login form 500s.')).toBe(true)
   await ui.press({ key: ID })
-  expect(await shows(ui, /^‹ web \/ Fix login form 500s  ◉ working$/)).toBe(true)
+  expect(await shows(ui, '‹ web / Fix login form 500s')).toBe(true)
+  expect(await shows(ui, '◉ working')).toBe(true)
   // A key the person presses first is theirs: Enter then opens at once.
   await keys(ui, 'hf')
   await ui.redraw({ title: 'Nexus', isFocused: false, bodyColumns: 100, placement: 'dock', scroll: { offset: 0, bodyRows: 60 }, view: {} } as never)
@@ -222,7 +225,8 @@ test('after the pane takes the keys back unasked, Enter on the row the ring land
   await ui.redraw({ title: 'Nexus', isFocused: true, bodyColumns: 100, placement: 'dock', scroll: { offset: 0, bodyRows: 60 }, view: {} } as never)
   await keys(ui, 'jk')
   await ui.press({ key: ID })
-  expect(await shows(ui, /^‹ web \/ Fix login form 500s  ◉ working$/)).toBe(true)
+  expect(await shows(ui, '‹ web / Fix login form 500s')).toBe(true)
+  expect(await shows(ui, '◉ working')).toBe(true)
 })
 
 test('a thread draws as a Claude Code transcript: prompts, ⏺ answers in Markdown, tool calls with ⎿ results, edits as diffs', async ($, on) => {
@@ -230,7 +234,8 @@ test('a thread draws as a Claude Code transcript: prompts, ⏺ answers in Markdo
   const { nexus, mount } = await boot($, on, cli)
   await nexus(`open ${ID}`)
   const ui = await mount()
-  expect(await shows(ui, /^‹ web \/ Fix login form 500s  ◉ working$/)).toBe(true)
+  expect(await shows(ui, '‹ web / Fix login form 500s')).toBe(true)
+  expect(await shows(ui, '◉ working')).toBe(true)
   expect(await shows(ui, /^1m 12s {2}· {2}firebat {2}· {2}claude-opus-5-5 {2}· {2}started 12 min ago$/)).toBe(true)
   expect((await ui.find({ type: 'Button', key: 'tab-conversation' }))?.props.autoFocus).toBe(true)
   expect(await shows(ui, /^❯ The login form answers 500/, 'Box')).toBe(true)
@@ -976,7 +981,8 @@ test('s shows the keys over the view, and q, s or h closes them', async ($, on) 
   expect(await ui.find({ type: 'Markdown' })).toBeDefined()
   await keys(ui, 'sh')
   expect(await ui.find({ type: 'Markdown' })).toBeDefined()
-  expect(await shows(ui, /^‹ web \/ Fix login form 500s  ◉ working$/)).toBe(true)
+  expect(await shows(ui, '‹ web / Fix login form 500s')).toBe(true)
+  expect(await shows(ui, '◉ working')).toBe(true)
 })
 
 test('the help shows over the list too, and scrolls when the pane is too short for it', async ($, on) => {

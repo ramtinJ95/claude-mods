@@ -1,60 +1,70 @@
 import { expect, test, type TestBody } from 'claude-code/testing'
 
+import { NOTICE_KEY } from '../hooks/strip'
 import { DETAIL, ENTRIES, ID, T0, THREAD, THREADS, boot, fake, state } from './fake-cli'
 
 const FAILED = { ...THREAD, id: 'th-f00000000004', title: 'Broken setup', agentTurnRunning: false, lastAgentActivityAt: T0 - 600_000, pylon: { node: 'firebat', actualState: 'failed', failed: 'git clone exited 128' }, attention: 'failed' }
 const REPLIED = { ...THREAD, id: 'th-e00000000005', title: 'Docs pass', agentTurnRunning: false, lastAgentActivityAt: T0 - 1_000, lastReplyAt: T0 - 1_000, seenAt: T0 - 60_000, pylon: { node: 'firebat', actualState: 'running', failed: null }, attention: 'reply' }
 const PARKED = { ...THREAD, id: 'th-a00000000007', title: 'Flaky deploy', agentTurnRunning: false, lastAgentActivityAt: T0 - 120_000, attention: 'parked' }
 const WAITING = { ...THREAD, id: 'th-b00000000008', title: 'Asks a question', agentTurnRunning: false, lastAgentActivityAt: T0 - 30_000, attention: 'waiting' }
+const LIMITED = { ...THREAD, id: 'th-c00000000009', title: 'Rate limiter', agentTurnRunning: false, lastAgentActivityAt: T0 - 600_000, attention: 'limited' }
 const DECIDING = { ...THREAD, id: 'th-d00000000006', title: 'Land the fix', agentTurnRunning: false, lastAgentActivityAt: T0 - 300_000, attention: 'decision' }
 const STORE = { themeNotice: true, strip: { isOn: true } }
 
 const chips = async (ui: Awaited<ReturnType<Awaited<ReturnType<typeof boot>>['strip']>>) => (await ui.findAll({ type: 'Button' })).map(one => [one.key, one.text.trim()])
 const threadPolls = (runs: string[][]) => runs.filter(argv => argv[0] === 'threads').length
 
-test("the strip shows a chip per thread whose attention asks for a look, in the control plane's order, and none for a quiet one", async ($, on) => {
-  const cli = fake({ threads: [...THREADS, WAITING, REPLIED, PARKED, DECIDING, FAILED], store: STORE })
+test('the strip folds every thread that needs the person into one notice, in the look of the most urgent, and leaves out the working ones', async ($, on) => {
+  const cli = fake({ threads: [...THREADS, WAITING, REPLIED, LIMITED, PARKED, DECIDING, FAILED], store: STORE })
   const { clock, strip } = await boot($, on, cli)
   await clock.settle()
   const ui = await strip(300)
-  expect(await chips(ui)).toEqual([
-    [FAILED.id, '✕ Broken setup  needs you'],
-    [DECIDING.id, '! Land the fix  needs you'],
-    [PARKED.id, '✕ Flaky deploy  needs you'],
-    [REPLIED.id, '● Docs pass  new reply'],
-    [ID, '◉ Fix login form 500s  working 2 min'],
-    [WAITING.id, '◇ Asks a question  waiting for you'],
-  ])
+  expect(await chips(ui)).toEqual([[NOTICE_KEY, '✕ 6 threads need you']])
   expect(await ui.find({ type: 'Text', text: '◆ Nexus' })).toBeDefined()
-  // The archived thread and the idle one with nothing new are not there, and the strip paints no band of its own.
+  // The strip paints no band of its own.
   expect((await ui.findAll({})).some(one => typeof one.props.backgroundColor === 'string')).toBe(false)
 })
 
-test('a narrow strip keeps the chips that fit and counts the rest', async ($, on) => {
-  const cli = fake({ threads: [...THREADS, FAILED, REPLIED], store: STORE })
+test('one thread that needs the person is named with what it asks, and a working one alone leaves the strip empty', async ($, on) => {
+  const cli = fake({ threads: [...THREADS, LIMITED], store: STORE })
+  on('ui.render', { component: 'AbovePrompt' }, ($, e) => $.ui.resolve(e).Text({ children: ['the prompt as it was'] } as never))
   const { clock, strip } = await boot($, on, cli)
   await clock.settle()
-  const ui = await strip(60)
-  expect((await chips(ui)).map(([key]) => key)).toEqual([FAILED.id])
-  expect(await ui.find({ type: 'Text', text: '+2' })).toBeDefined()
+  const ui = await strip(300)
+  expect(await chips(ui)).toEqual([[NOTICE_KEY, '◷ Rate limiter  usage limit']])
+  cli.threads = THREADS
+  await clock.advance(10_000)
+  expect(await chips(ui)).toEqual([])
+  expect(await ui.find({ type: 'Text', text: 'the prompt as it was' })).toBeDefined()
 })
 
-test('pressing a chip opens its thread in the pane, which marks the reply seen on the control plane, and it is no longer news', async ($, on) => {
+test('pressing a notice for several threads opens the pane on the list', async ($, on) => {
+  const cli = fake({ threads: [...THREADS, FAILED, REPLIED], store: STORE })
+  const { clock, strip, mount } = await boot($, on, cli)
+  await clock.settle()
+  await (await strip()).press({ key: NOTICE_KEY })
+  expect(cli.isOpen).toBe(true)
+  expect(cli.spawns.some(argv => argv[0] === 'watch')).toBe(false)
+  expect(await (await mount()).find({ type: 'Button', key: FAILED.id })).toBeDefined()
+})
+
+test('pressing the notice for one thread opens it in the pane, which marks the reply seen on the control plane, and it is no longer news', async ($, on) => {
   const cli = fake({ threads: [...THREADS, REPLIED], detail: { ...DETAIL, thread: REPLIED, attention: 'reply', seenAt: REPLIED.seenAt, lastReplyAt: REPLIED.lastReplyAt }, store: STORE })
   cli.watch = [{ type: 'reset', thread: ID, entries: ENTRIES.slice(0, -1) }, state('idle')]
+  on('ui.render', { component: 'AbovePrompt' }, ($, e) => $.ui.resolve(e).Text({ children: ['the prompt as it was'] } as never))
   const { clock, strip, mount } = await boot($, on, cli)
   await clock.settle()
   const ui = await strip()
-  await ui.press({ key: REPLIED.id })
+  await ui.press({ key: NOTICE_KEY })
   // The first poll reads the details before the watch has drawn the conversation; the next one marks.
   await clock.advance(5_000)
   expect(cli.isOpen).toBe(true)
   expect(cli.spawns).toContainEqual(['watch', REPLIED.id, '--json'])
-  expect(await (await mount()).find({ type: 'Text', text: REPLIED.id })).toBeDefined()
+  expect(await (await mount()).find({ type: 'Text', text: '‹ web / Docs pass' })).toBeDefined()
   expect(cli.runs.filter(argv => argv[0] === 'seen')).toEqual([['seen', '--json', REPLIED.id, `--last-reply-at=${REPLIED.lastReplyAt}`]])
   // The details read after the mark drop the reply from the strip before the strip's own poll.
   expect(threadPolls(cli.runs)).toBe(1)
-  expect((await chips(ui)).map(([key]) => key)).toEqual([ID])
+  expect(await chips(ui)).toEqual([])
   // Nothing is kept of it on this machine: the store holds only whether the strip shows.
   expect(cli.store.strip).toEqual({ isOn: true })
 })
@@ -128,14 +138,13 @@ test("a strip poll that ends after the pane's newer one writes nothing", async (
   expect(await ui.find({ type: 'Button', key: NEW.id })).toBeDefined()
 })
 
-test("a project's name in a narrow strip shortens the first chip's title rather than hide every chip", async ($, on) => {
-  const cli = fake({ threads: [...THREADS, FAILED, REPLIED], store: { ...STORE, project: 'web' } })
+test("a project's name in a narrow strip shortens the thread's title rather than its word", async ($, on) => {
+  const cli = fake({ threads: [...THREADS, FAILED], store: { ...STORE, project: 'web' } })
   const { clock, strip } = await boot($, on, cli)
   await clock.settle()
-  const ui = await strip(44)
+  const ui = await strip(32)
   expect(await ui.find({ type: 'Text', text: '◆ Nexus · web' })).toBeDefined()
-  expect(await chips(ui)).toEqual([[FAILED.id, '✕ Broken s…  needs you']])
-  expect(await ui.find({ type: 'Text', text: '+2' })).toBeDefined()
+  expect(await chips(ui)).toEqual([[NOTICE_KEY, '✕ Broken …  failed']])
 })
 
 test('the list marks an unread reply and counts it; going back from its thread marks it seen before the list is read again', async ($, on) => {
@@ -146,7 +155,7 @@ test('the list marks an unread reply and counts it; going back from its thread m
   await nexus('')
   const ui = await mount()
   expect((await ui.find({ type: 'Button', key: REPLIED.id }))?.text).toMatch(/Docs pass\s+ new reply/)
-  expect((await ui.find({ type: 'Text', text: /^◆ Nexus threads/ }))?.text).toMatch(/1 new · 0 working · 3 open/)
+  expect(await ui.find({ type: 'Text', text: '1 new · 3 open · 1 node offline' })).toBeDefined()
   // The details of the thread opened were marked seen by another client already: the pane marks nothing on opening it.
   cli.detail = { ...DETAIL, thread: { ...REPLIED, seenAt: REPLIED.lastReplyAt, attention: null }, attention: null, seenAt: REPLIED.lastReplyAt, lastReplyAt: REPLIED.lastReplyAt }
   await nexus('open e000')
@@ -171,7 +180,7 @@ test('a mark the control plane refuses says so in the pane, and the reply stays 
   await clock.advance(5_000)
   const ui = await mount()
   expect(await ui.find({ type: 'Text', text: `The reply in ${REPLIED.id} was not marked seen, so it still shows as new: connect ECONNREFUSED.` })).toBeDefined()
-  expect((await chips(await strip())).map(([key]) => key)).toContain(REPLIED.id)
+  expect(await chips(await strip())).toEqual([[NOTICE_KEY, '● Docs pass  new reply']])
   // The polls after it leave that reply alone rather than ask again every five seconds.
   await clock.advance(15_000)
   expect(cli.runs.filter(argv => argv[0] === 'seen')).toHaveLength(1)

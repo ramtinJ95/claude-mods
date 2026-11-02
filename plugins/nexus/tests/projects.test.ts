@@ -14,7 +14,7 @@ async function keys(ui: Ui, letters: string) {
 const shows = async (ui: Ui, text: string | RegExp) => (await ui.find({ text })) !== undefined
 /** The picker's rows as drawn: each Button's text, the cursor's mark included. */
 const picker = async (ui: Ui) => (await ui.findAll({ type: 'Button' })).flatMap(one => (one.key?.startsWith('scope-') ? [one.text.trim()] : []))
-const title = async (ui: Ui) => (await ui.find({ type: 'Text', text: /^◆ Nexus threads/ }))?.text
+const title = async (ui: Ui) => (await ui.find({ type: 'Text', text: /^◆ Nexus/ }))?.text
 
 test('p opens the project picker: every project, each with its repo, and a new one, the one shown marked current', async ($, on) => {
   const cli = fake()
@@ -34,7 +34,7 @@ test('p opens the project picker: every project, each with its repo, and a new o
   // q puts the picker away and changes nothing.
   await keys(ui, 'q')
   expect(await picker(ui)).toEqual([])
-  expect(await title(ui)).toMatch(/^◆ Nexus threads · All projects/)
+  expect(await title(ui)).toMatch(/^◆ Nexus · All projects/)
 })
 
 test('a project chosen scopes the list, its counts, the strip and the working thread /nexus opens, and is kept', async ($, on) => {
@@ -45,7 +45,8 @@ test('a project chosen scopes the list, its counts, the strip and the working th
   await keys(ui, 'h')
   await keys(ui, 'pjjo')
   expect(cli.store.project).toBe('api')
-  expect(await title(ui)).toMatch(/^◆ Nexus threads · api\s+0 working · 1 open/)
+  expect(await title(ui)).toBe('◆ Nexus · api')
+  expect(await ui.find({ type: 'Text', text: '1 open · 1 node offline' })).toBeDefined()
   expect(await ui.find({ type: 'Button', key: API })).toBeDefined()
   expect(await ui.find({ type: 'Button', key: ID })).toBeUndefined()
   await keys(ui, 'p')
@@ -57,28 +58,29 @@ test('a project chosen scopes the list, its counts, the strip and the working th
   await ui.unmount()
   await nexus('')
   const again = await mount()
-  expect(await title(again)).toMatch(/^◆ Nexus threads · api/)
+  expect(await title(again)).toMatch(/^◆ Nexus · api/)
   await keys(again, 'pkko')
   await keys(again, 'p')
   await keys(again, 'jo')
   expect(cli.store.project).toBe('web')
-  const band = await strip()
-  expect(await band.find({ type: 'Button', key: ID })).toBeDefined()
-  expect(await band.find({ type: 'Text', text: '◆ Nexus · web' })).toBeDefined()
+  // web's only open thread is working, which asks nothing of the person: the strip draws nothing.
+  await expect(strip()).rejects.toThrow('no implementation for ui.render')
   await nexus('close')
   await again.unmount()
   await nexus('')
   const third = await mount()
-  expect(await shows(third, /^‹ web \/ Fix login form 500s  ◉ working$/)).toBe(true)
+  expect(await shows(third, '‹ web / Fix login form 500s')).toBe(true)
+  expect(await shows(third, '◉ working')).toBe(true)
 })
 
 test("the strip shows only the project's threads, and names it", async ($, on) => {
-  const working = { ...THREADS[2]!, agentTurnRunning: true, attention: 'working' }
-  const cli = fake({ threads: [THREADS[0], THREADS[1], working], store: { themeNotice: true, project: 'api' } })
+  const replied = { ...THREADS[2]!, attention: 'reply' }
+  const elsewhere = { ...THREADS[0]!, attention: 'failed' }
+  const cli = fake({ threads: [elsewhere, THREADS[1], replied], store: { themeNotice: true, project: 'api' } })
   const { clock, strip } = await boot($, on, cli)
   await clock.settle()
   const band = await strip()
-  expect((await band.findAll({ type: 'Button' })).map(one => one.key)).toEqual([API])
+  expect((await band.findAll({ type: 'Button' })).map(one => one.text.trim())).toEqual(['● API docs  new reply'])
   expect(await band.find({ type: 'Text', text: '◆ Nexus · api' })).toBeDefined()
 })
 
@@ -87,7 +89,7 @@ test('a project remembered from an earlier session scopes the list and the start
   const { nexus, mount } = await boot($, on, cli)
   await nexus('')
   const ui = await mount()
-  expect(await title(ui)).toMatch(/^◆ Nexus threads · api/)
+  expect(await title(ui)).toMatch(/^◆ Nexus · api/)
   await keys(ui, 'n')
   expect((await ui.find({ type: 'Select', key: 'start-project' }))?.props.value).toBe('api')
   expect(cli.toasts).toEqual([])
@@ -102,7 +104,7 @@ test('a remembered project that no longer exists goes back to every project, say
   await nexus('')
   const ui = await mount()
   await keys(ui, 'h')
-  expect(await title(ui)).toMatch(/^◆ Nexus threads · All projects/)
+  expect(await title(ui)).toMatch(/^◆ Nexus · All projects/)
   await keys(ui, 'pq')
   await keys(ui, 'n')
   expect((await ui.find({ type: 'Select', key: 'start-project' }))?.props.value).toBe('web')
@@ -138,7 +140,7 @@ test('the picker opens on the project shown: Enter keeps it, and a move starts f
   await ui.press({ key: 'scope-project-api' })
   expect(cli.store.project).toBe('api')
   expect(await picker(ui)).toEqual([])
-  expect(await title(ui)).toMatch(/^◆ Nexus threads · api/)
+  expect(await title(ui)).toMatch(/^◆ Nexus · api/)
 })
 
 test('a narrow pane cuts the repo before the current mark, and the title before the nodes', async ($, on) => {
@@ -146,7 +148,7 @@ test('a narrow pane cuts the repo before the current mark, and the title before 
   const { nexus, mount } = await boot($, on, cli)
   await nexus('')
   const ui = await mount(40)
-  expect((await ui.find({ type: 'Text', text: /nodes online$/ }))?.text).toBe('1/2 nodes online')
+  expect(await ui.find({ type: 'Text', text: '1 open · 1 node offline' })).toBeDefined()
   await keys(ui, 'p')
   expect((await picker(ui))[2]).toBe('❯ api             git@github.c…  current')
   // At 24 columns the IDs take half the row, the repo goes before the mark, and every row fits.
@@ -168,7 +170,7 @@ test('p in a thread picks a project and opens its list', async ($, on) => {
   await keys(ui, 'p')
   expect(await picker(ui)).toContain('❯ All projects    current')
   await keys(ui, 'jo')
-  expect(await title(ui)).toMatch(/^◆ Nexus threads · web/)
+  expect(await title(ui)).toMatch(/^◆ Nexus · web/)
   expect(await ui.find({ type: 'Markdown' })).toBeUndefined()
   expect(await ui.find({ type: 'Button', key: ID })).toBeDefined()
 })
@@ -194,7 +196,7 @@ test('New project… adds the project from the form, on the first online node an
   await ui.input({ key: await field(ui, 'project-branch'), text: '' })
   expect(cli.runs).toContainEqual(['project', 'add', '--json', '--node=firebat', '--branch=main', '--', 'docs', DOCS])
   expect(cli.store.project).toBe('docs')
-  expect(await title(ui)).toMatch(/^◆ Nexus threads · docs/)
+  expect(await title(ui)).toMatch(/^◆ Nexus · docs/)
   expect(await shows(ui, `Added the project docs (${DOCS}) on firebat. Nexus shows its threads.`)).toBe(true)
   expect(await shows(ui, 'No threads in docs yet. n starts one, p shows another project.')).toBe(true)
   await keys(ui, 'p')
@@ -212,7 +214,7 @@ test('an ID or URL that starts with dashes reaches the CLI as given, not as one 
   await fields.type('project-url', '--branch=trunk')
   await ui.press({ key: 'project-submit' })
   expect(cli.projects.at(-1)).toMatchObject({ id: 'odd', repoUrl: '--branch=trunk', defaultBranch: 'main' })
-  expect(await title(ui)).toMatch(/^◆ Nexus threads · odd/)
+  expect(await title(ui)).toMatch(/^◆ Nexus · odd/)
 })
 
 test("a refused add shows the CLI's message as printed and keeps the form filled; Cancel goes back to the picker", async ($, on) => {
@@ -256,7 +258,7 @@ test("a refused add shows the CLI's message as printed and keeps the form filled
 
   await ui.press({ key: 'project-cancel' })
   expect(await picker(ui)).toContain('❯ + New project…')
-  expect(await title(ui)).toMatch(/^◆ Nexus threads · All projects/)
+  expect(await title(ui)).toMatch(/^◆ Nexus · All projects/)
 })
 
 test('/nexus project says which project is shown, switches it, refuses an unknown one, and adds one', async ($, on) => {
@@ -318,7 +320,7 @@ test('an add that ends after another project was chosen leaves that choice and s
   await clock.advance(5_000)
   expect(cli.runs).toContainEqual(['project', 'add', '--json', '--node=firebat', '--branch=main', '--', 'docs', DOCS])
   expect(cli.store.project).toBe('api')
-  expect(await title(ui)).toMatch(/^◆ Nexus threads · api/)
+  expect(await title(ui)).toMatch(/^◆ Nexus · api/)
   expect(await shows(ui, 'Added the project docs. Nexus still shows the project api, chosen while it was added.')).toBe(true)
 })
 
@@ -337,7 +339,7 @@ test('an add that ends after the person chose another project and then the first
   await nexus('project all')
   await clock.advance(5_000)
   expect(cli.store.project).toBe(null)
-  expect(await title(ui)).toMatch(/^◆ Nexus threads · All projects/)
+  expect(await title(ui)).toMatch(/^◆ Nexus · All projects/)
   expect(await shows(ui, 'Added the project docs. Nexus still shows every project, chosen while it was added.')).toBe(true)
 })
 
@@ -359,7 +361,7 @@ test('a project chosen while an add saves its own leaves the store on the choice
   await fields.type('project-url', DOCS)
   await ui.press({ key: 'project-submit' })
   await choosing
-  expect(await title(ui)).toMatch(/^◆ Nexus threads · api/)
+  expect(await title(ui)).toMatch(/^◆ Nexus · api/)
   expect(cli.store.project).toBe('api')
 })
 

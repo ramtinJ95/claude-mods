@@ -31,7 +31,8 @@ test("a Claude Code worker's conversation is its transcript, read with each poll
   // The queued message shows under the turn, and the run line counts the turn's tools, with no abort, which the harness's is.
   expect(await shows(ui, /^❯ also update the docs\.?queued, Claude reads it at its next tool step or after this turn$/, 'Box')).toBe(true)
   expect((await ui.find({ type: 'Text', text: /Working…/ }))?.text).toMatch(/^. Working… \(1m 30s · 2 tools this turn · new messages queue\)$/)
-  expect(await shows(ui, /^‹ web \/ Add a health check  ◉ working$/)).toBe(true)
+  expect(await shows(ui, '‹ web / Add a health check')).toBe(true)
+  expect(await shows(ui, '◉ working')).toBe(true)
   cli.conversation = { ...CONVERSATION, entries: [...CONVERSATION.entries, { kind: 'reply', at: T0, text: 'Done: `/healthz` answers 200.' }], working: false }
   await clock.advance(5_000)
   expect(conversations(cli.spawns)).toHaveLength(2)
@@ -47,12 +48,14 @@ test('a message to a worker is typed into its session, and the pane says whether
   expect(await shows(ui, `Queued in the Claude Code session of ${WORKER.id}: Claude reads it at its next tool step, or after this turn.`)).toBe(true)
 })
 
-test("a worker's Actions menu offers no harness abort or retry, and Pylon shows its launch with a stalled one's diagnostic", async ($, on) => {
+test("a worker's Actions menu interrupts Claude's turn but offers no harness retry, and Pylon shows its launch with a stalled one's diagnostic", async ($, on) => {
   const stalled = { ...WORKER_DETAIL, claudeWorker: { model: 'claude-opus-5-5', state: 'stalled', message: Array.from({ length: 20 }, (_, index) => `pane line ${index + 1}`).join('\n') } }
   const { ui } = await opened($, on, { detail: stalled })
   await keys(ui, 'm')
   const menu = (await ui.findAll({ type: 'Button' })).flatMap(one => (one.key?.startsWith('menu-') ? [one.key] : []))
-  expect(menu).not.toContain('menu-abort')
+  expect(menu).toContain('menu-abort')
+  expect(menu).not.toContain('menu-retry')
+  expect((await ui.find({ type: 'Button', key: 'menu-abort' }))?.text).toMatch(/Interrupt Claude's turn/)
   expect(menu).toContain('menu-archive')
   await keys(ui, 'q')
   await ui.press({ key: 'tab-pylon' })

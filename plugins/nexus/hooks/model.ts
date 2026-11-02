@@ -58,7 +58,7 @@ const list = (value: unknown) => (Array.isArray(value) ? value : [])
 
 const ACTUAL = new Set<string>(['spawning', 'running', 'pausing', 'paused', 'deleting', 'absent', 'failed', 'unknown'])
 const actual = (value: unknown): NexusActual => (typeof value === 'string' && ACTUAL.has(value) ? (value as NexusActual) : 'unknown')
-const desired = (value: unknown): NexusDesired | undefined => (value === 'running' || value === 'paused' || value === 'deleted' ? value : undefined)
+const desired = (value: unknown): NexusDesired | undefined => (value === 'running' || value === 'paused' || value === 'deleted' || value === 'reading' ? value : undefined)
 
 /** A field docs/cli.md requires is missing: the CLI and this mod disagree on the contract. */
 const contractError = (command: string, what: string) => new Error(`nexus ${command} printed ${what}, which docs/cli.md requires: the CLI and this mod disagree on the contract`)
@@ -87,7 +87,7 @@ function parseThread(raw: unknown, command: string): NexusThread | undefined {
   }
 }
 
-const ATTENTION = new Set<string>(['failed', 'decision', 'parked', 'reply', 'working', 'waiting'])
+const ATTENTION = new Set<string>(['failed', 'decision', 'parked', 'limited', 'reply', 'working', 'waiting'])
 
 /** A row's or a detail's `attention`, required since CLI 0.10.0. A value this mod does not know asks nothing of it. */
 function parseAttention(raw: Raw, command: string, id: string): NexusAttention {
@@ -97,6 +97,16 @@ function parseAttention(raw: Raw, command: string, id: string): NexusAttention {
 
 /** Whether the thread's latest reply came after the seen marker, as docs/cli.md counts an unread reply. */
 export const isUnread = (thread: Pick<NexusThread, 'lastReplyAt' | 'seenAt'>) => thread.lastReplyAt !== null && (thread.seenAt === null || thread.lastReplyAt > thread.seenAt)
+
+/** Why a review that ended for the person's decision asks for them: `review.phase.reasons`. */
+const reviewReasons = (review: unknown) =>
+  isRecord(review) && isRecord(review.phase) && review.phase.kind === 'needs-person' ? list(review.phase.reasons).filter((reason): reason is string => typeof reason === 'string') : []
+
+/** A person's open questions (CLI 0.35.0), by their first line. The CLI cannot answer them, so each says where to. */
+const openQuestions = (questions: unknown) =>
+  list(questions).flatMap(question =>
+    isRecord(question) && question.answer === null && question.answerer === 'person' && typeof question.text === 'string' ? [`${question.text.split('\n')[0]} (answer it on the dashboard)`] : [],
+  )
 
 /** `threads --json`, kept to the fields the mod reads. A row without its pylon, `desired` or attention fails the whole list. */
 export function parseThreads(json: unknown): NexusThreadRow[] {
@@ -190,7 +200,7 @@ export function parseDetail(json: unknown): NexusDetail {
     agent: isRecord(json.agent) ? { parkedTasks: num(json.agent.parkedTasks) } : null,
     conversation: isRecord(json.claudeWorker) ? 'claude' : isRecord(json.thread) && typeof json.thread.conversationId === 'string' ? 'agent' : null,
     worker: isRecord(json.claudeWorker) ? { state: str(json.claudeWorker.state), model: strOrNull(json.claudeWorker.model), message: strOrNull(json.claudeWorker.message) } : null,
-    decisions: isRecord(json.review) && isRecord(json.review.phase) && json.review.phase.kind === 'needs-person' ? list(json.review.phase.reasons).filter((reason): reason is string => typeof reason === 'string') : [],
+    decisions: [...reviewReasons(json.review), ...openQuestions(json.questions)],
     desired: wants,
     attach: json.attach,
   }
@@ -793,7 +803,7 @@ export const ACTUAL_BADGE: Record<NexusActual, [label: string, tone: Tone]> = {
   failed: ['failed', 'bad'],
   unknown: ['unknown', 'muted'],
 }
-export const DESIRED_TONE: Record<NexusDesired, Tone> = { running: 'ok', paused: 'idle', deleted: 'muted' }
+export const DESIRED_TONE: Record<NexusDesired, Tone> = { running: 'ok', paused: 'idle', deleted: 'muted', reading: 'busy' }
 
 /** What a thread is doing, most urgent first: the agent mid-turn hides a running pylon, never a failed one. */
 export function threadState(thread: Pick<NexusThread, 'status' | 'agentTurnRunning'>, pylon: NexusActual): [label: string, tone: Tone] {
@@ -807,6 +817,7 @@ const ATTENTION_LOOK: Partial<Record<Exclude<NexusAttention, null>, [label: stri
   failed: ['failed', 'bad'],
   decision: ['needs you', 'busy'],
   parked: ['parked', 'bad'],
+  limited: ['usage limit', 'busy'],
   reply: ['new reply', 'ok'],
   waiting: ['waiting', 'busy'],
 }
@@ -1505,25 +1516,29 @@ function addProject(args: readonly string[], invalid: (reason: string) => NexusC
   return { verb: 'add-project', id, repoUrl, node: flags.node, ...(flags.branch ? { branch: flags.branch } : {}) }
 }
 
-/** A thread the strip shows, by what it asks of the person. */
-export type Chip = { thread: NexusThreadRow; kind: Exclude<NexusAttention, null>; note: string }
+/** What an open thread's attention asks of the person: every attention but working, which asks nothing. */
+export type Need = Exclude<NexusAttention, null | 'working'>
 
-/** docs/cli.md's order of attention, most urgent first, which the strip keeps. */
-const ATTENTION_RANK: Record<Chip['kind'], number> = { failed: 0, decision: 1, parked: 2, reply: 3, working: 4, waiting: 5 }
+/** The strip's one line: the most urgent thread that needs the person, its word, and how many threads do. */
+export type StripNotice = { top: NexusThreadRow; need: Need; word: string; count: number }
+
+/** docs/cli.md's order of attention, most urgent first. */
+const NEED_RANK: Record<Need, number> = { failed: 0, decision: 1, parked: 2, limited: 3, reply: 4, waiting: 5 }
+
+const NEED_WORD: Record<Need, string> = { failed: 'failed', decision: 'needs you', parked: 'parked', limited: 'usage limit', reply: 'new reply', waiting: 'waiting for you' }
 
 /**
- * The open threads whose attention the control plane says asks for the person or is busy, in its order: a failed pylon
- * or Claude worker launch, a review that ended for the person's decision and parked tasks, a reply no client marked
- * seen, the agents at work with how long since the person's message started them, and a session waiting for input. The
- * rest stay out of the strip.
+ * The open threads whose attention asks for the person, folded into one notice: the most urgent, newest first among
+ * equals, and their count. Null when none does, so a thread that is only working leaves the strip empty.
  */
-export function stripChips(threads: readonly NexusThreadRow[], now: number): Chip[] {
-  const note = (thread: NexusThreadRow, kind: Chip['kind']) =>
-    kind === 'reply' ? 'new reply' : kind === 'working' ? `working ${span(now - thread.lastHumanActivityAt) ?? 'now'}` : kind === 'waiting' ? 'waiting for you' : 'needs you'
-  const chips = threads.flatMap((thread): Chip[] =>
-    thread.attention && (thread.status === 'active' || thread.status === 'idle') ? [{ thread, kind: thread.attention, note: note(thread, thread.attention) }] : [],
+export function stripNotice(threads: readonly NexusThreadRow[]): StripNotice | null {
+  const needing = threads.flatMap((thread): { thread: NexusThreadRow; need: Need }[] =>
+    thread.attention && thread.attention !== 'working' && (thread.status === 'active' || thread.status === 'idle') ? [{ thread, need: thread.attention }] : [],
   )
-  return chips.sort((a, b) => ATTENTION_RANK[a.kind] - ATTENTION_RANK[b.kind] || b.thread.lastActivityAt - a.thread.lastActivityAt)
+  if (needing.length === 0) return null
+  needing.sort((a, b) => NEED_RANK[a.need] - NEED_RANK[b.need] || b.thread.lastActivityAt - a.thread.lastActivityAt)
+  const { thread, need } = needing[0]!
+  return { top: thread, need, word: NEED_WORD[need], count: needing.length }
 }
 
 /**

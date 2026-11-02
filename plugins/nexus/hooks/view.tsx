@@ -225,7 +225,7 @@ function Pill({ Text }: Draw, label: string, tone: Tone) {
  * The pane's title bar: a band across the dock with where the person is and what is going on. In a narrow pane the
  * side that `yields` is cut, on one row: the left's detail by default, a form's hint on the right.
  */
-function TitleBar(draw: Draw, scene: Scene, left: RenderChildren, right: string, yields: 'left' | 'right' = 'left') {
+function TitleBar(draw: Draw, scene: Scene, left: RenderChildren, right: RenderChildren, yields: 'left' | 'right' = 'left') {
   const { Box, Text } = draw
   return (
     <Box key="title" flexDirection="row" width={scene.width} backgroundColor={BAR} paddingX={1} justifyContent="space-between">
@@ -270,6 +270,21 @@ function KeyMap({ Box, Button }: Draw, actions: PaneActions, nav: Nav) {
   )
 }
 
+/** The hints that fit `room` whole, in order, then always the last one, the key help, so none is cut mid-word. */
+function fitHints(hints: readonly (readonly [string, string])[], room: number) {
+  const width = ([key, what]: readonly [string, string]) => cells(key) + cells(what) + 3
+  const last = hints.at(-1)
+  if (!last) return []
+  const shown: (readonly [string, string])[] = []
+  let left = room - width(last)
+  for (const hint of hints.slice(0, -1)) {
+    left -= width(hint)
+    if (left < 0) break
+    shown.push(hint)
+  }
+  return [...shown, last]
+}
+
 const MODE_LOOK = { normal: ['NORMAL', 'idle'], insert: ['INSERT', 'ok'], filter: ['FILTER', 'busy'] } as const satisfies Record<NexusPane['mode'], [string, Tone]>
 
 /**
@@ -291,12 +306,13 @@ function ModeLine(draw: Draw, scene: Scene, hints: readonly (readonly [string, s
     )
   }
   const [label, tone] = MODE_LOOK[mode]
+  const pending = scene.pane.pending ? ` ${scene.pane.pending}…` : ''
   return (
     <Box key="mode" marginTop={1}>
       <Text wrap="truncate-end">
         {Pill(draw, label, tone)}
-        {scene.pane.pending ? <Text color="suggestion">{` ${scene.pane.pending}…`}</Text> : ''}
-        {hints.map(([key, what]) => (
+        {pending ? <Text color="suggestion">{pending}</Text> : ''}
+        {fitHints(hints, scene.width - cells(label) - 2 - cells(pending)).map(([key, what]) => (
           <Text key={`hint-${key}`}>
             <Text color="suggestion">{`  ${key}`}</Text>
             <Text color="subtle">{` ${what}`}</Text>
@@ -483,24 +499,28 @@ function TitleOfList(draw: Draw, scene: Scene) {
   const open = threads.filter(thread => thread.status === 'active' || thread.status === 'idle').length
   const working = threads.filter(thread => thread.agentTurnRunning).length
   const unread = threads.filter(thread => thread.attention === 'reply' && (thread.status === 'active' || thread.status === 'idle')).length
-  const online = catalog.nodes?.filter(node => node.state === 'online').length
+  const offline = catalog.nodes?.filter(node => node.state !== 'online').length ?? 0
   return TitleBar(
     draw,
     scene,
     <Text>
       <Text bold color="claude">
-        ◆ Nexus threads
+        ◆ Nexus
       </Text>
       <Text color="subtle">{` · ${scopeLabel(scene.scope)}`}</Text>
-      {list.threads ? (
-        <Text color="subtle">{`   ${unread > 0 ? `${unread} new · ` : ''}${working} working · ${open} open`}</Text>
-      ) : list.failure ? (
-        <Text color="error">{list.failure.kind === 'unreachable' ? '   unreachable' : '   not loaded'}</Text>
-      ) : (
-        <Text color="subtle">{'   connecting…'}</Text>
-      )}
     </Text>,
-    online === undefined ? '' : `${online}/${catalog.nodes!.length} nodes online`,
+    list.threads ? (
+      <Text>
+        {unread > 0 && <Text color={LOOK.ok}>{`${unread} new · `}</Text>}
+        {working > 0 && <Text color={LOOK.work}>{`${working} working · `}</Text>}
+        {`${open} open`}
+        {offline > 0 && <Text color="warning">{` · ${offline} ${offline === 1 ? 'node' : 'nodes'} offline`}</Text>}
+      </Text>
+    ) : list.failure ? (
+      <Text color="error">{list.failure.kind === 'unreachable' ? 'unreachable' : 'not loaded'}</Text>
+    ) : (
+      'connecting…'
+    ),
   )
 }
 
@@ -607,7 +627,7 @@ export function ListView(draw: Draw, scene: Scene, actions: PaneActions) {
       ? [['j/k', 'scroll'], ['q', 'close the help']]
       : isPicking
         ? PICKER_HINTS
-        : [['j/k', 'move'], ['l', 'open'], ['f', 'filter'], ['n', 'new'], ['p', 'projects'], ['s', 'keys'], ['q', 'close']]
+        : [['j/k', 'move'], ['l', 'open'], ['n', 'new'], ['f', 'filter'], ['p', 'projects'], ['q', 'close'], ['s', 'keys']]
   const footer = [Notice(draw, pane), ModeLine(draw, scene, hints)]
   const area = Math.max(3, scene.rows - rowsOf(header, scene.width) - rowsOf(footer, scene.width))
   const top = keepInView(Math.min(pane.listTop, Math.max(0, y - area)), items.find(item => item.key === cursor), area)
@@ -704,11 +724,11 @@ function Header(draw: Draw, scene: Scene, actions: PaneActions, counts: Counts, 
           <Text color="subtle">{'‹ '}</Text>
           {thread && <Text color="subtle">{`${thread.project} / `}</Text>}
           <Text bold>{thread?.title ?? id}</Text>
-          {'  '}
+        </Text>,
+        <Text>
           {Dot(draw, tone)}
           <Text color={LOOK[tone]}>{` ${word}`}</Text>
         </Text>,
-        id,
       )}
       <Text color="subtle" wrap="truncate-end">
         {[clockText, node, watch?.model, thread ? `started ${since(thread.createdAt, scene.now)}` : null].filter(Boolean).join('  ·  ')}
@@ -718,8 +738,6 @@ function Header(draw: Draw, scene: Scene, actions: PaneActions, counts: Counts, 
         {tab('changes')}
         {tab('previews')}
         {tab('pylon')}
-        <Box flexGrow={1} />
-        <Text color={scene.pane.overlay?.kind === 'menu' ? 'claude' : 'subtle'}>m actions</Text>
       </Box>
       {Rule(draw, scene)}
       {watch?.outage && <Text color="error">{`${watch.outage} The watch keeps trying.`}</Text>}
@@ -748,10 +766,10 @@ function menuOf(scene: Scene): { action: MenuAction; label: string }[] {
   const status = state?.status ?? thread?.status
   const failed = detail?.pylon.failed ?? state?.failed ?? null
   const refused = detail?.pylon.retryRefused ?? null
-  // The harness's abort and retry do not reach a Claude Code worker: its run is the session's.
+  // Abort presses Esc in a Claude Code worker's pane (CLI 0.49.0); the harness's retry does not reach it.
   const isHarness = detail?.conversation !== 'claude'
   return [
-    ...(isHarness && state?.run === 'working' ? [{ action: 'abort' as const, label: 'Abort the run' }] : []),
+    ...(state?.run === 'working' ? [{ action: 'abort' as const, label: isHarness ? 'Abort the run' : "Interrupt Claude's turn" }] : []),
     ...(isHarness && state?.run === 'parked' && status !== 'archived' ? [{ action: 'retry' as const, label: 'Retry the parked tasks' }] : []),
     ...(failed && !refused ? [{ action: 'retry-pylon' as const, label: 'Retry the pylon' }] : []),
     ...(failed ? [{ action: 'start-again' as const, label: 'Start again from its project and title' }] : []),
