@@ -21,6 +21,10 @@ export type NexusThread = {
   /** When the latest agent turn ended, a reply's identity, and when a person last marked the replies seen from any client: Unix milliseconds, null for never. */
   lastReplyAt: number | null
   seenAt: number | null
+  /** A session in the pylon waits at a dialog, such as a permission prompt: `sessionWaiting`, whatever the attention. */
+  sessionWaiting: boolean
+  /** The review loop started it: a reviewer, check thread or verify pylon, by its `startedBy`. */
+  isLoop: boolean
 }
 
 /** What a thread asks of the person, the first that holds in this order: `attention` in docs/cli.md. */

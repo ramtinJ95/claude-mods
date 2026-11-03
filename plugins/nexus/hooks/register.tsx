@@ -884,7 +884,7 @@ async function patchRow($: EngineInterface, detail: NexusDetail) {
   const { thread, attention } = detail
   await update($, listAtom, (list): NexusList =>
     list.threads?.some(one => one.id === thread.id)
-      ? { ...list, threads: list.threads.map(one => (one.id === thread.id ? { ...one, attention, seenAt: thread.seenAt, lastReplyAt: thread.lastReplyAt } : one)) }
+      ? { ...list, threads: list.threads.map(one => (one.id === thread.id ? { ...one, attention, seenAt: thread.seenAt, lastReplyAt: thread.lastReplyAt, sessionWaiting: thread.sessionWaiting } : one)) }
       : list,
   )
 }
