@@ -58,6 +58,7 @@ const thread = (over: Partial<NexusThread>): NexusThread => ({
   seenAt: null,
   sessionWaiting: false,
   isLoop: false,
+  disk: null,
   ...over,
 })
 
@@ -213,7 +214,7 @@ describe('the console', () => {
     const [reading] = parseThreads([{ ...THREADS[0], status: 'archived', desired: 'reading', readingUsage: true }])
     expect(reading!.desired).toBe('reading')
     const [limited] = parseThreads([{ ...THREADS[0], agentTurnRunning: false, attention: 'limited' }])
-    expect(rowState(limited!)).toEqual(['usage limit', 'busy'])
+    expect(rowState(limited!, T0)).toEqual(['usage limit', 'busy'])
     const asked = (id: string, answer: unknown, answerer = 'person') => ({ id, thread: DETAIL.thread.id, text: `Rebuild the image ${id}?\nIt takes ten minutes.`, options: ['Rebuild', 'Not now'], answerer, askedAt: 1, answer })
     const detail = parseDetail({
       ...DETAIL,
@@ -222,6 +223,27 @@ describe('the console', () => {
       questions: [asked('q1', null), asked('q2', { option: 'Rebuild', by: 'n1', at: 2 }), asked('q3', null, 'deployer')],
     })
     expect(detail.decisions).toEqual(['the migration drops a column', 'Rebuild the image q1? (answer it on the dashboard)'])
+  })
+
+  test("CLI 0.60.0: an archived disk waits on the person as Nexus's settleStuck decides, a guest not answering is read, and an approval held for the person names its Land", () => {
+    const DAY = 24 * 60 * 60_000
+    const archived = { ...THREADS[0], status: 'archived', archivedAt: T0 }
+    const disk = (over: Record<string, unknown>) => parseThreads([{ ...archived, ...over }])[0]!
+    expect(disk({}).disk).toEqual({ waitsFrom: T0 + 2 * DAY, failure: null })
+    const failing = disk({ settleFailure: { reason: 'its pylon did not boot', at: T0, count: 3 } })
+    expect(failing.disk).toEqual({ waitsFrom: T0 + DAY, failure: 'its pylon did not boot' })
+    expect(disk({ settleFailure: { reason: 'x', at: T0, count: 2 } }).disk?.waitsFrom).toBe(T0 + 2 * DAY)
+    expect(disk({ usageSettledAt: T0 + 1 }).disk).toBeNull()
+    expect(disk({ usageUnread: 'its pylon failed' }).disk).toBeNull()
+    expect(disk({ status: 'idle' }).disk).toBeNull()
+    expect(rowState(failing, T0 + DAY - 1)).not.toEqual(['disk kept', 'busy'])
+    expect(rowState(failing, T0 + DAY)).toEqual(['disk kept', 'busy'])
+    const mute = parseDetail({ ...DETAIL, pylon: { ...DETAIL.pylon, notAnswering: { since: new Date(T0 - 180_000).toISOString(), timeouts: 5 } } })
+    expect(mute.pylon.notAnswering).toEqual({ since: T0 - 180_000, timeouts: 5 })
+    expect(parseDetail(DETAIL).pylon.notAnswering).toBeNull()
+    const approved = parseDetail({ ...DETAIL, attention: 'decision', review: { pr: { number: 41 }, land: null, phase: { kind: 'approved' } } })
+    expect(approved.decisions).toEqual([`PR #41 is approved, and lands once you press Land on the dashboard or run nexus land ${DETAIL.thread.id}`])
+    expect(parseDetail({ ...DETAIL, review: { pr: { number: 41 }, land: { at: T0 }, phase: { kind: 'approved' } } }).decisions).toEqual([])
   })
 
   test('rows and details carry the attention and the seen marker of CLI 0.10.0; one without them throws, and an attention this mod does not know asks nothing', () => {

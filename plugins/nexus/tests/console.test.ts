@@ -3,7 +3,7 @@ import { expect, test, type TestBody } from 'claude-code/testing'
 import { KEYMAP, putFields } from '../hooks/keys'
 import type { NexusPane } from '../types'
 import { cutTree, editorRows, fieldRows, ringOf } from '../hooks/view'
-import { DETAIL, ENTRIES, ID, OPENED, PATCH, PUBLISHED, THEME_KEYS, THREAD, THREADS, WEB_PREVIEW, boot, fake, field, live, state, typing } from './fake-cli'
+import { DETAIL, ENTRIES, ID, OPENED, PATCH, PUBLISHED, T0, THEME_KEYS, THREAD, THREADS, WEB_PREVIEW, boot, fake, field, live, state, typing } from './fake-cli'
 
 type Ui = Awaited<ReturnType<Awaited<ReturnType<typeof boot>>['mount']>>
 
@@ -236,7 +236,9 @@ test('a thread draws as a Claude Code transcript: prompts, ⏺ answers in Markdo
   const ui = await mount()
   expect(await shows(ui, '‹ web / Fix login form 500s')).toBe(true)
   expect(await shows(ui, '◉ working')).toBe(true)
-  expect(await shows(ui, /^1m 12s {2}· {2}firebat {2}· {2}claude-opus-5-5 {2}· {2}started 12 min ago$/)).toBe(true)
+  // The run's clock is the run line's alone, not repeated under the title.
+  expect(await shows(ui, /^firebat {2}· {2}claude-opus-5-5 {2}· {2}started 12 min ago$/)).toBe(true)
+  expect(await shows(ui, /Working… \(1m 12s/)).toBe(true)
   expect((await ui.find({ type: 'Button', key: 'tab-conversation' }))?.props.autoFocus).toBe(true)
   expect(await shows(ui, /^❯ The login form answers 500/, 'Box')).toBe(true)
   // As Claude Code draws its own: the prompt and the answers' marks in the text colour.
@@ -1490,4 +1492,16 @@ test('the dock paints its body and title bar; above the prompt it paints nothing
   expect(await painted()).toEqual(expect.arrayContaining(['bashMessageBackgroundColor', 'userMessageBackground']))
   await ui.redraw({ title: 'Nexus', isFocused: true, bodyColumns: 100, placement: 'inline', scroll: { offset: 0, bodyRows: 60 }, view: {} } as never)
   expect(await painted()).toEqual(['userMessageBackground'])
+})
+
+test("a pylon whose guest stopped answering says so under the thread's title, on every tab, with what gives it a fresh VM", async ($, on) => {
+  const cli = fake({ detail: { ...DETAIL, pylon: { ...DETAIL.pylon, notAnswering: { since: new Date(T0 - 180_000).toISOString(), timeouts: 5 } } } })
+  const { clock, nexus, mount } = await boot($, on, cli)
+  await nexus('')
+  await clock.advance(5_000)
+  const ui = await mount()
+  const mute = 'Guest not answering since 3 min ago (5 commands): messages, files and diffs fail. Push or copy what you can, then archive and unarchive for a fresh VM. If its pause fails too, the pylon breaks, and Retry the pylon resumes its last saved disk, losing the changes since.'
+  expect(await shows(ui, mute)).toBe(true)
+  await ui.press({ key: 'tab-pylon' })
+  expect(await shows(ui, mute)).toBe(true)
 })

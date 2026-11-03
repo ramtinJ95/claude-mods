@@ -25,6 +25,11 @@ export type NexusThread = {
   sessionWaiting: boolean
   /** The review loop started it: a reviewer, check thread or verify pylon, by its `startedBy`. */
   isLoop: boolean
+  /**
+   * An archived thread whose disk will wait on the person, the dashboard's Disk kept card: from when (`waitsFrom`, Unix
+   * milliseconds), and the last failed read of its usage. Null for any other thread.
+   */
+  disk: { waitsFrom: number; failure: string | null } | null
 }
 
 /** What a thread asks of the person, the first that holds in this order: `attention` in docs/cli.md. */
@@ -185,7 +190,16 @@ export type NexusLiveShown = { thread: string; live: NexusLive }
 export type NexusDetail = {
   thread: NexusThread
   attention: NexusAttention
-  pylon: { id: string; node: string; actualState: NexusActual; failed: string | null; observedAt: string | null; retryRefused: string | null }
+  pylon: {
+    id: string
+    node: string
+    actualState: NexusActual
+    failed: string | null
+    observedAt: string | null
+    retryRefused: string | null
+    /** The node's guest commands went unanswered (CLI 0.60.0): since when, Unix milliseconds, and how many in a row. */
+    notAnswering: { since: number; timeouts: number } | null
+  }
   sessions: NexusSession[]
   previews: NexusPreview[]
   /** In port order; [] while the pylon is not running, null while its node could not read them. */

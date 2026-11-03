@@ -86,7 +86,24 @@ function parseThread(raw: unknown, command: string): NexusThread | undefined {
     seenAt: stamp(raw, 'seenAt', command),
     sessionWaiting: raw.sessionWaiting === true,
     isLoop: typeof raw.startedBy === 'string' && LOOP_CALLERS.has(raw.startedBy),
+    disk: diskOf(raw),
   }
+}
+
+/** How long an archived thread keeps its disk at least, and its usage, read or not, before the person must decide. */
+const DISK_MS = 24 * 60 * 60_000
+const SETTLE_FAILURES = 3
+
+/**
+ * When an archived thread's disk starts to wait on the person, as the Nexus repository's `settleStuck` (src/reconcile.ts)
+ * decides it: past its 24 hours with its usage unread, after 3 failed reads in a row, or a day later on its own. A
+ * usage that cannot be read, or one read, never waits on the person.
+ */
+function diskOf(raw: Raw): NexusThread['disk'] {
+  if (raw.status !== 'archived' || typeof raw.archivedAt !== 'number' || raw.usageSettledAt !== undefined || raw.usageUnread !== undefined) return null
+  const failure = isRecord(raw.settleFailure) ? raw.settleFailure : null
+  const failed = num(failure?.count) >= SETTLE_FAILURES
+  return { waitsFrom: raw.archivedAt + (failed ? DISK_MS : 2 * DISK_MS), failure: typeof failure?.reason === 'string' ? failure.reason : null }
 }
 
 /** The `startedBy` of the threads the review loop starts, whose replies are the loop's to read. */
@@ -104,14 +121,26 @@ function parseAttention(raw: Raw, command: string, id: string): NexusAttention {
 export const isUnread = (thread: Pick<NexusThread, 'lastReplyAt' | 'seenAt'>) => thread.lastReplyAt !== null && (thread.seenAt === null || thread.lastReplyAt > thread.seenAt)
 
 /** Why a review that ended for the person's decision asks for them: `review.phase.reasons`. */
-const reviewReasons = (review: unknown) =>
-  isRecord(review) && isRecord(review.phase) && review.phase.kind === 'needs-person' ? list(review.phase.reasons).filter((reason): reason is string => typeof reason === 'string') : []
+const reviewReasons = (review: unknown, thread: string) => {
+  if (!isRecord(review) || !isRecord(review.phase)) return []
+  if (review.phase.kind === 'needs-person') return list(review.phase.reasons).filter((reason): reason is string => typeof reason === 'string')
+  // An approval that stops for the person (CLI 0.59.0) lands only by their press.
+  const pr = isRecord(review.pr) && typeof review.pr.number === 'number' ? `PR #${review.pr.number}` : 'Its pull request'
+  return review.phase.kind === 'approved' && review.land === null ? [`${pr} is approved, and lands once you press Land on the dashboard or run nexus land ${thread}`] : []
+}
 
 /** A person's open questions (CLI 0.35.0), by their first line. The CLI cannot answer them, so each says where to. */
 const openQuestions = (questions: unknown) =>
   list(questions).flatMap(question =>
     isRecord(question) && question.answer === null && question.answerer === 'person' && typeof question.text === 'string' ? [`${question.text.split('\n')[0]} (answer it on the dashboard)`] : [],
   )
+
+/** `pylon.notAnswering` (CLI 0.60.0), its `since` an ISO time; absent while the guest answers. */
+function notAnswering(raw: unknown): NexusDetail['pylon']['notAnswering'] {
+  if (!isRecord(raw) || typeof raw.since !== 'string' || typeof raw.timeouts !== 'number') return null
+  const since = Date.parse(raw.since)
+  return Number.isNaN(since) ? null : { since, timeouts: raw.timeouts }
+}
 
 /** `threads --json`, kept to the fields the mod reads. A row without its pylon, `desired` or attention fails the whole list. */
 export function parseThreads(json: unknown): NexusThreadRow[] {
@@ -195,6 +224,7 @@ export function parseDetail(json: unknown): NexusDetail {
       failed: strOrNull(pylon.failed),
       observedAt: strOrNull(pylon.observedAt),
       retryRefused: strOrNull(pylon.retryRefused),
+      notAnswering: notAnswering(pylon.notAnswering),
     },
     sessions: list(json.sessions).map(parseSession),
     previews: list(json.previews).map(raw => parsePreview(raw, 'show')),
@@ -205,7 +235,7 @@ export function parseDetail(json: unknown): NexusDetail {
     agent: isRecord(json.agent) ? { parkedTasks: num(json.agent.parkedTasks) } : null,
     conversation: isRecord(json.claudeWorker) ? 'claude' : isRecord(json.thread) && typeof json.thread.conversationId === 'string' ? 'agent' : null,
     worker: isRecord(json.claudeWorker) ? { state: str(json.claudeWorker.state), model: strOrNull(json.claudeWorker.model), message: strOrNull(json.claudeWorker.message) } : null,
-    decisions: [...reviewReasons(json.review), ...openQuestions(json.questions)],
+    decisions: [...reviewReasons(json.review, thread.id), ...openQuestions(json.questions)],
     desired: wants,
     attach: json.attach,
   }
@@ -825,11 +855,12 @@ const ASK_LOOK: Record<Ask, [label: string, tone: Tone]> = {
   limited: ['usage limit', 'busy'],
   reply: ['new reply', 'ok'],
   waiting: ['waiting', 'busy'],
+  disk: ['disk kept', 'busy'],
 }
 
 /** A list row's word and tone: what the thread asks of the person, else what it is doing. */
-export function rowState(thread: NexusThreadRow): [label: string, tone: Tone] {
-  const ask = askOf(thread)
+export function rowState(thread: NexusThreadRow, now: number): [label: string, tone: Tone] {
+  const ask = askOf(thread, now)
   return ask ? ASK_LOOK[ask] : threadState(thread, thread.pylon.actualState)
 }
 
@@ -1522,7 +1553,10 @@ function addProject(args: readonly string[], invalid: (reason: string) => NexusC
 }
 
 /** What waits on the person in a thread, as the dashboard's Needs you (`needsOf`) decides it. */
-export type Need = 'failed' | 'decision' | 'parked' | 'limited' | 'waiting'
+export type Need = 'failed' | 'decision' | 'parked' | 'limited' | 'waiting' | 'disk'
+
+/** Whether an archived thread's disk waits on the person at `now`: the dashboard's Disk kept card. */
+export const diskWaits = (thread: NexusThread, now: number) => thread.status === 'archived' && thread.disk !== null && now >= thread.disk.waitsFrom
 
 /** What a thread shows the person: a need, else a new reply, which waits on no one. */
 export type Ask = Need | 'reply'
@@ -1532,7 +1566,8 @@ export type Ask = Need | 'reply'
  * or a running turn outranks waiting there. The review loop's threads need the person as any other does, but their
  * replies are the loop's.
  */
-export function askOf(thread: NexusThreadRow): Ask | null {
+export function askOf(thread: NexusThreadRow, now: number): Ask | null {
+  if (thread.status === 'archived') return diskWaits(thread, now) ? 'disk' : null
   if (thread.status !== 'active' && thread.status !== 'idle') return null
   const { attention } = thread
   if (attention === 'failed' || attention === 'decision' || attention === 'parked' || attention === 'limited') return attention
@@ -1544,18 +1579,18 @@ export function askOf(thread: NexusThreadRow): Ask | null {
 export type StripNotice = { top: NexusThreadRow; ask: Ask; word: string; count: number; replies: number }
 
 /** docs/cli.md's order of attention, most urgent first, with a dialog's wait before a new reply as Needs you counts it. */
-const ASK_RANK: Record<Ask, number> = { failed: 0, decision: 1, parked: 2, limited: 3, waiting: 4, reply: 5 }
+const ASK_RANK: Record<Ask, number> = { failed: 0, decision: 1, parked: 2, limited: 3, waiting: 4, disk: 5, reply: 6 }
 
-const ASK_WORD: Record<Ask, string> = { failed: 'failed', decision: 'needs you', parked: 'parked', limited: 'usage limit', reply: 'new reply', waiting: 'waiting for you' }
+const ASK_WORD: Record<Ask, string> = { failed: 'failed', decision: 'needs you', parked: 'parked', limited: 'usage limit', reply: 'new reply', waiting: 'waiting for you', disk: 'disk kept' }
 
 /**
  * The open threads that ask something of the person, folded into one notice: the most urgent, newest first among
  * equals, and how many need the person with how many new replies wait beside them, or while none needs the person, how
  * many new replies wait. Null when none asks anything.
  */
-export function stripNotice(threads: readonly NexusThreadRow[]): StripNotice | null {
+export function stripNotice(threads: readonly NexusThreadRow[], now: number): StripNotice | null {
   const asking = threads.flatMap((thread): { thread: NexusThreadRow; ask: Ask }[] => {
-    const ask = askOf(thread)
+    const ask = askOf(thread, now)
     return ask ? [{ thread, ask }] : []
   })
   if (asking.length === 0) return null
