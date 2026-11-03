@@ -1500,7 +1500,7 @@ test("a pylon whose guest stopped answering says so under the thread's title, on
   await nexus('')
   await clock.advance(5_000)
   const ui = await mount()
-  const mute = 'Guest not answering since 3 min ago (5 commands): messages, files and diffs fail. Archive, then unarchive, for a fresh VM.'
+  const mute = 'Guest not answering since 3 min ago (5 commands): messages, files and diffs fail. Push or copy what you can, then archive and unarchive for a fresh VM. If its pause fails too, the pylon breaks, and Retry the pylon resumes its last saved disk, losing the changes since.'
   expect(await shows(ui, mute)).toBe(true)
   await ui.press({ key: 'tab-pylon' })
   expect(await shows(ui, mute)).toBe(true)

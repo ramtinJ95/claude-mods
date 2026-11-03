@@ -745,7 +745,7 @@ function Header(draw: Draw, scene: Scene, actions: PaneActions, counts: Counts, 
       </Box>
       {Rule(draw, scene)}
       {mute && (
-        <Text color="error">{`Guest not answering since ${since(mute.since, scene.now)} (${mute.timeouts} commands): messages, files and diffs fail. Archive, then unarchive, for a fresh VM.`}</Text>
+        <Text color="error">{`Guest not answering since ${since(mute.since, scene.now)} (${mute.timeouts} commands): messages, files and diffs fail. Push or copy what you can, then archive and unarchive for a fresh VM. If its pause fails too, the pylon breaks, and Retry the pylon resumes its last saved disk, losing the changes since.`}</Text>
       )}
       {watch?.outage && <Text color="error">{`${watch.outage} The watch keeps trying.`}</Text>}
       {watch?.ended && <Text color="error">{watch.ended}</Text>}
