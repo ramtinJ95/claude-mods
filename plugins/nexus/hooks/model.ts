@@ -1540,8 +1540,8 @@ export function askOf(thread: NexusThreadRow): Ask | null {
   return attention === 'reply' && !thread.isLoop ? 'reply' : null
 }
 
-/** The strip's one line: the most urgent thread that asks something of the person, its word, and how many ask as much. */
-export type StripNotice = { top: NexusThreadRow; ask: Ask; word: string; count: number }
+/** The strip's one line: the most urgent thread that asks something of the person, its word, how many ask as much, and beside needs, how many new replies wait. */
+export type StripNotice = { top: NexusThreadRow; ask: Ask; word: string; count: number; replies: number }
 
 /** docs/cli.md's order of attention, most urgent first, with a dialog's wait before a new reply as Needs you counts it. */
 const ASK_RANK: Record<Ask, number> = { failed: 0, decision: 1, parked: 2, limited: 3, waiting: 4, reply: 5 }
@@ -1550,7 +1550,8 @@ const ASK_WORD: Record<Ask, string> = { failed: 'failed', decision: 'needs you',
 
 /**
  * The open threads that ask something of the person, folded into one notice: the most urgent, newest first among
- * equals, and how many need the person, or while none does, how many have a new reply. Null when none asks anything.
+ * equals, and how many need the person with how many new replies wait beside them, or while none needs the person, how
+ * many new replies wait. Null when none asks anything.
  */
 export function stripNotice(threads: readonly NexusThreadRow[]): StripNotice | null {
   const asking = threads.flatMap((thread): { thread: NexusThreadRow; ask: Ask }[] => {
@@ -1560,7 +1561,8 @@ export function stripNotice(threads: readonly NexusThreadRow[]): StripNotice | n
   if (asking.length === 0) return null
   asking.sort((a, b) => ASK_RANK[a.ask] - ASK_RANK[b.ask] || b.thread.lastActivityAt - a.thread.lastActivityAt)
   const { thread, ask } = asking[0]!
-  return { top: thread, ask, word: ASK_WORD[ask], count: asking.filter(one => (one.ask === 'reply') === (ask === 'reply')).length }
+  const replies = asking.filter(one => one.ask === 'reply').length
+  return ask === 'reply' ? { top: thread, ask, word: ASK_WORD[ask], count: replies, replies: 0 } : { top: thread, ask, word: ASK_WORD[ask], count: asking.length - replies, replies }
 }
 
 /**
