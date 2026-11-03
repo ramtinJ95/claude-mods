@@ -1,14 +1,16 @@
 // The strip: one row above the prompt with a single notice when Nexus needs the
-// person, its most urgent thread named, or how many threads need them. It opens
-// that thread, or the list when several do. It draws on the prompt's own background.
+// person, its most urgent thread named, or how many threads need them, with how
+// many new replies wait, and while none needs them, the new replies. It opens
+// that thread, or the list when there are several. It draws on the prompt's own
+// background.
 import type { BoxProps, ButtonProps, ElementConstructor, TextProps } from 'claude-code'
 
 import type { NexusList } from '../types'
-import { type Need, type StripNotice, cells, clip, scopeLabel } from './model'
+import { type Ask, type StripNotice, cells, clip, scopeLabel } from './model'
 
 type Draw = { Box: ElementConstructor<BoxProps>; Text: ElementConstructor<TextProps>; Button: ElementConstructor<ButtonProps> }
 
-const LOOK: Record<Need, { glyph: string; color: string }> = {
+const LOOK: Record<Ask, { glyph: string; color: string }> = {
   failed: { glyph: '✕', color: 'error' },
   decision: { glyph: '!', color: 'warning' },
   parked: { glyph: '✕', color: 'error' },
@@ -41,10 +43,14 @@ export function StripView(draw: Draw, list: NexusList, notice: StripNotice | nul
       </Box>
     )
   }
-  const look = LOOK[notice.need]
+  const look = LOOK[notice.ask]
   // A Button ignores a child Text's truncation, so the row is budgeted here: the project's name goes before the title.
-  const room = (shown: string) => width - cells(shown) - 4
-  const many = [`${notice.count} threads need you`, `${notice.count} need you`]
+  const many = notice.ask === 'reply' ? [`${notice.count} new replies`, `${notice.count} new`] : [`${notice.count} threads need you`, `${notice.count} need you`]
+  const least = notice.count === 1 ? cells(notice.word) + 2 + LEAST_TITLE_CELLS : cells(many[1]!)
+  const replies = notice.replies > 0 ? ` · ${notice.replies} new` : ''
+  // The new replies go first when the row is too narrow for them beside the least of the notice.
+  const besides = width - cells(HEAD) - 4 - cells(replies) >= least ? replies : ''
+  const room = (shown: string) => width - cells(shown) - 4 - cells(besides)
   const shownHead = notice.count === 1 ? (room(head) >= cells(notice.word) + 2 + LEAST_TITLE_CELLS ? head : HEAD) : room(head) >= cells(many[0]!) ? head : HEAD
   const what = notice.count === 1 ? null : (many.find(text => cells(text) <= room(shownHead)) ?? many[1]!)
   const title = Math.max(1, room(shownHead) - cells(notice.word) - 2)
@@ -58,6 +64,7 @@ export function StripView(draw: Draw, list: NexusList, notice: StripNotice | nul
           <Text color={isCursor ? 'inverseText' : look.color}>{`${look.glyph} `}</Text>
           {what ? <Text bold>{what}</Text> : clip(notice.top.title, title)}
           {!what && <Text color={isCursor ? 'inverseText' : look.color}>{`  ${notice.word}`}</Text>}
+          {besides && <Text color={isCursor ? 'inverseText' : LOOK.reply.color}>{besides}</Text>}
         </Text>
       </Button>
     </Box>

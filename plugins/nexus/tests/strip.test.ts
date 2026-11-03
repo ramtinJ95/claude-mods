@@ -20,10 +20,66 @@ test('the strip folds every thread that needs the person into one notice, in the
   const { clock, strip } = await boot($, on, cli)
   await clock.settle()
   const ui = await strip(300)
-  expect(await chips(ui)).toEqual([[NOTICE_KEY, '✕ 6 threads need you']])
+  expect(await chips(ui)).toEqual([[NOTICE_KEY, '✕ 5 threads need you · 1 new']])
   expect(await ui.find({ type: 'Text', text: '◆ Nexus' })).toBeDefined()
   // The strip paints no band of its own.
   expect((await ui.findAll({})).some(one => typeof one.props.backgroundColor === 'string')).toBe(false)
+})
+
+test("unread replies need no one, as the dashboard's Needs you counts: the strip says how many are new, and the review loop's own replies are not news", async ($, on) => {
+  const builders = [1, 2, 3, 4, 5].map(n => ({ ...REPLIED, id: `th-e0000000001${n}`, title: `Builder ${n}`, startedBy: 'nodeAbc123CNTRL' }))
+  const loop = [
+    ...[1, 2, 3].map(n => ({ ...REPLIED, id: `th-e0000000002${n}`, title: `Review of #4${n}`, startedBy: 'nexus-review' })),
+    { ...REPLIED, id: 'th-e00000000031', title: 'Check of #41', startedBy: 'nexus-check' },
+  ]
+  const cli = fake({ threads: [...THREADS, ...builders, ...loop], store: STORE })
+  on('ui.render', { component: 'AbovePrompt' }, ($, e) => $.ui.resolve(e).Text({ children: ['the prompt as it was'] } as never))
+  const { clock, strip, nexus, mount } = await boot($, on, cli)
+  await clock.settle()
+  const ui = await strip(300)
+  expect(await chips(ui)).toEqual([[NOTICE_KEY, '● 5 new replies']])
+  cli.threads = [...THREADS.map(thread => ({ ...thread, agentTurnRunning: false, attention: null })), ...loop]
+  await clock.advance(10_000)
+  expect(await chips(ui)).toEqual([])
+  await nexus('')
+  const pane = await mount()
+  expect((await pane.find({ type: 'Button', key: loop[0]!.id }))?.text).toMatch(/Review of #41\s+ running/)
+  expect(await pane.find({ type: 'Text', text: /new ·/ })).toBeUndefined()
+})
+
+test('what needs the person outranks the new replies, which it counts beside it, a failed reviewer among it, and a session waiting at a dialog counts whatever its attention', async ($, on) => {
+  const reviewer = { ...FAILED, id: 'th-f00000000041', title: 'Review of #41', startedBy: 'nexus-review' }
+  const builders = [1, 2].map(n => ({ ...REPLIED, id: `th-e0000000004${n}`, title: `Builder ${n}` }))
+  const dialog = { ...REPLIED, id: 'th-b00000000042', title: 'Permission prompt', agentTurnRunning: true, attention: 'working', sessionWaiting: true }
+  const cli = fake({ threads: [...THREADS, REPLIED, ...builders, reviewer], store: STORE })
+  const { clock, strip } = await boot($, on, cli)
+  await clock.settle()
+  const ui = await strip(300)
+  expect(await chips(ui)).toEqual([[NOTICE_KEY, '✕ Review of #41  failed · 3 new']])
+  cli.threads = [...THREADS, REPLIED, dialog]
+  await clock.advance(10_000)
+  expect(await chips(ui)).toEqual([[NOTICE_KEY, '◇ Permission prompt  waiting for you · 1 new']])
+  cli.threads = [...THREADS, REPLIED, { ...dialog, status: 'archived' }]
+  await clock.advance(10_000)
+  expect(await chips(ui)).toEqual([[NOTICE_KEY, '● Docs pass  new reply']])
+})
+
+test("an idle thread needs the person as an active one does, a deleted one never, a dialog behind a new reply is a wait, and a verify pylon's reply is the loop's", async ($, on) => {
+  const quiet = THREADS.map(thread => ({ ...thread, agentTurnRunning: false, attention: null }))
+  const idle = { ...DECIDING, status: 'idle' }
+  const deleted = { ...FAILED, status: 'deleted' }
+  const verify = { ...REPLIED, id: 'th-e00000000051', title: 'Verify #41', startedBy: 'nexus-verify' }
+  const dialog = { ...REPLIED, id: 'th-b00000000052', title: 'Permission prompt', sessionWaiting: true }
+  const cli = fake({ threads: [...quiet, idle, deleted, verify, dialog], store: STORE })
+  const { clock, strip, nexus, mount } = await boot($, on, cli)
+  await clock.settle()
+  expect(await chips(await strip(300))).toEqual([[NOTICE_KEY, '! 2 threads need you']])
+  await nexus('')
+  const pane = await mount()
+  expect((await pane.find({ type: 'Button', key: idle.id }))?.text).toMatch(/Land the fix\s+ needs you/)
+  expect((await pane.find({ type: 'Button', key: dialog.id }))?.text).toMatch(/Permission prompt\s+ waiting/)
+  expect((await pane.find({ type: 'Button', key: verify.id }))?.text).toMatch(/Verify #41\s+ running/)
+  expect(await pane.find({ type: 'Text', text: /new ·/ })).toBeUndefined()
 })
 
 test('one thread that needs the person is named with what it asks, and a working one alone leaves the strip empty', async ($, on) => {
@@ -40,7 +96,7 @@ test('one thread that needs the person is named with what it asks, and a working
 })
 
 test('pressing a notice for several threads opens the pane on the list', async ($, on) => {
-  const cli = fake({ threads: [...THREADS, FAILED, REPLIED], store: STORE })
+  const cli = fake({ threads: [...THREADS, FAILED, PARKED], store: STORE })
   const { clock, strip, mount } = await boot($, on, cli)
   await clock.settle()
   await (await strip()).press({ key: NOTICE_KEY })
@@ -139,7 +195,7 @@ test("a strip poll that ends after the pane's newer one writes nothing", async (
   expect(await ui.find({ type: 'Button', key: NEW.id })).toBeDefined()
 })
 
-test("a narrow strip fits its one row: the project's name goes before the thread's title, and a count says less", async ($, on) => {
+test("a narrow strip fits its one row: the project's name goes before the thread's title, a count says less, and the new replies beside it go first", async ($, on) => {
   const cli = fake({ threads: [...THREADS, FAILED], store: { ...STORE, project: 'web' } })
   const { clock, strip } = await boot($, on, cli)
   await clock.settle()
@@ -150,9 +206,12 @@ test("a narrow strip fits its one row: the project's name goes before the thread
   }
   const ui = await strip(32)
   expect(await fits(ui, 32)).toEqual(['◆ Nexus', '✕ Broken setup  failed'])
-  cli.threads = [...THREADS, FAILED, REPLIED]
+  cli.threads = [...THREADS, FAILED, PARKED]
   await clock.advance(10_000)
   expect(await fits(ui, 32)).toEqual(['◆ Nexus', '✕ 2 threads need you'])
+  cli.threads = [...THREADS, FAILED, PARKED, REPLIED]
+  await clock.advance(10_000)
+  expect(await fits(ui, 32)).toEqual(['◆ Nexus', '✕ 2 need you · 1 new'])
   await ui.unmount()
   expect(await fits(await strip(24), 24)).toEqual(['◆ Nexus', '✕ 2 need you'])
 })

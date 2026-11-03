@@ -56,6 +56,8 @@ const thread = (over: Partial<NexusThread>): NexusThread => ({
   lastActivityAt: 0,
   lastReplyAt: null,
   seenAt: null,
+  sessionWaiting: false,
+  isLoop: false,
   ...over,
 })
 

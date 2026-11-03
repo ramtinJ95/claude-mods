@@ -65,6 +65,7 @@ import {
   resumesOn,
   sessionPlace,
   type ShownSession,
+  askOf,
   attachCommand,
   type Tone,
   TONE_COLOR,
@@ -498,7 +499,7 @@ function TitleOfList(draw: Draw, scene: Scene) {
   const threads = inScope(list.threads ?? [], scene.scope)
   const open = threads.filter(thread => thread.status === 'active' || thread.status === 'idle').length
   const working = threads.filter(thread => thread.agentTurnRunning).length
-  const unread = threads.filter(thread => thread.attention === 'reply' && (thread.status === 'active' || thread.status === 'idle')).length
+  const unread = threads.filter(thread => askOf(thread) === 'reply').length
   const offline = catalog.nodes?.filter(node => node.state !== 'online').length ?? 0
   return TitleBar(
     draw,

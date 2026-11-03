@@ -84,8 +84,13 @@ function parseThread(raw: unknown, command: string): NexusThread | undefined {
     lastActivityAt: Math.max(num(raw.lastAgentActivityAt), num(raw.lastHumanActivityAt), num(raw.createdAt)),
     lastReplyAt: stamp(raw, 'lastReplyAt', command),
     seenAt: stamp(raw, 'seenAt', command),
+    sessionWaiting: raw.sessionWaiting === true,
+    isLoop: typeof raw.startedBy === 'string' && LOOP_CALLERS.has(raw.startedBy),
   }
 }
+
+/** The `startedBy` of the threads the review loop starts, whose replies are the loop's to read. */
+const LOOP_CALLERS = new Set(['nexus-review', 'nexus-check', 'nexus-verify'])
 
 const ATTENTION = new Set<string>(['failed', 'decision', 'parked', 'limited', 'reply', 'working', 'waiting'])
 
@@ -813,7 +818,7 @@ export function threadState(thread: Pick<NexusThread, 'status' | 'agentTurnRunni
 }
 
 /** The word a list row shows for what an open thread asks of the person; working is the thread's state's own. */
-const ATTENTION_LOOK: Partial<Record<Exclude<NexusAttention, null>, [label: string, tone: Tone]>> = {
+const ASK_LOOK: Record<Ask, [label: string, tone: Tone]> = {
   failed: ['failed', 'bad'],
   decision: ['needs you', 'busy'],
   parked: ['parked', 'bad'],
@@ -822,10 +827,10 @@ const ATTENTION_LOOK: Partial<Record<Exclude<NexusAttention, null>, [label: stri
   waiting: ['waiting', 'busy'],
 }
 
-/** A list row's word and tone: what the control plane's attention asks of the person, else what the thread is doing. */
+/** A list row's word and tone: what the thread asks of the person, else what it is doing. */
 export function rowState(thread: NexusThreadRow): [label: string, tone: Tone] {
-  const isOpen = thread.status === 'active' || thread.status === 'idle'
-  return (isOpen && thread.attention && ATTENTION_LOOK[thread.attention]) || threadState(thread, thread.pylon.actualState)
+  const ask = askOf(thread)
+  return ask ? ASK_LOOK[ask] : threadState(thread, thread.pylon.actualState)
 }
 
 /** "5 min", or null under 45 seconds: the dashboard's spans. */
@@ -1516,29 +1521,48 @@ function addProject(args: readonly string[], invalid: (reason: string) => NexusC
   return { verb: 'add-project', id, repoUrl, node: flags.node, ...(flags.branch ? { branch: flags.branch } : {}) }
 }
 
-/** What an open thread's attention asks of the person: every attention but working, which asks nothing. */
-export type Need = Exclude<NexusAttention, null | 'working'>
+/** What waits on the person in a thread, as the dashboard's Needs you (`needsOf`) decides it. */
+export type Need = 'failed' | 'decision' | 'parked' | 'limited' | 'waiting'
 
-/** The strip's one line: the most urgent thread that needs the person, its word, and how many threads do. */
-export type StripNotice = { top: NexusThreadRow; need: Need; word: string; count: number }
-
-/** docs/cli.md's order of attention, most urgent first. */
-const NEED_RANK: Record<Need, number> = { failed: 0, decision: 1, parked: 2, limited: 3, reply: 4, waiting: 5 }
-
-const NEED_WORD: Record<Need, string> = { failed: 'failed', decision: 'needs you', parked: 'parked', limited: 'usage limit', reply: 'new reply', waiting: 'waiting for you' }
+/** What a thread shows the person: a need, else a new reply, which waits on no one. */
+export type Ask = Need | 'reply'
 
 /**
- * The open threads whose attention asks for the person, folded into one notice: the most urgent, newest first among
- * equals, and their count. Null when none does, so a thread that is only working leaves the strip empty.
+ * What an open thread asks of the person. A session at a dialog needs them whatever its attention says, since a reply
+ * or a running turn outranks waiting there. The review loop's threads need the person as any other does, but their
+ * replies are the loop's.
+ */
+export function askOf(thread: NexusThreadRow): Ask | null {
+  if (thread.status !== 'active' && thread.status !== 'idle') return null
+  const { attention } = thread
+  if (attention === 'failed' || attention === 'decision' || attention === 'parked' || attention === 'limited') return attention
+  if (thread.sessionWaiting || attention === 'waiting') return 'waiting'
+  return attention === 'reply' && !thread.isLoop ? 'reply' : null
+}
+
+/** The strip's one line: the most urgent thread that asks something of the person, its word, how many ask as much, and beside needs, how many new replies wait. */
+export type StripNotice = { top: NexusThreadRow; ask: Ask; word: string; count: number; replies: number }
+
+/** docs/cli.md's order of attention, most urgent first, with a dialog's wait before a new reply as Needs you counts it. */
+const ASK_RANK: Record<Ask, number> = { failed: 0, decision: 1, parked: 2, limited: 3, waiting: 4, reply: 5 }
+
+const ASK_WORD: Record<Ask, string> = { failed: 'failed', decision: 'needs you', parked: 'parked', limited: 'usage limit', reply: 'new reply', waiting: 'waiting for you' }
+
+/**
+ * The open threads that ask something of the person, folded into one notice: the most urgent, newest first among
+ * equals, and how many need the person with how many new replies wait beside them, or while none needs the person, how
+ * many new replies wait. Null when none asks anything.
  */
 export function stripNotice(threads: readonly NexusThreadRow[]): StripNotice | null {
-  const needing = threads.flatMap((thread): { thread: NexusThreadRow; need: Need }[] =>
-    thread.attention && thread.attention !== 'working' && (thread.status === 'active' || thread.status === 'idle') ? [{ thread, need: thread.attention }] : [],
-  )
-  if (needing.length === 0) return null
-  needing.sort((a, b) => NEED_RANK[a.need] - NEED_RANK[b.need] || b.thread.lastActivityAt - a.thread.lastActivityAt)
-  const { thread, need } = needing[0]!
-  return { top: thread, need, word: NEED_WORD[need], count: needing.length }
+  const asking = threads.flatMap((thread): { thread: NexusThreadRow; ask: Ask }[] => {
+    const ask = askOf(thread)
+    return ask ? [{ thread, ask }] : []
+  })
+  if (asking.length === 0) return null
+  asking.sort((a, b) => ASK_RANK[a.ask] - ASK_RANK[b.ask] || b.thread.lastActivityAt - a.thread.lastActivityAt)
+  const { thread, ask } = asking[0]!
+  const replies = asking.filter(one => one.ask === 'reply').length
+  return ask === 'reply' ? { top: thread, ask, word: ASK_WORD[ask], count: replies, replies: 0 } : { top: thread, ask, word: ASK_WORD[ask], count: asking.length - replies, replies }
 }
 
 /**
