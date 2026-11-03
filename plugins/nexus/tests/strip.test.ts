@@ -95,6 +95,19 @@ test('one thread that needs the person is named with what it asks, and a working
   expect(await ui.find({ type: 'Text', text: 'the prompt as it was' })).toBeDefined()
 })
 
+test("an archived thread's disk that waits on the person counts in the notice from its time on, and its project's fold says so", async ($, on) => {
+  const KEPT = { ...THREADS[1]!, id: 'th-5d0000000010', title: 'Spike on caching', status: 'archived', archivedAt: T0 - 24 * 60 * 60_000, settleFailure: { reason: 'its pylon did not boot', at: T0, count: 3 }, attention: null }
+  const early = { ...KEPT, archivedAt: T0 - 60_000 }
+  const quiet = THREADS.map(thread => ({ ...thread, agentTurnRunning: false, attention: null }))
+  const cli = fake({ threads: [...quiet, KEPT, early], store: STORE })
+  const { clock, strip, nexus, mount } = await boot($, on, cli)
+  await clock.settle()
+  expect(await chips(await strip(300))).toEqual([[NOTICE_KEY, '◌ Spike on caching  disk kept']])
+  await nexus('')
+  const ui = await mount()
+  expect((await ui.find({ type: 'Button', key: 'closed-web' }))?.text).toMatch(/3 archived · 1 disk kept$/)
+})
+
 test('pressing a notice for several threads opens the pane on the list', async ($, on) => {
   const cli = fake({ threads: [...THREADS, FAILED, PARKED], store: STORE })
   const { clock, strip, mount } = await boot($, on, cli)

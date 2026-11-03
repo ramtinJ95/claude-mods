@@ -66,6 +66,7 @@ import {
   sessionPlace,
   type ShownSession,
   askOf,
+  diskWaits,
   attachCommand,
   type Tone,
   TONE_COLOR,
@@ -499,7 +500,7 @@ function TitleOfList(draw: Draw, scene: Scene) {
   const threads = inScope(list.threads ?? [], scene.scope)
   const open = threads.filter(thread => thread.status === 'active' || thread.status === 'idle').length
   const working = threads.filter(thread => thread.agentTurnRunning).length
-  const unread = threads.filter(thread => askOf(thread) === 'reply').length
+  const unread = threads.filter(thread => askOf(thread, scene.now) === 'reply').length
   const offline = catalog.nodes?.filter(node => node.state !== 'online').length ?? 0
   return TitleBar(
     draw,
@@ -558,7 +559,7 @@ export function ListView(draw: Draw, scene: Scene, actions: PaneActions) {
   }
   // The dashboard's sidebar: a dot by state, the title, the state's word while there is room, how long ago, dim.
   const row = (thread: NexusThreadRow) => {
-    const [label, tone] = rowState(thread)
+    const [label, tone] = rowState(thread, now)
     const age = thread.agentTurnRunning ? 'now' : (span(now - thread.lastActivityAt) ?? 'now')
     const word = label === 'agent working' ? 'working' : label
     const hasWord = scene.width >= 44
@@ -589,10 +590,13 @@ export function ListView(draw: Draw, scene: Scene, actions: PaneActions) {
     group.open.forEach(row)
     if (group.closed.length > 0) {
       const key = closedKey(group.project)
+      // An archived disk that waits on the person is folded away with the rest, so the fold says so.
+      const kept = group.closed.filter(thread => askOf(thread, now) === 'disk').length
       place(
         <Button key={key} plain dimColor autoFocus={cursor === key && !isFiltering ? true : undefined} onPress={() => actions.toggle(key, group.isUnfolded)}>
           {Pointer(draw, cursor === key)}
           {`  ${group.isUnfolded ? '▾' : '▸'} ${closedLabel(group.closed)}`}
+          {kept > 0 && <Text color="warning">{` · ${kept} disk kept`}</Text>}
         </Button>,
         { key, enter: { kind: 'toggle', key, isOpen: group.isUnfolded } },
       )
@@ -690,11 +694,10 @@ function Header(draw: Draw, scene: Scene, actions: PaneActions, counts: Counts, 
   const facts = { status: state?.status ?? thread?.status ?? 'active', agentTurnRunning: state ? state.run === 'working' : (thread?.agentTurnRunning ?? false) }
   const known = pylon ? threadState(facts, pylon) : null
   const node = detail?.pylon.node ?? row?.pylon.node
-  const run = watch && state?.run === 'working' ? runOf(watch.rows) : null
-  // The dashboard's header: `shop / Validate postcodes ● running`, then the facts the pane had, the run clock first.
+  // The dashboard's header: `shop / Validate postcodes ● running`, then the facts the pane had. The run line keeps the run's clock.
   const word = known ? (known[0] === 'agent working' ? 'working' : known[0]) : watch?.ended ? 'not watching' : watch?.outage ? 'not connected' : 'connecting'
   const tone = known?.[1] ?? 'muted'
-  const clockText = known?.[0] === 'agent working' && run?.since ? clock(scene.now - run.since) : null
+  const mute = detail?.pylon.notAnswering
   const tab = (key: NexusTab) => {
     const count = counts[key]
     const label = `${TAB_LABEL[key]}${count === undefined ? '' : ` ${count}`}`
@@ -732,7 +735,7 @@ function Header(draw: Draw, scene: Scene, actions: PaneActions, counts: Counts, 
         </Text>,
       )}
       <Text color="subtle" wrap="truncate-end">
-        {[clockText, node, watch?.model, thread ? `started ${since(thread.createdAt, scene.now)}` : null].filter(Boolean).join('  ·  ')}
+        {[node, watch?.model, thread ? `started ${since(thread.createdAt, scene.now)}` : null].filter(Boolean).join('  ·  ')}
       </Text>
       <Box flexDirection="row" columnGap={3}>
         {tab('conversation')}
@@ -741,6 +744,9 @@ function Header(draw: Draw, scene: Scene, actions: PaneActions, counts: Counts, 
         {tab('pylon')}
       </Box>
       {Rule(draw, scene)}
+      {mute && (
+        <Text color="error">{`Guest not answering since ${since(mute.since, scene.now)} (${mute.timeouts} commands): messages, files and diffs fail. Archive, then unarchive, for a fresh VM.`}</Text>
+      )}
       {watch?.outage && <Text color="error">{`${watch.outage} The watch keeps trying.`}</Text>}
       {watch?.ended && <Text color="error">{watch.ended}</Text>}
       {scene.shown?.thread === id && scene.shown.failure && <Text color="error">{`The thread's details did not load: ${sentence(scene.shown.failure.message)}`}</Text>}
@@ -1921,6 +1927,9 @@ function PylonBody(draw: Draw, scene: Scene, actions: PaneActions, area: number,
       {detail.decisions.map((reason, at) => (
         <Text key={`decision-${at}`} color="warning">{`Needs you: ${reason}`}</Text>
       ))}
+      {diskWaits(thread, scene.now) && (
+        <Text color="warning">{`Needs you: its disk is kept past its 24 hours, as its token usage is not read${thread.disk?.failure ? `, the last read failing because ${thread.disk.failure}` : ''}. Nexus tries again on its own, or delete the thread, which deletes the disk with that usage unread.`}</Text>
+      )}
       <Text color="subtle">{pylon.id}</Text>
       {pylon.failed && <Text color="error">{`The planner gave up: ${pylon.failed}`}</Text>}
     </Box>,

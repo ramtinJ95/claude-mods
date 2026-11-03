@@ -2514,7 +2514,7 @@ export const register: Register = (on, options) => {
       read($, scopeAtom),
     ])
     if (!strip.isOn) return next(e)
-    const notice = stripNotice(inScope(list.threads ?? [], scope))
+    const notice = stripNotice(inScope(list.threads ?? [], scope), list.polledAt ?? 0)
     if (!notice && !(list.failure && !list.threads)) return next(e)
     return StripView($.ui.resolve(e), list, notice, e.props.bodyColumns, cursor === NOTICE_KEY, scope, () => void openFromStrip($, notice?.count === 1 ? notice.top.id : null))
   })

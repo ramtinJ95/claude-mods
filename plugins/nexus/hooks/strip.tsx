@@ -17,6 +17,7 @@ const LOOK: Record<Ask, { glyph: string; color: string }> = {
   limited: { glyph: '◷', color: 'warning' },
   reply: { glyph: '●', color: 'success' },
   waiting: { glyph: '◇', color: 'warning' },
+  disk: { glyph: '◌', color: 'warning' },
 }
 
 const HEAD = '◆ Nexus'
