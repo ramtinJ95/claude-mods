@@ -20,10 +20,47 @@ test('the strip folds every thread that needs the person into one notice, in the
   const { clock, strip } = await boot($, on, cli)
   await clock.settle()
   const ui = await strip(300)
-  expect(await chips(ui)).toEqual([[NOTICE_KEY, '✕ 6 threads need you']])
+  expect(await chips(ui)).toEqual([[NOTICE_KEY, '✕ 5 threads need you']])
   expect(await ui.find({ type: 'Text', text: '◆ Nexus' })).toBeDefined()
   // The strip paints no band of its own.
   expect((await ui.findAll({})).some(one => typeof one.props.backgroundColor === 'string')).toBe(false)
+})
+
+test("unread replies need no one, as the dashboard's Needs you counts: the strip says how many are new, and the review loop's own replies are not news", async ($, on) => {
+  const builders = [1, 2, 3, 4, 5].map(n => ({ ...REPLIED, id: `th-e0000000001${n}`, title: `Builder ${n}`, startedBy: 'nodeAbc123CNTRL' }))
+  const loop = [
+    ...[1, 2, 3].map(n => ({ ...REPLIED, id: `th-e0000000002${n}`, title: `Review of #4${n}`, startedBy: 'nexus-review' })),
+    { ...REPLIED, id: 'th-e00000000031', title: 'Check of #41', startedBy: 'nexus-check' },
+  ]
+  const cli = fake({ threads: [...THREADS, ...builders, ...loop], store: STORE })
+  on('ui.render', { component: 'AbovePrompt' }, ($, e) => $.ui.resolve(e).Text({ children: ['the prompt as it was'] } as never))
+  const { clock, strip, nexus, mount } = await boot($, on, cli)
+  await clock.settle()
+  const ui = await strip(300)
+  expect(await chips(ui)).toEqual([[NOTICE_KEY, '● 5 new replies']])
+  cli.threads = [...THREADS.map(thread => ({ ...thread, agentTurnRunning: false, attention: null })), ...loop]
+  await clock.advance(10_000)
+  expect(await chips(ui)).toEqual([])
+  await nexus('')
+  const pane = await mount()
+  expect((await pane.find({ type: 'Button', key: loop[0]!.id }))?.text).toMatch(/Review of #41\s+ running/)
+  expect(await pane.find({ type: 'Text', text: /new ·/ })).toBeUndefined()
+})
+
+test('what needs the person outranks a new reply, a failed reviewer among it, and a session waiting at a dialog counts whatever its attention', async ($, on) => {
+  const reviewer = { ...FAILED, id: 'th-f00000000041', title: 'Review of #41', startedBy: 'nexus-review' }
+  const dialog = { ...REPLIED, id: 'th-b00000000042', title: 'Permission prompt', agentTurnRunning: true, attention: 'working', sessionWaiting: true }
+  const cli = fake({ threads: [...THREADS, REPLIED, reviewer], store: STORE })
+  const { clock, strip } = await boot($, on, cli)
+  await clock.settle()
+  const ui = await strip(300)
+  expect(await chips(ui)).toEqual([[NOTICE_KEY, '✕ Review of #41  failed']])
+  cli.threads = [...THREADS, REPLIED, dialog]
+  await clock.advance(10_000)
+  expect(await chips(ui)).toEqual([[NOTICE_KEY, '◇ Permission prompt  waiting for you']])
+  cli.threads = [...THREADS, REPLIED, { ...dialog, status: 'archived' }]
+  await clock.advance(10_000)
+  expect(await chips(ui)).toEqual([[NOTICE_KEY, '● Docs pass  new reply']])
 })
 
 test('one thread that needs the person is named with what it asks, and a working one alone leaves the strip empty', async ($, on) => {
@@ -40,7 +77,7 @@ test('one thread that needs the person is named with what it asks, and a working
 })
 
 test('pressing a notice for several threads opens the pane on the list', async ($, on) => {
-  const cli = fake({ threads: [...THREADS, FAILED, REPLIED], store: STORE })
+  const cli = fake({ threads: [...THREADS, FAILED, PARKED], store: STORE })
   const { clock, strip, mount } = await boot($, on, cli)
   await clock.settle()
   await (await strip()).press({ key: NOTICE_KEY })
@@ -150,7 +187,7 @@ test("a narrow strip fits its one row: the project's name goes before the thread
   }
   const ui = await strip(32)
   expect(await fits(ui, 32)).toEqual(['◆ Nexus', '✕ Broken setup  failed'])
-  cli.threads = [...THREADS, FAILED, REPLIED]
+  cli.threads = [...THREADS, FAILED, PARKED]
   await clock.advance(10_000)
   expect(await fits(ui, 32)).toEqual(['◆ Nexus', '✕ 2 threads need you'])
   await ui.unmount()
