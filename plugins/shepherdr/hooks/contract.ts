@@ -47,7 +47,7 @@ export const TOOL_SPEC = {
       machine: { type: 'string', description: 'Machine ID from list; omit for this machine' },
       commands: { type: 'boolean' },
       agent_type: { type: 'string' },
-      label: { type: 'string' },
+      label: { type: 'string', description: 'Tab label, short; required for spawn' },
       name: { type: 'string' },
       placement: { type: 'string', enum: PLACEMENTS },
       workspace: { type: 'string' },
