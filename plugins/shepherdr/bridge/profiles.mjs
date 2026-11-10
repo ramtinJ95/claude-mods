@@ -26,7 +26,7 @@ async function isDirectory(path) {
 }
 
 /** Pi's agent directory, where pi-shepherdr profiles and Pi keybindings live. */
-export function piAgentDir() {
+function piAgentDir() {
 	return process.env.PI_CODING_AGENT_DIR ?? join(homedir(), ".pi", "agent");
 }
 
@@ -188,7 +188,7 @@ async function workerSettings(name, claudeArgs) {
 
 /**
  * The worker's launch arguments. A Pi worker's prompt travels as JSON text
- * for pi-shepherdr's profile flag, which keeps its whitespace through Herdr on
+ * for pi-shepherdr's profile flag, which keeps its whitespace through Core on
  * any machine and places it after the shared project context.
  */
 export async function profileArgs(profile) {

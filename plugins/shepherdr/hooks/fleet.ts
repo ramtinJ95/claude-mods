@@ -1,7 +1,7 @@
 // Watched workers, their settlement and its delivery to the controller.
 //
-// Records are keyed by machine and Herdr terminal ID (pane IDs change on move)
-// and persisted per Claude Code session. Each machine with watched workers has
+// Records are keyed by machine and Core terminal address (`paneId` and
+// `terminalId` are both that address) and persisted per Claude Code session. Each machine with watched workers has
 // its own watcher process, so a change on one machine restarts only that one;
 // each change is reconciled with a bridge `check`. A blocking tool call or an
 // answer being entered leases its worker, so the watcher never reports what
@@ -42,7 +42,7 @@ type SavedState = { watches: Watched[]; orchestration?: Orchestration }
 /** An explicit orchestration choice and the guidance it gave. */
 type Orchestration = { enabled: boolean; guidance: string }
 
-type Machine = { id: string; label: string; enabled: boolean }
+type Machine = { id: string; name: string; state: string }
 
 type Report = {
   record: Watched
@@ -86,15 +86,15 @@ function bodyFor({ record, status, reply, ask }: Report): string[] {
         questionHint(ask),
       ]
     case 'blocked': {
-      const herdr = record.machine ? `herdr --machine ${record.machine}` : 'herdr'
+      const address = record.machine ? `${record.machine}/${record.paneId}` : record.paneId
       return [
-        `Waiting on an approval or dialog. Inspect it with read source:"visible"; respond with send, or use \`${herdr} agent send-keys ${record.paneId} <keys>\` for interactive controls. Tell the user if it needs them.`,
+        `Waiting on an approval or dialog. Inspect it with read source:"visible"; respond with send, or use \`hc keys ${address} <keys>\` for interactive controls. Tell the user if it needs them.`,
       ]
     }
     case 'interrupted':
       return ['Its session changed before the task finished; the watch continues on the new session.']
     case 'closed':
-      return ['The pane closed; its watch ended.']
+      return ['Its terminal closed; its watch ended.']
   }
 }
 
@@ -146,7 +146,9 @@ export class Fleet {
 
   find(target: string, machine?: string): Watched | undefined {
     return [...this.records.values()].find(
-      record => record.machine === machine && (record.paneId === target || record.name === target),
+      record =>
+        (record.machine === machine || (machine !== undefined && record.machineName === machine)) &&
+        (record.paneId === target || record.name === target),
     )
   }
 
@@ -245,7 +247,7 @@ export class Fleet {
 
   /** Restarts monitoring that stopped on any machine; returns a summary for /shepherdr. */
   inspect(machines: readonly Machine[]): string {
-    const labelOf = (id: string) => machines.find(machine => machine.id === id)?.label ?? id
+    const labelOf = (id: string) => machines.find(machine => machine.id === id)?.name ?? id
     const stopped = [...this.watchers].filter(([, watcher]) => watcher.error)
     const problems = stopped.map(
       ([machine, watcher]) =>
@@ -260,9 +262,7 @@ export class Fleet {
           return `${record.name ?? record.paneId} (${record.paneId}${where}) ${record.status ?? 'unknown'}${record.task ? ', task assigned' : ''}`
         })
       : ['Shepherdr watches no agents.']
-    const machineLines = machines.map(
-      machine => `Machine ${machine.label} (${machine.id}): ${machine.enabled ? 'enabled' : 'disabled in Herdr'}`,
-    )
+    const machineLines = machines.map(machine => `Machine ${machine.name} (${machine.id}): ${machine.state}`)
     const mode = `Orchestration: ${this.orchestration?.enabled ? 'on' : 'off'}`
     return [...problems, ...lines, ...machineLines, mode].join('\n')
   }
@@ -361,14 +361,13 @@ export class Fleet {
           if (record.sessionPath !== line.path) continue
           // A background question reports at once, while its worker continues.
           if (line.ask) this.report(this.settle(record, { state: 'question', ask: line.ask }, false))
-          // A working worker writes its transcript continuously; Herdr's status
+          // A working worker writes its transcript continuously; Core's status
           // event marks when it settles, so only settled workers' writes matter.
           else if (record.status !== 'working') this.reconcile(keyOf(record))
         }
         return
       case 'event': {
-        // Moves and closes name the pane by the ID the record knows.
-        const record = records.find(candidate => candidate.paneId === line.pane)
+        const record = records.find(candidate => candidate.terminalId === line.pane)
         if (!record) return
         if (line.status === 'working' || line.status === 'unknown') {
           // Starting work settles nothing.
@@ -461,7 +460,7 @@ export class Fleet {
         report = { record, status: 'blocked' }
         break
     }
-    // A moved pane or new transcript needs the watcher on its new identity.
+    // A new transcript needs the watcher on its new identity.
     const moved = identity[0] !== record.paneId || identity[1] !== record.sessionPath
     if (result.state === 'closed' || moved) this.changed()
     else if (JSON.stringify(record) !== before) {

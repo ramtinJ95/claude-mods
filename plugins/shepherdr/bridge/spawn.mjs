@@ -1,13 +1,17 @@
-// Starts a Pi or Claude Code worker in a new Herdr tab, workspace or existing
-// pane on the machine this runs on.
-import { stat } from "node:fs/promises";
+// Starts a Pi or Claude Code worker in a new Core terminal. The controller's
+// Core runs the terminal (with `on` for another machine), so it is the
+// controller's child and a Herdr window adopts it; the worker's machine
+// resolves its directory and program and waits for it to become ready.
+import { randomUUID } from "node:crypto";
+import { constants } from "node:fs";
+import { access, stat } from "node:fs/promises";
 import { homedir } from "node:os";
-import { resolve } from "node:path";
-import { setTimeout as sleep } from "node:timers/promises";
-import { getAgent, isHerdrErrorCode, request, snapshot } from "./herdr.mjs";
+import { delimiter, resolve } from "node:path";
+import { getAgent, ownTerminal, request, subscribe } from "./core.mjs";
 import { workerFor, workerOfKind } from "./workers/index.mjs";
 
 const AGENT_NAME = /^[a-z][a-z0-9_-]{0,31}$/;
+const READY_TIMEOUT_MS = 30_000;
 
 function slugify(value) {
 	const slug = value
@@ -20,8 +24,8 @@ function slugify(value) {
 	return named.slice(0, 32).replace(/-+$/u, "") || "agent";
 }
 
-function allocateName(agents, label, requested) {
-	const names = new Set(agents.map((agent) => agent.name).filter(Boolean));
+/** A terminal name free among `names`, which Core requires unique among a machine's live terminals. */
+export function allocateName(names, label, requested) {
 	if (requested) {
 		if (!AGENT_NAME.test(requested))
 			throw new Error(
@@ -49,143 +53,157 @@ async function directory(path) {
 	return path;
 }
 
-function resolveWorkspace(workspaces, target) {
-	const direct = workspaces.find((item) => item.workspace_id === target);
-	if (direct) return direct;
-	const matches = workspaces.filter((item) => item.label === target);
-	if (matches.length === 1) return matches[0];
-	throw new Error(
-		matches.length
-			? `workspace label ${target} is ambiguous; use its Herdr ID`
-			: `no Herdr workspace matches ${target}`,
-	);
-}
-
 /**
- * A new tab goes to `workspace` or the controller's own workspace; on a remote
- * machine there is none, so a spawn without `workspace` gets a new workspace.
+ * The program's absolute path on this machine: Core would take a bare name
+ * that matches one of its templates for that template.
  */
-async function createLocation(params, cwd, label, workspaces, controllerWorkspace) {
-	const placement =
-		params.placement ??
-		(params.workspace || controllerWorkspace ? "new_tab" : "new_workspace");
-	if (placement === "pane") return { paneId: params.pane };
-	if (placement === "new_tab") {
-		const workspaceId = params.workspace
-			? resolveWorkspace(workspaces, params.workspace).workspace_id
-			: controllerWorkspace;
-		if (!workspaceId)
-			throw new Error("a new tab on another machine needs workspace");
-		const created = await request("tab.create", {
-			workspace_id: workspaceId,
-			cwd,
-			label,
-			focus: false,
-		});
-		return {
-			paneId: created.root_pane.pane_id,
-			cleanup: { method: "tab.close", params: { tab_id: created.tab.tab_id } },
-		};
-	}
-	if (placement !== "new_workspace")
-		throw new Error("placement must be new_tab, new_workspace or pane");
-	const created = await request("workspace.create", { cwd, focus: false });
-	const cleanup = {
-		method: "workspace.close",
-		params: { workspace_id: created.workspace.workspace_id },
-	};
-	try {
-		await request("tab.rename", { tab_id: created.tab.tab_id, label });
-	} catch (error) {
-		await rollback(cleanup, error);
-	}
-	return { paneId: created.root_pane.pane_id, cleanup };
-}
-
-async function rollback(cleanup, cause) {
-	if (!cleanup) throw cause;
-	try {
-		await request(cleanup.method, cleanup.params);
-	} catch (cleanupError) {
-		throw new Error(
-			`${cause.message}; rollback also failed: ${cleanupError.message}`,
-		);
-	}
-	throw cause;
-}
-
-async function startWhenShellReady(params) {
-	const shellDeadline = Date.now() + 3_000;
-	let started;
-	for (;;) {
+async function executable(name) {
+	for (const folder of (process.env.PATH ?? "").split(delimiter).filter(Boolean)) {
+		const path = resolve(folder, name);
 		try {
-			started = (await request("agent.start", params, 35_000)).agent;
-			break;
+			if (!(await stat(path)).isFile()) continue;
+			await access(path, constants.X_OK);
+			return path;
 		} catch (error) {
-			if (
-				!isHerdrErrorCode(error, "agent_pane_busy") ||
-				Date.now() >= shellDeadline
-			)
-				throw error;
-			await sleep(50);
+			if (!["ENOENT", "EACCES", "ENOTDIR"].includes(error.code)) throw error;
 		}
 	}
-	// Herdr can finish launch before Pi reports its persistent session.
-	const readyDeadline = Date.now() + 30_000;
-	while (Date.now() < readyDeadline) {
-		let current;
-		try {
-			current = await getAgent(params.name);
-		} catch (error) {
-			if (!isHerdrErrorCode(error, "agent_not_found")) throw error;
-			await sleep(100);
-			continue;
-		}
-		if (current.terminal_id !== started.terminal_id)
-			throw new Error(`named agent ${params.name} no longer owns its pane`);
-		if (current.agent_status === "blocked")
-			throw new Error(`agent ${params.name} is blocked during startup`);
-		const settled =
-			current.agent_status === "idle" || current.agent_status === "done";
-		if (settled && current.interactive_ready === true && current.agent) {
-			if (workerFor(current).isReady(current)) return current;
-		} else if (settled && current.launch_pending === false)
-			throw new Error("agent process exited before becoming interactive");
-		await sleep(100);
-	}
-	throw new Error(`timed out waiting for agent ${params.name} to become ready`);
+	throw new Error(`${name} is not on PATH on that machine; install it before spawning`);
 }
 
 /**
- * The worker's directory, resolved on its machine before launch so the
- * profile's preparation runs first. Relative paths start at `fallbackCwd`
+ * The worker's directory and program, resolved on its machine before launch so
+ * the profile's preparation runs first. Relative paths start at `fallbackCwd`
  * locally and at the home directory on a remote machine.
  */
-export async function spawnDirectory(params, fallbackCwd = homedir()) {
-	if (params.placement !== "pane")
-		return directory(resolve(fallbackCwd, params.cwd?.trim() || "."));
-	if (!params.pane) throw new Error("pane is required for placement=pane");
-	if (params.cwd)
-		throw new Error("cwd cannot change an existing pane; omit cwd");
-	const { pane } = await request("pane.get", { pane_id: params.pane });
-	return pane.foreground_cwd || pane.cwd || fallbackCwd;
+export async function launchTarget(params, kind, fallbackCwd = homedir()) {
+	const [cwd, program] = await Promise.all([
+		directory(resolve(fallbackCwd, params.cwd?.trim() || ".")),
+		executable(workerOfKind(kind).executable),
+	]);
+	return { cwd, program };
+}
+
+const newId = (prefix) => `${prefix}${randomUUID().replaceAll("-", "")}`;
+
+/**
+ * Herdr-window placement labels. A tab joins a space a live terminal on the
+ * same Core advertises; without one the worker runs as a background terminal,
+ * which the window lists but does not lay out.
+ */
+function placementLabels(params, spaces, controllerSpace) {
+	const placement =
+		params.placement ?? (params.workspace || controllerSpace ? "new_tab" : "terminal");
+	if (placement === "terminal") return {};
+	if (placement === "new_workspace")
+		return { "herdr.space": newId("sp"), "herdr.tab": newId("tb") };
+	if (placement !== "new_tab")
+		throw new Error("placement must be terminal, new_tab or new_workspace");
+	const space = params.workspace ?? controllerSpace;
+	if (!space) throw new Error("a new tab on another machine needs workspace");
+	if (!spaces.has(space))
+		throw new Error(
+			`no live terminal on that machine is in Herdr space ${space}; use a workspace from list, or placement new_workspace`,
+		);
+	return { "herdr.space": space, "herdr.tab": newId("tb") };
+}
+
+/**
+ * Runs the worker's terminal through this machine's Core: on `machine` (a
+ * Core machine entry) or here. `existing` are the target machine's live
+ * agents. Returns the terminal's address on its own machine.
+ */
+export async function launch({ params, agent, args, target, machine, existing, controllerSpace }) {
+	const label = params.label.trim();
+	const name = allocateName(
+		new Set(existing.map((item) => item.name).filter(Boolean)),
+		label,
+		params.name,
+	);
+	const worker = workerOfKind(agent);
+	const spaces = new Set(existing.map((item) => item.workspace_id).filter(Boolean));
+	const caller = ownTerminal();
+	const started = await request(
+		"terminal.run",
+		{
+			argv: [target.program, ...worker.launchArgs(label, args)],
+			name,
+			cwd: target.cwd,
+			...(machine ? { on: machine.id } : {}),
+			...(caller ? { caller } : {}),
+			// Workers report through Shepherdr, not Core's notes to their parent.
+			no_notify: true,
+			// Workers keep running when the controller exits, as they did in
+			// Herdr tabs; /quit or the user closes them.
+			outlive_parent: true,
+			labels: {
+				...placementLabels(params, spaces, machine ? undefined : controllerSpace),
+				...(worker.launchLabels?.(args) ?? {}),
+			},
+		},
+		30_000,
+	);
+	const address = typeof started?.address === "string" ? started.address.split("/").at(-1) : undefined;
+	if (!address)
+		throw new Error(
+			"Core returned no terminal address for the launch; inspect its terminals before retrying",
+		);
+	return { address, name };
+}
+
+/** Resolves once the worker's terminal hosts a ready worker; rejects when it exits or blocks. */
+async function ready(address) {
+	return new Promise((resolve, reject) => {
+		let done = false;
+		let subscription;
+		const finish = (error, agent) => {
+			if (done) return;
+			done = true;
+			clearTimeout(timer);
+			subscription?.close();
+			if (error) reject(error);
+			else resolve(agent);
+		};
+		const timer = setTimeout(
+			() => finish(new Error(`timed out waiting for ${address} to become ready`)),
+			READY_TIMEOUT_MS,
+		);
+		let chain = Promise.resolve();
+		const inspect = () => {
+			chain = chain
+				.then(async () => {
+					if (done) return;
+					const agent = await getAgent(address);
+					if (!agent.live)
+						throw new Error("agent process exited before becoming interactive");
+					if (agent.agent_status === "blocked")
+						throw new Error(`${address} is blocked during startup`);
+					const settled =
+						agent.agent_status === "idle" || agent.agent_status === "done";
+					if (settled && agent.agent && workerFor(agent).isReady(agent))
+						finish(undefined, agent);
+				})
+				.catch((error) => finish(error));
+		};
+		subscribe({ terminal: address }, inspect, (error) => finish(error)).then(
+			(opened) => {
+				subscription = opened;
+				if (done) opened.close();
+				else inspect();
+			},
+			(error) => finish(error),
+		);
+	});
 }
 
 /**
  * A start that stalls at the folder trust prompt says so: trusting a folder is
  * the user's decision. The adapter's `startupFailure` explains other screens.
  */
-async function startupError(paneId, cwd, worker, error) {
+async function startupError(address, cwd, worker, error) {
 	let screen;
 	try {
-		screen = (
-			await request("pane.read", {
-				pane_id: paneId,
-				source: "visible",
-				lines: 40,
-				strip_ansi: true,
-			})
-		).read?.text;
+		screen = (await request("terminal.read", { terminal: address, lines: 0 })).text;
 	} catch {
 		return error;
 	}
@@ -198,31 +216,17 @@ async function startupError(paneId, cwd, worker, error) {
 }
 
 /**
- * Starts the profile's agent on this machine with the controller's profile
- * arguments. `controllerWorkspace` is set only when the controller runs here.
- * Returns `{ agent, notice? }`, the notice from the adapter's `awaitStartup`.
+ * Waits on this machine for a launched worker to become ready, then for the
+ * adapter's `awaitStartup`. Returns `{ agent, notice? }`; a failure is
+ * explained from the worker's screen, for the controller to roll back.
  */
-export async function startAgent({ params, agent, args: profile, cwd, controllerWorkspace }) {
-	const label = params.label.trim();
-	const { agents, workspaces } = await snapshot();
-	const name = allocateName(agents, label, params.name);
-	const worker = workerOfKind(agent);
-	const args = worker.launchArgs(label, profile);
-	const location = await createLocation(params, cwd, label, workspaces, controllerWorkspace);
+export async function awaitWorker(address, kind, cwd) {
+	const worker = workerOfKind(kind);
 	try {
-		const started = await startWhenShellReady({
-			name,
-			kind: agent,
-			pane_id: location.paneId,
-			args,
-			timeout_ms: 30_000,
-		});
-		const startup = await worker.awaitStartup?.(started);
-		return { agent: started, ...(startup?.notice ? { notice: startup.notice } : {}) };
+		const agent = await ready(address);
+		const startup = await worker.awaitStartup?.(agent);
+		return { agent, ...(startup?.notice ? { notice: startup.notice } : {}) };
 	} catch (error) {
-		return rollback(
-			location.cleanup,
-			await startupError(location.paneId, cwd, worker, error),
-		);
+		throw await startupError(address, cwd, worker, error);
 	}
 }

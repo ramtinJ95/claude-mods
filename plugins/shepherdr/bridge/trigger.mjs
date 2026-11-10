@@ -1,21 +1,14 @@
-// A wake-up for waits: fires on Herdr events and transcript writes, and
+// A wake-up for waits: fires on Core events and transcript writes, and
 // remembers firing between waits so no change is missed.
-import { subscribe, workerSubscriptions } from "./herdr.mjs";
+import { subscribe } from "./core.mjs";
 import { watchSessions } from "./vendor/shepherdr-session-watch.mjs";
 
-/** Fires on the worker's status changes, pane moves and closes, and writes to its transcript. */
-export function workerTrigger(paneId, path) {
-	return openTrigger({
-		subscriptions: workerSubscriptions([paneId]),
-		paths: path ? [path] : [],
-	});
-}
-
 /**
- * @param {{ subscriptions?: object[], paths?: string[] }} sources
+ * Fires on any change Core reports for the worker's terminal (status, exit,
+ * labels) and on writes to its transcript.
  * @returns {Promise<{ next(timeoutMs: number): Promise<void>, close(): void }>}
  */
-export async function openTrigger({ subscriptions = [], paths = [] }) {
+export async function workerTrigger(terminal, path) {
 	let dirty = false;
 	let failure;
 	let wake;
@@ -27,12 +20,10 @@ export async function openTrigger({ subscriptions = [], paths = [] }) {
 		failure = error;
 		wake?.();
 	};
-	const unsubscribe = subscriptions.length
-		? await subscribe(subscriptions, fire, fail)
-		: () => {};
+	const { close: unsubscribe } = await subscribe({ terminal }, fire, fail);
 	let unwatch = () => {};
 	try {
-		if (paths.length) unwatch = watchSessions(paths, fire, fail);
+		if (path) unwatch = watchSessions([path], fire, fail);
 	} catch (error) {
 		unsubscribe();
 		throw error;

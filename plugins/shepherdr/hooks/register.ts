@@ -18,7 +18,7 @@ import { awaitAnswer, takeAnswer } from './worker'
 
 const COMMAND = 'shepherdr'
 
-type Machine = { id: string; label: string; enabled: boolean }
+type Machine = { id: string; name: string; state: string }
 type Profiles = { sources: Record<string, string>; profiles: ProfileSummary[] }
 
 let fleet: { file: string; current: Fleet; ready: Promise<void> } | undefined
@@ -199,6 +199,25 @@ async function handle(bridge: Bridge, current: Fleet, cwd: string, request: Agen
   }
 }
 
+/** The session this Claude Code's Core terminal is labeled with, so its controller finds it. */
+let labeledSession: string | undefined
+
+/**
+ * Worker side: labels this Core terminal with the current session's ID, which
+ * changes on /clear and /resume, so a controller's Shepherdr can find this
+ * session's transcript and send it messages. Outside Core there is nothing to label.
+ */
+async function publishSession($: EngineInterface): Promise<void> {
+  const [terminal, sessionId] = await Promise.all([$.env.get('HC_TERMINAL_ID'), $.session.id()])
+  if (!terminal || labeledSession === sessionId) return
+  try {
+    await call(bridgeOf($), 'label', { sessionId }, 15_000)
+    labeledSession = sessionId
+  } catch (error) {
+    $.ui.toast(`Shepherdr could not publish this session to Herdr Core (${message(error)}); a controller cannot reach it.`)
+  }
+}
+
 /** /shepherdr: status and restart; `orchestrate` or `normal` switches the guidance. */
 async function runCommand(
   $: EngineInterface,
@@ -228,7 +247,7 @@ export const register: Register = on => {
       }),
     ])
     const started = await next(e)
-    await requireFleet($)
+    await Promise.all([requireFleet($), publishSession($)])
     return started
   })
 
@@ -261,7 +280,8 @@ export const register: Register = on => {
   }).catch(() => ({ deny: 'Shepherdr failed to handle the call; retry or call agents with {} for help.' }))
 
   on('turn.start', async ($, e, next) => {
-    await appendAll($, (await requireFleet($)).turnStarted())
+    const [current] = await Promise.all([requireFleet($), publishSession($)])
+    await appendAll($, current.turnStarted())
     return next(e)
   })
 
