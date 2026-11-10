@@ -18,10 +18,13 @@ function firstLine(text: string, max = 80): string {
   return line.length > max ? `${line.slice(0, max - 1)}…` : line
 }
 
+/** A Core machine ID shortened for a row; a machine name as given. */
+const machineLabel = (machine: string) => (/^[0-9a-f]{32}$/.test(machine) ? machine.slice(0, 8) : machine)
+
 /** `target` on `machine`, as the call names them. */
 function where(input: Input): string {
   const machine = str(input['machine'])
-  return `${str(input['target']) ?? ''}${machine ? ` on ${machine.slice(0, 8)}` : ''}`
+  return `${str(input['target']) ?? ''}${machine ? ` on ${machineLabel(machine)}` : ''}`
 }
 
 /** One line saying what the call does. */
@@ -36,7 +39,7 @@ export function callSummary(input: Input): string {
     }
     case 'spawn': {
       const machine = str(input['machine'])
-      return `spawn ${str(input['agent_type'])} "${str(input['label'])}"${machine ? ` on ${machine.slice(0, 8)}` : ''}: ${firstLine(str(input['message']) ?? '', 60)}`
+      return `spawn ${str(input['agent_type'])} "${str(input['label'])}"${machine ? ` on ${machineLabel(machine)}` : ''}: ${firstLine(str(input['message']) ?? '', 60)}`
     }
     case 'assign':
     case 'send':
@@ -155,7 +158,7 @@ export function ReportRows(draw: Draw, reports: readonly Report[]) {
             <Text>
               <Text bold color={STATUS_COLOR[report.status] ?? 'text'}>{report.status}</Text>
               <Text>{`  ${report.name ?? report.target}`}</Text>
-              <Text dimColor>{`  ${report.target}${report.machine ? ` on ${report.machine.slice(0, 8)}` : ''}`}</Text>
+              <Text dimColor>{`  ${report.target}${report.machine ? ` on ${machineLabel(report.machine)}` : ''}`}</Text>
             </Text>
             {task && <Text dimColor>{firstLine(task, 120)}</Text>}
             {report.status === 'question' ? questionBody(draw, rest) : rest ? <Markdown text={rest} /> : null}

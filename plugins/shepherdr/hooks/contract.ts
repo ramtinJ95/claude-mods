@@ -4,7 +4,7 @@ export const TOOL_NAME = 'agents'
 
 const ACTIONS = ['help', 'list', 'spawn', 'send', 'assign', 'answer', 'read', 'watch', 'unwatch'] as const
 const STATUSES = ['idle', 'working', 'blocked', 'done', 'unknown'] as const
-const PLACEMENTS = ['new_tab', 'new_workspace', 'pane'] as const
+const PLACEMENTS = ['new_tab', 'new_workspace', 'terminal'] as const
 const SOURCES = ['latest', 'visible', 'recent'] as const
 
 export type Action = (typeof ACTIONS)[number]
@@ -12,7 +12,7 @@ export type Action = (typeof ACTIONS)[number]
 const FIELDS: Record<Action, readonly string[]> = {
   help: ['commands', 'target', 'machine'],
   list: ['machine', 'query', 'status'],
-  spawn: ['machine', 'agent_type', 'label', 'name', 'placement', 'workspace', 'pane', 'cwd', 'message', 'base', 'blocking'],
+  spawn: ['machine', 'agent_type', 'label', 'name', 'placement', 'workspace', 'cwd', 'message', 'base', 'blocking'],
   send: ['machine', 'target', 'message'],
   assign: ['machine', 'target', 'message', 'blocking'],
   answer: ['machine', 'target', 'ask_id', 'answers', 'blocking'],
@@ -36,22 +36,21 @@ const REQUIRED: Record<Action, readonly string[]> = {
 export const TOOL_SPEC = {
   name: TOOL_NAME,
   description:
-    'Spawn, delegate to and monitor Pi and Claude Code agents running in Herdr. Call with {} first for profiles and rules.',
+    'Spawn, delegate to and monitor Pi and Claude Code agents running in Herdr Core terminals. Call with {} first for profiles and rules.',
   isDeferred: false,
   inputSchema: {
     type: 'object',
     additionalProperties: false,
     properties: {
       action: { type: 'string', enum: ACTIONS },
-      target: { type: 'string', description: 'Agent name or pane ID' },
-      machine: { type: 'string', description: 'Machine ID from list; omit for this machine' },
+      target: { type: 'string', description: 'Agent name or terminal address' },
+      machine: { type: 'string', description: 'Machine name or ID from list; omit for this machine' },
       commands: { type: 'boolean' },
       agent_type: { type: 'string' },
       label: { type: 'string' },
       name: { type: 'string' },
       placement: { type: 'string', enum: PLACEMENTS },
-      workspace: { type: 'string' },
-      pane: { type: 'string' },
+      workspace: { type: 'string', description: 'Herdr space ID from list' },
       cwd: { type: 'string' },
       message: { type: 'string' },
       base: { type: 'string', description: 'Review base branch' },
@@ -88,7 +87,6 @@ export type AgentsRequest = {
   name?: string
   placement?: (typeof PLACEMENTS)[number]
   workspace?: string
-  pane?: string
   cwd?: string
   message?: string
   base?: string
@@ -162,7 +160,7 @@ export function helpText(profiles: { sources: Record<string, string>; profiles: 
     requests: {
       list: '{action:"list", machine?, query?, status?} — this machine and every connected machine unless machine is given',
       commands: '{commands:true, target, machine?} — the slash commands that agent accepts',
-      spawn: '{action:"spawn", agent_type, label (short, 2 words when useful), message, cwd?, placement?: new_tab|new_workspace|pane, workspace?, pane?, name?, base?, blocking?}',
+      spawn: '{action:"spawn", agent_type, label (short, 2 words when useful), message, cwd?, placement?: new_tab|new_workspace|terminal, workspace?, name?, base?, blocking?} — a new tab beside this session by default, in workspace (a space ID from list) when given; terminal runs it in the background',
       send: '{action:"send", target, message}',
       assign: '{action:"assign", target, message, blocking?}',
       answer: '{action:"answer", target, ask_id, answers: [{selections?: [choice label], other?, comment?}] one per prompt in order, blocking?}',
@@ -176,10 +174,10 @@ export function helpText(profiles: { sources: Record<string, string>; profiles: 
       'send delivers input without waiting or watching; use assign only for work whose result you need',
       'Give each worker a distinct scope, desired outcome, relevant project context and issue references. Describe success rather than lists of forbidden investigations',
       'Reuse an agent only for the same investigation; keep reviews independent; a new scope gets a new agent',
-      'Delegation and watch keep reporting later work until unwatch or the pane closes',
+      'Delegation and watch keep reporting later work until unwatch or the terminal closes',
       'A question report carries its ask_id and prompts; answer it with answer, asking the user first when the choice is theirs. A background question does not stop the worker, and answering it does not wait for its task',
       'Messages starting with / run as the worker\'s slash commands without a watch; list them first with commands:true',
-      'Agents on another machine need its machine ID from list with every request; omit machine for this one. Claude Code agents work on this machine only',
+      'Agents on another machine need its machine name or ID from list with every request; omit machine for this one. Claude Code agents work on this machine only',
       'For work in this repository, create a dedicated worktree and pass it as cwd',
       'Close finished workers by sending "/quit"; do not send acknowledgements',
     ],

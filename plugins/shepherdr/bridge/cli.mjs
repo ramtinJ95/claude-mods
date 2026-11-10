@@ -3,18 +3,22 @@
 // { ok: false, error }. The hooks side validates request fields; `budgetMs`
 // is how long the caller waits, so nested work fits inside it.
 //
-// Controller operations run here, beside Claude Code: they own the sender
-// identity, profiles and preparation. Each hands its worker-side part to a
-// machine operation, run in this process for this machine or by this same
-// file on a remote machine over SSH (`machine.*` ops, `--session`).
+// Controller operations run here, beside Claude Code in a Core terminal: they
+// own the sender identity, profiles, preparation and launches. Each hands its
+// worker-side part to a machine operation, run in this process for this
+// machine or by this same file on a remote machine through `hc exec`
+// (`machine.*` ops), which reaches that machine's Core with `hc connect`.
 import { hostname } from "node:os";
 import {
 	agentSummary,
-	currentPane,
+	CLAUDE_SESSION_LABEL,
+	closeTerminal,
+	coreIdentity,
 	getAgent,
+	localAgents,
+	ownTerminal,
 	request,
-	snapshot,
-} from "./herdr.mjs";
+} from "./core.mjs";
 import { catalog, remoteCall, resolveMachine } from "./machines.mjs";
 import {
 	listProfiles,
@@ -23,9 +27,9 @@ import {
 	profileArgs,
 } from "./profiles.mjs";
 import { check, wait } from "./settle.mjs";
-import { spawnDirectory, startAgent } from "./spawn.mjs";
+import { awaitWorker, launch, launchTarget } from "./spawn.mjs";
 import { workerTrigger } from "./trigger.mjs";
-import { isWorker, workerFor, workerOfKind } from "./workers/index.mjs";
+import { workerFor, workerOfKind } from "./workers/index.mjs";
 
 const DELEGATED_WORKER_GUIDANCE =
 	"If blocked mid-run, use a question-asking tool, not peer messages. Without one, end with the blocker. Finish with an assistant reply, not a separate send report; never watch your parent.";
@@ -46,23 +50,19 @@ function xml(value) {
 		.replaceAll("\r", "&#13;");
 }
 
-function labels(snap, agent) {
-	const workspace = snap.workspaces.find(
-		(item) => item.workspace_id === agent.workspace_id,
-	)?.label;
-	const tab = snap.tabs.find((item) => item.tab_id === agent.tab_id)?.label;
-	return {
-		...(workspace ? { workspace_name: workspace } : {}),
-		...(tab ? { tab_name: tab } : {}),
-	};
-}
-
 async function resolveWorker(target) {
 	const agent = await getAgent(target);
-	if (agent.pane_id === process.env.HERDR_PANE_ID)
+	if (agent.terminal_id === ownTerminal())
 		throw new Error("refusing to target this Claude Code session");
+	if (!agent.live) throw new Error(`${agent.pane_id} has finished; nothing runs there`);
 	return { agent, worker: workerFor(agent) };
 }
+
+/** A listed agent: its summary and the Herdr space a new tab can join. */
+const listed = (agent) => ({
+	...agentSummary(agent),
+	...(agent.workspace_id ? { workspace: agent.workspace_id } : {}),
+});
 
 async function recordFor(agent, worker, pendingWork) {
 	const path = worker.sessionPath(agent);
@@ -87,26 +87,33 @@ async function deliver(target, message, kind) {
 	return { agent: agentSummary(agent), ...(record ? { record } : {}), ...receipt };
 }
 
-/** Worker-side operations; they never touch the controller's pane. */
+/** Worker-side operations; they never touch the controller's terminal. */
 const MACHINE_OPS = {
 	async "machine.list"({ status }) {
-		const snap = await snapshot();
-		return snap.agents
-			.filter((agent) => agent.pane_id !== process.env.HERDR_PANE_ID)
+		// Only Pi and Claude Code workers report what a worker needs.
+		return (await localAgents())
+			.filter((agent) => agent.agent && agent.terminal_id !== ownTerminal())
 			.filter((agent) => !status || agent.agent_status === status)
-			.map((agent) => ({
-				...agentSummary(agent),
-				...labels(snap, agent),
-				...(isWorker(agent) ? {} : { unsupported: true }),
-			}));
+			.map(listed);
 	},
-	"machine.directory"({ params, fallbackCwd }) {
-		return spawnDirectory(params, fallbackCwd);
+	/** The worker's directory and program, and the names and spaces live here. */
+	async "machine.target"({ params, kind, fallbackCwd }) {
+		const [target, agents] = await Promise.all([
+			launchTarget(params, kind, fallbackCwd),
+			localAgents(),
+		]);
+		return {
+			...target,
+			agents: agents.map(({ name, workspace_id }) => ({
+				...(name ? { name } : {}),
+				...(workspace_id ? { workspace_id } : {}),
+			})),
+		};
 	},
-	/** Starts the worker and delivers its first task in one call. */
-	async "machine.start"({ message, ...start }) {
-		const { agent, notice } = await startAgent(start);
-		const delivered = await deliver(agent.pane_id, message, "task");
+	/** Waits for a launched worker, then delivers its first task. */
+	async "machine.started"({ address, kind, cwd, message }) {
+		const { agent, notice } = await awaitWorker(address, kind, cwd);
+		const delivered = await deliver(agent.terminal_id, message, "task");
 		return notice ? { ...delivered, notice } : delivered;
 	},
 	"machine.deliver"({ target, message, kind }) {
@@ -151,7 +158,7 @@ const MACHINE_OPS = {
 	/** Waits for the worker to record answers sent through its session. */
 	async "machine.answered"({ target, ask_id: askId, answers }, deadline) {
 		const { agent, worker } = await resolveWorker(target);
-		const trigger = await workerTrigger(agent.pane_id, worker.sessionPath(agent));
+		const trigger = await workerTrigger(agent.terminal_id, worker.sessionPath(agent));
 		try {
 			const recordBy = Math.min(deadline - MARGIN_MS, Date.now() + ANSWER_RECORD_MS);
 			for (;;) {
@@ -184,18 +191,22 @@ const MACHINE_OPS = {
 				...(view.ask ? { ask: view.ask } : {}),
 			};
 		}
-		const result = await request("agent.read", {
-			target: agent.pane_id,
-			source: source === "recent" ? "recent_unwrapped" : "visible",
-			lines,
-		});
-		return { agent: agentSummary(agent), text: result.read?.text ?? result };
+		const result = await request(
+			"terminal.read",
+			{ terminal: agent.terminal_id, lines: source === "recent" ? lines : 0 },
+			30_000,
+		);
+		return {
+			agent: agentSummary(agent),
+			text: result.text,
+			...(result.complete === false ? { incomplete: result.why ?? true } : {}),
+		};
 	},
 };
 
 /**
- * Runs a machine operation: here for this machine (`machine` undefined), over
- * SSH for a catalog entry. A remote record comes back tagged with its machine,
+ * Runs a machine operation: here for this machine (`machine` undefined),
+ * through `hc exec` for a catalog entry. A remote record comes back tagged with its machine,
  * which keys it beside its terminal.
  */
 async function onMachine(machine, op, params, deadline) {
@@ -204,31 +215,37 @@ async function onMachine(machine, op, params, deadline) {
 	// Claude Code's session messages reach only sessions on this machine.
 	if (result?.session) throw new Error(REMOTE_CLAUDE);
 	return result?.record
-		? { ...result, record: { ...result.record, machine: machine.id } }
+		? {
+				...result,
+				record: { ...result.record, machine: machine.id, machineName: machine.name },
+			}
 		: result;
 }
 
 /** The catalog entry for a request's machine, or undefined for this one. */
 const machineEntry = (id) => (id ? resolveMachine(id) : undefined);
 
-/** This Claude Code pane and the local Herdr snapshot. */
+/** This Claude Code terminal and its Core's identity. */
 async function controller() {
-	const [pane, snap] = await Promise.all([currentPane(), snapshot()]);
-	return { pane, snap };
+	const terminal = ownTerminal();
+	if (!terminal)
+		throw new Error(
+			"Claude Code is not running in a Herdr Core terminal; start it from the Herdr app or with hc",
+		);
+	const [pane, core] = await Promise.all([getAgent(terminal), coreIdentity()]);
+	return { pane, core };
 }
 
-function attribute({ pane, snap }, text, kind) {
-	const paneName = pane.label || pane.title;
+function attribute({ pane, core }, text, kind) {
 	const source = {
 		kind,
 		host: hostname(),
-		session: process.env.HERDR_SESSION || "default",
-		pane: pane.pane_id,
-		workspace: pane.workspace_id,
-		tab: pane.tab_id,
+		machine: core.id,
+		terminal: pane.terminal_id,
+		...(pane.workspace_id ? { workspace: pane.workspace_id } : {}),
+		...(pane.tab_id ? { tab: pane.tab_id } : {}),
 		...(pane.name ? { name: pane.name } : {}),
-		...(paneName ? { pane_name: paneName } : {}),
-		...labels(snap, pane),
+		...(pane.title ? { pane_name: pane.title } : {}),
 	};
 	const attributes = Object.entries(source)
 		.map(([key, value]) => `${key}="${xml(value)}"`)
@@ -241,21 +258,28 @@ function attribute({ pane, snap }, text, kind) {
 }
 
 const CONTROLLER_OPS = {
+	/** A worker's own Shepherdr publishing its session on its terminal, so its controller finds it. */
+	async label({ sessionId }) {
+		const terminal = ownTerminal();
+		if (!terminal) return { labeled: false };
+		await request("terminal.label", {
+			terminal,
+			labels: { [CLAUDE_SESSION_LABEL]: sessionId },
+		});
+		return { labeled: true };
+	},
 	profiles() {
 		return listProfiles();
 	},
 	async machines() {
-		return (await catalog()).map(({ id, label, enabled }) => ({
-			id,
-			label,
-			enabled,
-		}));
+		return (await catalog()).map(({ id, name, state }) => ({ id, name, state }));
 	},
-	/** Agents on one machine, or on this one and every enabled remote machine. */
+	/** Agents on one machine, or on this one and every connected remote machine. */
 	async list({ machine, query, status }, deadline) {
+		const machines = machine ? [] : await catalog();
 		const sources = machine
 			? [await resolveMachine(machine)]
-			: [undefined, ...(await catalog()).filter((entry) => entry.enabled)];
+			: [undefined, ...machines.filter((entry) => entry.state === "connected")];
 		const results = await Promise.allSettled(
 			sources.map((source) =>
 				onMachine(source, "machine.list", { status }, deadline),
@@ -266,7 +290,7 @@ const CONTROLLER_OPS = {
 		const unavailable = [];
 		results.forEach((result, index) => {
 			const source = sources[index];
-			const where = source ? { machine: source.id, machine_name: source.label } : {};
+			const where = source ? { machine: source.id, machine_name: source.name } : {};
 			if (result.status === "rejected")
 				unavailable.push({ ...where, error: result.reason.message });
 			else
@@ -283,43 +307,71 @@ const CONTROLLER_OPS = {
 								: {}),
 						});
 		});
+		for (const entry of machines)
+			if (entry.state !== "connected")
+				unavailable.push({
+					machine: entry.id,
+					machine_name: entry.name,
+					error: `${entry.state} in Herdr`,
+				});
 		return { agents, ...(unavailable.length ? { unavailable } : {}) };
 	},
 	async spawn(params, deadline) {
 		const machine = await machineEntry(params.machine);
 		const profile = await loadProfile(params.agent_type.trim());
 		if (machine && workerOfKind(profile.agent).localOnly) throw new Error(REMOTE_CLAUDE);
-		const [context, cwd] = await Promise.all([
+		const [context, target] = await Promise.all([
 			controller(),
 			onMachine(
 				machine,
-				"machine.directory",
-				{ params, ...(machine ? {} : { fallbackCwd: params.fallbackCwd }) },
+				"machine.target",
+				{
+					params,
+					kind: profile.agent,
+					...(machine ? {} : { fallbackCwd: params.fallbackCwd }),
+				},
 				deadline,
 			),
 		]);
 		const [task, args] = await Promise.all([
 			prepareMessage(profile, {
-				cwd,
+				cwd: target.cwd,
 				message: params.message,
 				base: params.base,
 				local: !machine,
 			}),
 			profileArgs(profile),
 		]);
-		const delivery = await onMachine(
+		const { address } = await launch({
+			params,
+			agent: profile.agent,
+			args,
+			target,
 			machine,
-			"machine.start",
-			{
-				params,
-				agent: profile.agent,
-				args,
-				cwd,
-				message: attribute(context, task, "task"),
-				...(machine ? {} : { controllerWorkspace: context.pane.workspace_id }),
-			},
-			deadline,
-		);
+			existing: target.agents,
+			controllerSpace: context.pane.workspace_id,
+		});
+		let delivery;
+		try {
+			delivery = await onMachine(
+				machine,
+				"machine.started",
+				{
+					address,
+					kind: profile.agent,
+					cwd: target.cwd,
+					message: attribute(context, task, "task"),
+				},
+				deadline,
+			);
+		} catch (error) {
+			try {
+				await closeTerminal(machine ? `${machine.id}/${address}` : address);
+			} catch (cleanup) {
+				throw new Error(`${error.message}; closing its terminal also failed: ${cleanup.message}`);
+			}
+			throw error;
+		}
 		return {
 			...delivery,
 			...(profile.blocking === undefined

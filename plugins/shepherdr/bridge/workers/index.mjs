@@ -1,11 +1,12 @@
-// Worker adapters by Herdr agent kind. Each exports kind, program (its display
-// name), localOnly?, launchArgs(label, profileArgs), sessionPath(agent),
+// Worker adapters by agent kind. Each exports kind, program (its display
+// name), executable (its command), localOnly?, launchArgs(label, profileArgs), launchLabels?(args)
+// (Core labels spawn sets on the worker's terminal), sessionPath(agent),
 // isReady(agent), view(agent) -> SessionView, deliver(agent, message),
 // commands(agent), answer(agent, askId, answers) -> { status?, background?,
 // session? }, answerStatus(agent, askId, answers) and optional
 // awaitStartup(agent) -> { notice? }, which spawn awaits before delivering the
 // first task; a notice says why that task may take a fallback route. Optional
-// startupFailure(screen) -> message? explains a pane where a spawn failed.
+// startupFailure(screen) -> message? explains a terminal where a spawn failed.
 // view().ask is { toolCallId, delivery?: "steer", prompts: [{ title, body?,
 // multiple, choices }] }, where "steer" marks a question asked while the worker
 // continues; answers are [{ selections?, other?, comment? }] in prompt order,
@@ -31,11 +32,7 @@ export function workerFor(agent) {
 	return adapter;
 }
 
-/** The adapter for a Herdr agent kind or a profile's `agent`; undefined for others. */
+/** The adapter for an agent kind or a profile's `agent`; undefined for others. */
 export function workerOfKind(kind) {
 	return ADAPTERS.get(kind);
-}
-
-export function isWorker(agent) {
-	return ADAPTERS.has(agent.agent);
 }

@@ -1,39 +1,38 @@
 // Settlement: what a watched worker's state means for its controller.
 //
-// A record is { terminalId, paneId, sessionPath?, seenInputId }. seenInputId is
-// the latest worker input the controller already accounted for; a settled
-// worker whose latest input differs has finished new work.
-import {
-	agentByTerminal,
-	agentSummary,
-	getAgent,
-	isHerdrErrorCode,
-	snapshot,
-} from "./herdr.mjs";
+// A record is { terminalId, paneId, sessionPath?, seenInputId }, both IDs the
+// worker's Core terminal address on its machine. seenInputId is the latest
+// worker input the controller already accounted for; a settled worker whose
+// latest input differs has finished new work.
+import { agentSummary, getAgent, isCoreError } from "./core.mjs";
 import { workerTrigger } from "./trigger.mjs";
 import { workerFor } from "./workers/index.mjs";
 
-// Herdr can report a settled status before the worker writes its reply.
+// A worker can report a settled status before it writes its reply.
 const REPLY_GRACE_MS = 5_000;
 
+/** The worker's terminal while it lives; undefined once it finished or was removed. */
 async function locate(record) {
 	try {
-		const agent = await getAgent(record.paneId);
-		if (agent.terminal_id === record.terminalId) return agent;
+		const agent = await getAgent(record.terminalId);
+		return agent.live ? agent : undefined;
 	} catch (error) {
-		if (!isHerdrErrorCode(error, "agent_not_found")) throw error;
+		if (isCoreError(error, "not_found")) return undefined;
+		throw error;
 	}
-	return agentByTerminal((await snapshot()).agents, record.terminalId);
 }
 
 /**
- * states: closed | replaced (new transcript in the same pane) | working |
+ * states: closed | replaced (new transcript in the same terminal) | working |
  * idle (nothing new) | replying (settled, reply not yet written) | done |
  * question | blocked
  */
 async function inspect(record) {
 	const agent = await locate(record);
 	if (!agent) return { state: "closed" };
+	// Pi clears its status and session label between sessions (/new,
+	// /resume); the next session publishes them again.
+	if (!agent.agent) return { state: "working", agent };
 	const worker = workerFor(agent);
 	const path = worker.sessionPath(agent);
 	const status = agent.agent_status;
@@ -79,7 +78,7 @@ export async function check(record, trigger) {
 	const own =
 		trigger ??
 		(await workerTrigger(
-			result.agent.pane_id,
+			result.agent.terminal_id,
 			workerFor(result.agent).sessionPath(result.agent),
 		));
 	try {
@@ -99,17 +98,16 @@ export async function check(record, trigger) {
 /** Waits until the worker settles new work, asks, blocks or closes, or `deadline` passes. */
 export async function wait(record, deadline) {
 	let current = { ...record };
-	let trigger = await workerTrigger(current.paneId, current.sessionPath);
+	let trigger = await workerTrigger(current.terminalId, current.sessionPath);
 	try {
 		for (;;) {
 			const result = await check(current, trigger);
 			if (result.state !== "working" && result.state !== "idle") return result;
-			const paneId = result.agent?.target ?? current.paneId;
 			const sessionPath = result.sessionPath ?? current.sessionPath;
-			if (paneId !== current.paneId || sessionPath !== current.sessionPath) {
-				current = { ...current, paneId, sessionPath };
+			if (sessionPath !== current.sessionPath) {
+				current = { ...current, sessionPath };
 				trigger.close();
-				trigger = await workerTrigger(current.paneId, current.sessionPath);
+				trigger = await workerTrigger(current.terminalId, current.sessionPath);
 				continue;
 			}
 			const remaining = deadline - Date.now();

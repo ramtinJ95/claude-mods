@@ -1,56 +1,61 @@
-// Remote machines: Herdr's SSH machine catalog, and running bridge scripts on
-// a machine over noninteractive SSH. The bridge's files are copied once per
-// version to ~/.local/share/claude-shepherdr/bridge/<version>/ on the machine;
-// OpenSSH owns authentication and nothing stays running between operations.
-// Callers resolve a machine once and pass the catalog entry along.
-import { execFile, spawn } from "node:child_process";
+// Remote machines: Herdr Core's machine catalog, and running bridge scripts
+// on a machine through Core (`hc exec --on`), which owns the connection and
+// its authentication. The bridge's files are copied once per version to
+// ~/.local/share/claude-shepherdr/bridge/<version>/ on the machine; nothing
+// stays running between operations. Callers resolve a machine once and pass
+// the catalog entry along.
+import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
 import { mkdir, readdir, readFile, rm, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { dirname, join, relative } from "node:path";
 import { fileURLToPath } from "node:url";
-import { promisify } from "node:util";
-import { isSessionName } from "./herdr.mjs";
+import { hcBinary, request } from "./core.mjs";
 
 const BRIDGE_DIR = dirname(fileURLToPath(import.meta.url));
 const MAX_OUTPUT_BYTES = 8 * 1024 * 1024;
 /** Where a machine keeps installed bridge versions, under its home directory. */
 const REMOTE_BRIDGE = [".local", "share", "claude-shepherdr", "bridge"];
+// Core ends an exec after ten minutes at most.
+const LONGEST_EXEC_S = 600;
 
-/** Herdr's saved SSH machines by opaque profile ID, from the host running Claude Code. */
+/** The machines added to this Core: `{ id, name, host, state, session }`. */
 export async function catalog() {
-	const binary = process.env.HERDR_BIN_PATH?.trim() || "herdr";
-	const { stdout } = await promisify(execFile)(
-		binary,
-		["machine", "list", "--json"],
-		{ timeout: 10_000, maxBuffer: 1024 * 1024, encoding: "utf8" },
-	);
-	const machines = JSON.parse(stdout);
+	const machines = (await request("machine.list", {}, 15_000))?.machines;
 	if (
 		!Array.isArray(machines) ||
-		!machines.every(
-			(machine) =>
-				/^[a-f0-9]{32}$/.test(machine?.id) &&
-				typeof machine.label === "string" &&
-				typeof machine.target === "string" &&
-				!machine.target.startsWith("-") &&
-				isSessionName(machine.session) &&
-				typeof machine.enabled === "boolean",
+		!machines.every((machine) =>
+			["id", "name", "host", "state"].every(
+				(field) => typeof machine?.[field] === "string" && machine[field],
+			),
 		)
 	)
-		throw new Error("Herdr machine list returned an invalid catalog");
-	return machines;
+		throw new Error("Core machine.list returned an invalid catalog");
+	return machines.map(({ id, name, host, state, session }) => ({
+		id,
+		name,
+		host,
+		state,
+		session: typeof session === "string" && session ? session : "default",
+	}));
 }
 
-/** The enabled catalog entry for a machine ID. */
-export async function resolveMachine(id) {
-	const machine = (await catalog()).find((candidate) => candidate.id === id);
+/** The connected catalog entry for a machine's stable ID or exact current name. */
+export async function resolveMachine(selector) {
+	const machines = await catalog();
+	const byId = machines.find((machine) => machine.id === selector);
+	const byName = machines.filter((machine) => machine.name === selector);
+	if (!byId && byName.length > 1)
+		throw new Error(`machine name ${selector} is ambiguous; use its ID from list`);
+	const machine = byId ?? byName[0];
 	if (!machine)
 		throw new Error(
-			`unknown machine ${id}; use the machine ID that list returns, not its label`,
+			`unknown machine ${selector}; use a machine name or ID that list returns`,
 		);
-	if (!machine.enabled)
-		throw new Error(`machine ${machine.label} is disabled in Herdr`);
+	if (machine.state !== "connected")
+		throw new Error(
+			`machine ${machine.name} is ${machine.state}; reconnect it in Herdr (hc machine ls) and retry`,
+		);
 	return machine;
 }
 
@@ -75,8 +80,6 @@ function bundle() {
 	})();
 	return bundled;
 }
-
-const shellQuote = (value) => `'${value.replaceAll("'", `'"'"'`)}'`;
 
 // Runs on the machine: writes the bundle into a fresh directory, then renames
 // it into place, so a version directory is either complete or absent.
@@ -104,33 +107,45 @@ process.stdin.on("end", () => void (async () => {
 })().catch((error) => { process.stderr.write(error.message + "\n"); process.exit(1); }));
 `;
 
-/** Spawns `command` on the machine; stdout and stdin stay the caller's. */
-function sshChild(machine, command) {
+/** Runs `argv` on the machine through Core; stdout and stdin stay the caller's. */
+function execChild(machine, argv, timeoutS) {
 	return spawn(
-		"ssh",
-		["-T", "-o", "BatchMode=yes", "--", machine.target, command],
+		hcBinary(),
+		[
+			"exec",
+			"--on",
+			machine.id,
+			"--timeout",
+			String(Math.min(LONGEST_EXEC_S, Math.max(1, Math.ceil(timeoutS)))),
+			// The bridge there reaches this session's Core with `hc connect`.
+			"--env",
+			`HC_SESSION=${machine.session}`,
+			"-i",
+			"--",
+			...argv,
+		],
 		{ stdio: ["pipe", "pipe", "pipe"] },
 	);
 }
 
-/** A bridge script of `version` on the machine, run against its Herdr session. */
-function bridgeCommand(machine, version, script) {
-	const path = [...REMOTE_BRIDGE, version, script].join("/");
-	return `exec node "$HOME"/${path} --session ${shellQuote(machine.session)}`;
-}
+/** A bridge script of `version` on the machine; relative paths start at its home. */
+const bridgeArgv = (version, script) => [
+	"node",
+	[...REMOTE_BRIDGE, version, script].join("/"),
+];
 
-/** Runs `command` with `input`, collecting its output, until `deadline`. */
-function ssh(machine, command, input, deadline) {
+/** Runs `argv` on the machine with `input`, collecting its output, until `deadline`. */
+export function execOn(machine, argv, input, deadline) {
 	return new Promise((resolve, reject) => {
-		const child = sshChild(machine, command);
+		const child = execChild(machine, argv, (deadline - Date.now()) / 1000);
 		let stdout = "";
 		let stderr = "";
 		const timer = setTimeout(
 			() => {
 				child.kill();
-				reject(new Error(`${machine.label} did not answer in time`));
+				reject(new Error(`${machine.name} did not answer in time`));
 			},
-			Math.max(1, deadline - Date.now()),
+			Math.max(1, deadline - Date.now() + 2_000),
 		);
 		child.stdout.on("data", (chunk) => {
 			stdout += chunk;
@@ -143,8 +158,8 @@ function ssh(machine, command, input, deadline) {
 			clearTimeout(timer);
 			reject(error);
 		});
-		// ssh that exits before reading its input (host down, key refused)
-		// breaks the pipe; its exit code and stderr, reported on close, say why.
+		// hc that exits before reading its input breaks the pipe; its exit code
+		// and stderr, reported on close, say why.
 		child.stdin.on("error", () => {});
 		child.on("close", (code) => {
 			clearTimeout(timer);
@@ -165,15 +180,15 @@ async function ensureInstalled(machine, deadline) {
 	const marker = deployedMarker(machine, version);
 	if (await readFile(marker).then(() => true, () => false))
 		return { version, marker };
-	const result = await ssh(
+	const result = await execOn(
 		machine,
-		`node -e ${shellQuote(INSTALL_SOURCE)}`,
+		["node", "-e", INSTALL_SOURCE],
 		JSON.stringify({ root: REMOTE_BRIDGE, version, files }),
 		deadline,
 	);
 	if (result.code !== 0)
 		throw new Error(
-			`could not install the Shepherdr bridge on ${machine.label}: ${result.stderr.trim() || `ssh exited ${result.code}`}`,
+			`could not install the Shepherdr bridge on ${machine.name}: ${result.stderr.trim() || `hc exec exited ${result.code}`} (the bridge needs Node.js on that machine's PATH)`,
 		);
 	await mkdir(dirname(marker), { recursive: true });
 	await writeFile(marker, "");
@@ -187,9 +202,9 @@ async function ensureInstalled(machine, deadline) {
  */
 export async function remoteCall(machine, op, params, deadline, marginMs) {
 	const { version, marker } = await ensureInstalled(machine, deadline);
-	const result = await ssh(
+	const result = await execOn(
 		machine,
-		bridgeCommand(machine, version, "cli.mjs"),
+		bridgeArgv(version, "cli.mjs"),
 		JSON.stringify({ op, ...params, budgetMs: deadline - Date.now() - marginMs }),
 		deadline,
 	);
@@ -202,21 +217,33 @@ export async function remoteCall(machine, op, params, deadline, marginMs) {
 		if (/Cannot find module/.test(result.stderr))
 			await rm(marker, { force: true });
 		throw new Error(
-			`${machine.label} bridge failed: ${result.stderr.trim() || `ssh exited ${result.code}`}`,
+			`${machine.name} bridge failed: ${result.stderr.trim() || `hc exec exited ${result.code}`}`,
 		);
 	}
 	if (!reply.ok) throw new Error(reply.error.message);
 	return reply.result;
 }
 
-/** Starts the machine's watcher; the caller reads its stdout lines. */
-export async function spawnRemoteWatcher(machine, targets) {
-	const { version } = await ensureInstalled(machine, Date.now() + 60_000);
-	const child = sshChild(machine, bridgeCommand(machine, version, "watch.mjs"));
-	// A connection that closes early breaks this pipe; the caller's close
-	// handler reports why, from ssh's exit code and stderr.
-	child.stdin.on("error", () => {});
-	// Kept open: the remote watcher exits when it closes with this connection.
-	child.stdin.write(`${JSON.stringify({ targets })}\n`);
-	return child;
+/**
+ * Runs the machine's transcript watcher once: it returns when a watched
+ * transcript changes or its time runs out, with one JSON line per change.
+ */
+export async function watchOnce(machine, input, deadline) {
+	const { version, marker } = await ensureInstalled(machine, deadline);
+	const result = await execOn(
+		machine,
+		bridgeArgv(version, "watch.mjs"),
+		JSON.stringify(input),
+		deadline,
+	);
+	if (result.code !== 0) {
+		if (/Cannot find module/.test(result.stderr)) await rm(marker, { force: true });
+		throw new Error(
+			`${machine.name} watcher failed: ${result.stderr.trim() || `hc exec exited ${result.code}`}`,
+		);
+	}
+	return result.stdout
+		.split("\n")
+		.filter(Boolean)
+		.map((line) => JSON.parse(line));
 }

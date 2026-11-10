@@ -33,8 +33,8 @@ function deliveryError(message, rejected) {
  * checking the pane still hosts the expected Pi session. Undefined when the
  * worker publishes none.
  */
-async function resolveReceiver(request, expected, { allowBlocked }) {
-	const { agent } = await request("agent.get", { target: expected.pane_id });
+async function resolveReceiver(peer, expected, { allowBlocked }) {
+	const agent = await peer.terminal(expected.terminal_id);
 	const session = agent?.agent_session;
 	const sessionFile = session?.kind === "path" ? session.value : undefined;
 	if (
@@ -98,15 +98,15 @@ function peerFrame(receiver, fields) {
 /**
  * Sends one message frame. Resolves undefined when the worker publishes no
  * receiver, so the caller can choose another route.
- * @param {(method: string, params: object) => Promise<any>} request
+ * @param {{ terminal(address: string): Promise<object>, closeTerminal(address: string): Promise<void> }} peer Core identity of the worker's terminal
  * @param {{ pane_id: string, terminal_id: string, agent_session?: { kind: string, value: string } | null }} expected
  * @param {{ text: string, sender: string, context?: string }} message
  * @param {{ commands?: boolean }} [options] commands asks for the slash
  *   commands the worker accepts instead of delivering text; it works while blocked.
  * @returns {Promise<{ command: boolean, commands?: { name: string, description: string }[] } | undefined>}
  */
-export async function sendPeerMessage(request, expected, message, options = {}) {
-	const receiver = await resolveReceiver(request, expected, {
+export async function sendPeerMessage(peer, expected, message, options = {}) {
+	const receiver = await resolveReceiver(peer, expected, {
 		allowBlocked: options.commands === true,
 	});
 	if (!receiver) return undefined;
@@ -116,7 +116,7 @@ export async function sendPeerMessage(request, expected, message, options = {}) 
 		sender: message.sender,
 		context: message.context,
 	});
-	return deliverFrame(request, expected, message, receiver.descriptor.port, receiver.sessionFile, id, frame);
+	return deliverFrame(peer, expected, message, receiver.descriptor.port, receiver.sessionFile, id, frame);
 }
 
 /**
@@ -127,8 +127,8 @@ export async function sendPeerMessage(request, expected, message, options = {}) 
  * @param {{ extension: string, id: string, message: string }} reply
  * @returns {Promise<boolean>}
  */
-export async function sendPeerExtensionReply(request, expected, reply) {
-	const receiver = await resolveReceiver(request, expected, { allowBlocked: true });
+export async function sendPeerExtensionReply(peer, expected, reply) {
+	const receiver = await resolveReceiver(peer, expected, { allowBlocked: true });
 	if (!receiver) return false;
 	const { id, frame } = peerFrame(receiver, {
 		kind: "extension-reply",
@@ -136,11 +136,11 @@ export async function sendPeerExtensionReply(request, expected, reply) {
 		messageId: reply.id,
 		message: reply.message,
 	});
-	await deliverFrame(request, expected, { text: "" }, receiver.descriptor.port, receiver.sessionFile, id, frame, EXTENSION_REPLY_TIMEOUT_MS);
+	await deliverFrame(peer, expected, { text: "" }, receiver.descriptor.port, receiver.sessionFile, id, frame, EXTENSION_REPLY_TIMEOUT_MS);
 	return true;
 }
 
-function deliverFrame(request, expected, message, port, sessionFile, id, frame, timeoutMs = 10_000) {
+function deliverFrame(peer, expected, message, port, sessionFile, id, frame, timeoutMs = 10_000) {
 	return new Promise((resolve, reject) => {
 		let attempted = false;
 		let settled = false;
@@ -171,12 +171,12 @@ function deliverFrame(request, expected, message, port, sessionFile, id, frame, 
 		socket.on("end", () => {
 			if (settled) return;
 			if (!closing) return failed();
-			void closeExitedPane(request, expected, sessionFile).then(
+			void closeExitedTerminal(peer, expected, sessionFile).then(
 				() => finish(undefined, { command: true }),
 				(error) =>
 					finish(
 						deliveryError(
-							`Pi shut down, but its pane could not be closed: ${error.message}`,
+							`Pi shut down, but its terminal could not be closed: ${error.message}`,
 							false,
 						),
 					),
@@ -233,14 +233,10 @@ function deliverFrame(request, expected, message, port, sessionFile, id, frame, 
 	});
 }
 
-/** Closes an exited worker's pane, refusing when another terminal or session holds it now. */
-export async function closeExitedPane(request, expected, sessionFile) {
-	const { pane } = await request("pane.current", {
-		caller_pane_id: expected.pane_id,
-	});
-	if (typeof pane?.pane_id !== "string" || pane.terminal_id !== expected.terminal_id)
-		throw new Error("Target pane changed; resolve it again");
-	if (pane.agent_session?.value && pane.agent_session.value !== sessionFile)
+/** Closes an exited worker's terminal, refusing when another session holds it now. */
+export async function closeExitedTerminal(peer, expected, sessionFile) {
+	const current = await peer.terminal(expected.terminal_id);
+	if (current.agent_session?.value && current.agent_session.value !== sessionFile)
 		throw new Error("Target session changed; resolve it again");
-	await request("pane.close", { pane_id: pane.pane_id });
+	await peer.closeTerminal(expected.terminal_id);
 }

@@ -1,33 +1,43 @@
 // Claude Code workers: transcripts through the Claude session reader; tasks
 // and answers through Claude Code's own cross-session messages, which only
 // the hooks side can send, so deliver and answer return a `session` route for
-// it; slash commands through Herdr's terminal prompt.
+// it; slash commands through Core's terminal input. Claude Code reports its
+// status to Core itself; its session ID is the terminal's `claude.session_id`
+// label, set by spawn and kept current by the worker's own Shepherdr.
 import { existsSync, readdirSync } from "node:fs";
 import { readFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join } from "node:path";
-import { getAgent, isHerdrErrorCode, request } from "../herdr.mjs";
+import { CLAUDE_SESSION_LABEL, getAgent, request, terminalPeer } from "../core.mjs";
 import { workerTrigger } from "../trigger.mjs";
-import { closeExitedPane } from "../vendor/shepherdr-peer.mjs";
+import { closeExitedTerminal } from "../vendor/shepherdr-peer.mjs";
 import { checkAnswers } from "./answers.mjs";
 import { askPrompts, readClaudeSessionView } from "./claude-session.mjs";
 import { envelopeText } from "./envelope.mjs";
 
 export const kind = "claude";
 export const program = "Claude Code";
+export const executable = "claude";
 /** Tasks and answers travel as Claude Code cross-session messages, which stay on one machine. */
 export const localOnly = true;
 
-/** Spawn's launch arguments, without `--name`: its name bar leaves the question dialog outside the screen region Herdr reads. */
+/** Spawn's launch arguments; `profileArgs` already chose the session ID. */
 export function launchArgs(_label, args) {
 	return args;
 }
 
-// Claude Code exits within moments of /exit; its pane then holds a shell.
+/** Labels spawn sets on the worker's terminal, so the session is known before Claude Code starts. */
+export function launchLabels(args) {
+	const index = args.indexOf("--session-id");
+	const id = index >= 0 ? args[index + 1] : undefined;
+	return id ? { [CLAUDE_SESSION_LABEL]: id } : {};
+}
+
+// Claude Code exits within moments of /exit.
 const EXIT_TIMEOUT_MS = 15_000;
 
 const COMMANDS = [
-	{ name: "quit", description: "Exit Claude Code and close its pane" },
+	{ name: "quit", description: "Exit Claude Code and close its terminal" },
 	{ name: "compact", description: "Compact context: /compact [instructions]" },
 	{ name: "clear", description: "Start a new conversation" },
 ];
@@ -95,8 +105,8 @@ async function publishedAsk(id) {
 export async function view(agent) {
 	const transcript = await readClaudeSessionView(sessionPath(agent));
 	const id = sessionId(agent);
-	// Not gated on Herdr's status: an attached session started with --name
-	// shows its open dialog as idle.
+	// Not gated on Core's status, which a dialog Claude Code does not report
+	// as blocked leaves idle.
 	const ask = id && (await publishedAsk(id));
 	// A result in the transcript outranks a file its hook could not clear.
 	return ask && !transcript.askResults?.[ask.toolCallId]
@@ -166,24 +176,14 @@ export async function answer(agent, askId, answers) {
 	return { session: { sessionId: id, text: answerFrame(askId, payload) } };
 }
 
-/** Waits for Claude Code to leave the pane, then closes it. */
+/** Waits for Claude Code to leave the terminal, then closes it. */
 async function closeAfterExit(agent) {
-	const trigger = await workerTrigger(agent.pane_id);
+	const trigger = await workerTrigger(agent.terminal_id);
 	try {
 		const deadline = Date.now() + EXIT_TIMEOUT_MS;
 		for (;;) {
-			let current;
-			try {
-				current = await getAgent(agent.pane_id);
-			} catch (error) {
-				if (!isHerdrErrorCode(error, "agent_not_found")) throw error;
-			}
-			if (
-				!current ||
-				current.terminal_id !== agent.terminal_id ||
-				current.agent !== kind
-			)
-				break;
+			const current = await getAgent(agent.terminal_id);
+			if (current.agent !== kind) break;
 			const remaining = deadline - Date.now();
 			if (remaining <= 0)
 				throw new Error(
@@ -194,7 +194,7 @@ async function closeAfterExit(agent) {
 	} finally {
 		trigger.close();
 	}
-	await closeExitedPane(request, agent, sessionId(agent));
+	await closeExitedTerminal(terminalPeer, agent, sessionId(agent));
 }
 
 async function command(agent, text) {
@@ -204,8 +204,8 @@ async function command(agent, text) {
 		);
 	const quit = /^\/quit\s*$/.test(text);
 	await request(
-		"agent.prompt",
-		{ target: agent.pane_id, text: quit ? "/exit" : text },
+		"terminal.send",
+		{ terminal: agent.terminal_id, text: quit ? "/exit" : text },
 		30_000,
 	);
 	if (quit) await closeAfterExit(agent);
@@ -215,7 +215,10 @@ async function command(agent, text) {
 /** @returns {Promise<{ delivery: "session" | "terminal", command?: true, session?: { sessionId: string, text: string } }>} */
 export async function deliver(agent, message) {
 	const id = sessionId(agent);
-	if (!id) throw new Error(`${agent.pane_id} has no Claude Code session`);
+	if (!id)
+		throw new Error(
+			`${agent.pane_id} has published no Claude Code session; it needs the shepherdr mod loaded`,
+		);
 	const text = message.text.trim();
 	if (text.startsWith("/")) return command(agent, text);
 	return {

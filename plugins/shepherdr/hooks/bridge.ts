@@ -1,4 +1,4 @@
-// The mod has no Node APIs; Herdr sockets, transcripts and processes go
+// The mod has no Node APIs; Core sockets, transcripts and processes go
 // through the Node helpers under ../bridge. A Bridge carries one hook's own
 // process calls, since `$` stays in the hooks module's top-level functions.
 import type {
@@ -29,8 +29,10 @@ export async function sendRoute(bridge: Bridge, route: SessionRoute | undefined)
 }
 
 export type WorkerRecord = {
-  /** Herdr machine profile ID; absent on the machine running Claude Code. */
+  /** Core machine ID; absent on the machine running Claude Code. */
   machine?: string
+  /** The machine's name when the watch began, which requests may use in place of its ID. */
+  machineName?: string
   terminalId: string
   paneId: string
   name?: string
@@ -54,7 +56,7 @@ export type Ask = {
   prompts: { title: string; multiple: boolean; choices: { label: string; description?: string }[]; body?: string }[]
   /** The worker's own question text, in place of prompts. */
   question?: string
-  /** Only the user can complete it, in the worker's pane. */
+  /** Only the user can complete it, in the worker's terminal. */
   handoff?: boolean
 }
 
@@ -103,7 +105,7 @@ export const LONGEST_CALL_MS = 590_000
 
 /**
  * Runs one bridge operation. Its time limit is the one budget for everything
- * beneath: the bridge, and any SSH call it makes, finish inside it.
+ * beneath: the bridge, and any remote call it makes, finish inside it.
  */
 export async function call<T>(
   bridge: Bridge,
@@ -128,10 +130,10 @@ export async function call<T>(
   return reply.result
 }
 
-/** Every line carries `machine` when it came from a remote machine's watcher. */
+/** One line from a machine's watcher, which runs beside Claude Code for every machine. */
 export type WatchLine =
   | { type: 'ready' }
-  | { type: 'event'; event: string; pane: string | null; status?: string }
+  | { type: 'event'; pane: string; status: string }
   | { type: 'session'; path: string; ask?: Ask }
 
 /** Starts one machine's watcher (this one when `machine` is absent); the returned function stops it. */
