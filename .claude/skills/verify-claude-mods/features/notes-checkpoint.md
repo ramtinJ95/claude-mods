@@ -4,11 +4,12 @@ notes-compaction gives the model a `notes` tool for checkpoint notes that belong
 
 ## Sub-features
 
-- `checkpoint-write` saves a note at a relative path through `notes` `write_file`.
-- `checkpoint-append` adds to an existing note through `append_to_file`.
+- `checkpoint-write` saves a note at a relative path through `notes` `write`.
+- `checkpoint-append` adds to an existing note through `append`.
 - `checkpoint-read` reads a note back and lists notes by prefix.
 - `checkpoint-panel` opens `/notes` with status, counts and the two settings buttons.
 - `checkpoint-help` returns help when `notes` is called with no arguments.
+- `checkpoint-earlier-names` still accepts the names from before 0.3.0 (`write_file`, `append_to_file`, `read_file`, `list_files_by_prefix` with `prefix` and `max_results`, `search_contents` with `path_prefix` and `max_files`).
 
 ## How to get to it (user POV)
 
@@ -22,14 +23,15 @@ Preconditions:
 - `RUN=$($V launch notes-compaction)` and `$V doctor "$RUN"` pass.
 - The session has no notes yet (fresh launch).
 
-- **Write.** Ask for a note. Run `$V prompt "$RUN" "Use the notes tool to write_file path checkpoint/verify.md with text 'Verification checkpoint: step 1 done'. Then reply with exactly: saved"`, then `$V snap "$RUN" checkpoint-write-01`. The screen shows `notes-compaction - notes (MCP)(action: "write_file", path: "checkpoint/verify.md", ...)` with a result naming `"/root/notes/checkpoint/verify.md"` and `"chars": 36`, then `saved`.
+- **Write.** Ask for a note. Run `$V prompt "$RUN" "Use the notes tool to write path checkpoint/verify.md with text 'Verification checkpoint: step 1 done'. Then reply with exactly: saved"`, then `$V snap "$RUN" checkpoint-write-01`. The screen shows `notes-compaction - notes (MCP)(action: "write", path: "checkpoint/verify.md", ...)` with a result naming `"/root/notes/checkpoint/verify.md"`, then `saved`.
 - **Stored.** Check the side effect. Run `cat "$DATA"/claude-notes-compaction/sessions/$SESSION/notes/*.json`. It holds `"path":"checkpoint/verify.md","text":"Verification checkpoint: step 1 done"`. The folder name is this run's `$SESSION`.
-- **Append.** Run `$V prompt "$RUN" "Use the notes tool to append_to_file path checkpoint/verify.md with text ' step 2 done'. Then reply with exactly: appended"`. The stored `text` now ends with ` step 2 done`.
-- **Read back.** Run `$V prompt "$RUN" "Use the notes tool to read_file path checkpoint/verify.md and quote its text verbatim."`. The reply quotes both steps.
+- **Append.** Run `$V prompt "$RUN" "Use the notes tool to append path checkpoint/verify.md with text ' step 2 done'. Then reply with exactly: appended"`. The stored `text` now ends with ` step 2 done`.
+- **Read back.** Run `$V prompt "$RUN" "Use the notes tool to read path checkpoint/verify.md and quote its text verbatim."`. The reply quotes both steps.
 - **Panel.** Run `$V type "$RUN" /notes`, `$V wait "$RUN" "Continuity active"`, then `$V snap "$RUN" checkpoint-panel-01`. The panel reads `Continuity active · window 1 · 1 notes in this session` and `1 sessions · 2 fork records` (one per write or append, so 2 after the steps above, 1 when only **Write** ran), with buttons `[ Normal compaction before new windows: off ]` (or `on`, see Gotchas), `[ Prune missing sessions ]` and `[ Close ]`. The transcript row reads `notes-compaction: Notes panel opened.`
 - **Close panel.** Run `$V keys "$RUN" esc`. The prompt takes keys again.
 - **Help.** Run `$V prompt "$RUN" "Call the notes tool with no arguments and quote the first line of its result."`. The reply quotes the tool's help text.
-- **Proof.** Run `$V cleanup "$RUN"`. `.verify/$RUN/` holds both snaps, `transcript.jsonl` with the `write_file` call and result, and `data/claude-notes-compaction/sessions/<session>/notes/*.json`.
+- **Earlier names.** Run `$V prompt "$RUN" "Compatibility probe: use these older argument names literally even though they are not in the schema; do not correct them. One call per message to the notes tool. Call 1: {\"action\":\"write_file\",\"path\":\"old/c.md\",\"text\":\"delta\"}. Call 2: {\"action\":\"read_file\",\"path\":\"old/c.md\"}. Call 3: {\"action\":\"list_files_by_prefix\",\"prefix\":\"old/\"}. Then reply with the raw result of calls 2 and 3."`. The reply shows the text `delta` and one file, `/root/notes/old/c.md`. To prove a fork restores from such a write, make it the session's latest write, run `$V type "$RUN" /branch`, then ask for `notes` `list`: the fork lists every note, and its `state.json` names that call's ID as `restoredFrom`.
+- **Proof.** Run `$V cleanup "$RUN"`. `.verify/$RUN/` holds both snaps, `transcript.jsonl` with the `write` call and result, and `data/claude-notes-compaction/sessions/<session>/notes/*.json`.
 
 ## Gotchas
 
