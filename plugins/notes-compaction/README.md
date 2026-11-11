@@ -13,7 +13,7 @@ Ported from [pi-notes-compaction](https://github.com/IgorWarzocha/howaboua-pi-st
 ## What the agent gets
 
 - `notes`: list, read, search, write and append on virtual paths. `write_file` replaces; `append_to_file` adds.
-- `new_context`: accepted only directly after a successful notes write in the same turn, so a new window never starts from stale notes. It ends the turn once its tool batch has run, then opens a new context window with the agent name, window IDs and recent note paths, and tells the agent to continue.
+- `new_context`: accepted only when the tool calls just before it, in the same batch or the one before, saved a note and no notes write among them failed, so a new window never starts from stale notes. It ends the turn once its tool batch has run, then opens a new context window with the agent name, window IDs and recent note paths, and tells the agent to continue. A write that fails later in that batch withdraws the request.
 - `history`: lists, searches and reads earlier windows of this session, or a subagent's transcript. Loaded on demand.
 - `get_context_remaining`: remaining tokens in the current window. Loaded on demand.
 

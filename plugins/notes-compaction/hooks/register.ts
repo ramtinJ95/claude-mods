@@ -35,6 +35,7 @@ import {
 } from './windows.ts'
 
 const NOTES_TOOL = 'mcp__notes-compaction__notes'
+const NEW_CONTEXT_TOOL = 'mcp__notes-compaction__new_context'
 
 type Namespace = 'notes' | 'history'
 interface ActionSpec {
@@ -193,6 +194,7 @@ const PENDING = 'A notes checkpoint or rollover is already pending.'
 const CHECKPOINT_FIRST = 'Saving a notes checkpoint first. The new window opens after it completes.'
 const ROLLOVER_FAILED = 'Context rollover failed. The existing context remains.'
 const NOTE_FIRST = 'Save your progress with notes, wait for the write to succeed, then call new_context next.'
+const ROLLOVER_WITHDRAWN = 'The requested new window will not open. Save again, then call new_context.'
 
 const CHECKPOINT_PROMPT =
   '<context_window_reminder>\nContext checkpoint requested. Save the current state with notes, then finish your response. The new window opens after this turn. Do not call new_context. If saving fails, report the failure without rolling over.\n</context_window_reminder>'
@@ -212,12 +214,22 @@ const REVISION_LIMIT = 4_000_000
 let storage: Promise<string> | undefined
 let sessionId: string | undefined
 let loaded: { dir: string; promise: Promise<{ dir: string; state: SessionState }> } | undefined
+/** The main tool calls one model request made, new_context aside: how many started, and whether its notes writes saved or failed. */
+interface CallGroup {
+  calls: number
+  saved: boolean
+  failed: boolean
+}
+const newGroup = (): CallGroup => ({ calls: 0, saved: false, failed: false })
+/** A group whose notes writes all succeeded, with at least one. */
+const savedIn = (group: CallGroup | undefined) => group !== undefined && group.saved && !group.failed
 /**
- * The running main turn. Between turns, Claude Code compacts on its own only while idle. `lastCall` is its latest
- * completed tool call and `savedNote` its latest successful notes write, so new_context can require that it directly
- * follows a saved note.
+ * The running main turn. Between turns, Claude Code compacts on its own only while idle. `group` is the current
+ * model request's calls, `previous` the latest earlier group that made any, and `written` the latest group that
+ * wrote notes: new_context requires a save in the calls just before it, and a turn's notes are fresh when its
+ * latest writes saved, so a failed write stops counting once a later group saves.
  */
-let turn: { id: string; notes: 'none' | 'saved' | 'failed'; lastCall?: string; savedNote?: string } | undefined
+let turn: { id: string; group: CallGroup; previous?: CallGroup; written?: CallGroup } | undefined
 /** The window whose latest completed turn saved fresh notes. */
 let freshWindowId: string | undefined
 /**
@@ -612,13 +624,18 @@ async function runNotes($: EngineInterface, e: ToolCallInput): Promise<ToolCallR
       await saveState($, sessionDir, state)
     }
     if (main && turn) {
-      if (turn.notes === 'none') turn.notes = 'saved'
-      turn.savedNote = e.tool_use_id
+      turn.group.saved = true
+      turn.written = turn.group
     }
     return result(payload)
   } catch (error) {
-    if (isWrite && main && turn) turn.notes = 'failed'
-    return failure(error)
+    if (!isWrite || !main || !turn) return failure(error)
+    turn.group.failed = true
+    turn.written = turn.group
+    // A write that fails after new_context was accepted, in the same batch, withdraws it: the model reads why.
+    if (pending?.kind !== 'requested') return failure(error)
+    pending = undefined
+    return { deny: `${message(error)}. ${ROLLOVER_WITHDRAWN}` }
   }
 }
 
@@ -753,8 +770,9 @@ async function confirmPrune($: EngineInterface) {
 export const register: Register = (on) => {
   // First registered is outermost: this wraps every tool's result, the plugin's own included.
   on('tool.call', async ($, e, next) => {
+    // Counted as it starts, so a call that runs beside new_context is seen by it; new_context is no call of its own group.
+    if (e.agentId === undefined && turn && e.tool !== NEW_CONTEXT_TOOL) turn.group.calls++
     const called = await next(e)
-    if (e.agentId === undefined && turn && e.tool_use_id) turn.lastCall = e.tool_use_id
     return remind($, e.agentId, called)
   })
 
@@ -791,10 +809,17 @@ export const register: Register = (on) => {
 
   // After new_context, the turn ends at its next model request, once the whole tool batch ran,
   // as Pi's new_context ends the run; the rollover then follows the turn's completion.
-  // A note that failed this turn keeps the turn going, so the model sees the error; the rollover is then cancelled.
+  // A note that failed later in that batch withdrew the request, so the turn goes on and the model sees the error.
   on('turn.step', async function* ($, e, next) {
-    if (e.agentId === undefined) batchChars = 0
-    if (e.agentId !== undefined || pending?.kind !== 'requested' || turn?.notes === 'failed') return yield* next(e)
+    if (e.agentId === undefined) {
+      batchChars = 0
+      // A request that made no calls (a retry, a continued answer) leaves the latest group that did in place.
+      if (turn?.group.calls) {
+        turn.previous = turn.group
+        turn.group = newGroup()
+      }
+    }
+    if (e.agentId !== undefined || pending?.kind !== 'requested') return yield* next(e)
     const answer = 'Starting a new context window.'
     yield { kind: 'text', index: 0, text: answer }
     yield { kind: 'stop', stopReason: 'end_turn', usage: null }
@@ -811,7 +836,7 @@ export const register: Register = (on) => {
   on('turn.start', async ($, e, next) => {
     // A subagent's turn completes without clearing turn, so only the main turn is tracked.
     if (e.agentId === undefined) {
-      turn = { id: e.turnId, notes: 'none' }
+      turn = { id: e.turnId, group: newGroup() }
       idleTimer?.cancel()
     }
     // /config and /model can move the threshold between turns; the previous figure stands meanwhile.
@@ -825,7 +850,7 @@ export const register: Register = (on) => {
     const ended = turn?.id === e.turnId ? turn : undefined
     turn = undefined
     const windowId = (await session($)).state.window.currentWindowId
-    const fresh = e.reason === 'answer' && ended?.notes === 'saved'
+    const fresh = e.reason === 'answer' && savedIn(ended?.written)
     freshWindowId = fresh ? windowId : undefined
     const was = pending
     if (was?.kind === 'checkpoint') {
@@ -839,8 +864,6 @@ export const register: Register = (on) => {
     } else if (was?.kind === 'requested') {
       pending = undefined
       if (e.isAborted) $.ui.toast('Rollover cancelled by the interruption. The old context remains.')
-      else if (ended?.notes === 'failed')
-        $.ui.toast('Rollover did not start: a note failed to save this turn. The old context remains.')
       else roll($, 'continue')
     }
     armIdleRollover($)
@@ -906,7 +929,8 @@ export const register: Register = (on) => {
       })
     // A write earlier in the batch may still be saving.
     await notesQueue
-    if (!turn?.savedNote || turn.lastCall !== turn.savedNote) return { deny: NOTE_FIRST }
+    // The other calls of its own batch decide, or when it came alone, the batch before.
+    if (!savedIn(turn?.group.calls ? turn.group : turn?.previous)) return { deny: NOTE_FIRST }
     pending = { kind: 'requested' }
     return result({
       started: true,
