@@ -107,7 +107,7 @@ function answer(
       truncated: values.length > limit,
     }
   }
-  if (action === 'read_item') {
+  if (action === 'read') {
     const item = windows.get(String(params['window_id']))?.find((item) => item.item_id === params['item_id'])
     if (!item) return { item: null }
     const offset = integer(params['offset_chars'], 0, item.content.length, 0)
@@ -122,7 +122,7 @@ function answer(
       },
     }
   }
-  // list_items or search_contents
+  // list or search
   const query = String(params['query'])
   let items = [...windows.values()]
     .flat()
@@ -131,7 +131,7 @@ function answer(
         (!params['window_id'] || item.window_id === params['window_id']) &&
         (!params['role'] || item.role === params['role']) &&
         (!params['tool_name'] || item.tool_name === params['tool_name']) &&
-        (action !== 'search_contents' || item.content.includes(query)),
+        (action !== 'search' || item.content.includes(query)),
     )
   if (params['recent_first'] === true) items = items.reverse()
   const limit = integer(params['limit'], 10, 25)
