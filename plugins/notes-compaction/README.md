@@ -12,12 +12,12 @@ Ported from [pi-notes-compaction](https://github.com/IgorWarzocha/howaboua-pi-st
 
 ## What the agent gets
 
-- `notes`: list, read, search, write and append on virtual paths. `write_file` replaces; `append_to_file` adds.
+- `notes`: `list`, `read`, `search`, `write` and `append` on virtual paths. `write` replaces; `append` adds. One `path` names the file to read, write or append to, and the prefix to list or search under.
 - `new_context`: accepted only when the tool calls just before it, in the same batch or the one before, saved a note and no notes write among them failed, so a new window never starts from stale notes. It ends the turn once its tool batch has run, then opens a new context window with the agent name, window IDs and recent note paths, and tells the agent to continue. A write that fails later in that batch withdraws the request.
-- `history`: lists, searches and reads earlier windows of this session, or a subagent's transcript. Loaded on demand.
+- `history`: lists, searches and reads earlier windows of this session, or a subagent's transcript (`list_windows`, `list`, `read`, `search`; a query alone searches). Loaded on demand.
 - `get_context_remaining`: remaining tokens in the current window. Loaded on demand.
 
-Tool calls with no arguments return help. The `notes` tool's description explains how to keep checkpoints, so a fresh session needs no extra instructions.
+Tool calls with no arguments return help. The action and argument names from before 0.3.0 (`write_file`, `read_item`, `prefix`, `max_results` and the like) are still accepted, so a session that was running during the upgrade keeps working. The `notes` tool's description explains how to keep checkpoints, so a fresh session needs no extra instructions.
 
 ## Agents
 
