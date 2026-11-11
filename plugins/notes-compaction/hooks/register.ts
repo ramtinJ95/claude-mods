@@ -41,37 +41,50 @@ type Namespace = 'notes' | 'history'
 interface ActionSpec {
   fields: readonly string[]
   required?: readonly string[]
-  /** The notes field that holds a virtual path. */
-  pathField?: string
 }
 /** Each tool's actions: the fields they take and which are required. Help, filtering and checks derive from it. */
 const ACTIONS: Record<Namespace, Record<string, ActionSpec>> = {
   notes: {
-    list_files_by_prefix: { fields: ['prefix', 'file_order', 'file_order_by', 'max_results'], pathField: 'prefix' },
-    read_file: { fields: ['path', 'start_line', 'stop_line'], required: ['path'], pathField: 'path' },
-    search_contents: {
-      fields: ['query', 'path_prefix', 'max_files', 'max_matches_per_file', 'recent_file_first'],
-      required: ['query'],
-      pathField: 'path_prefix',
-    },
-    append_to_file: { fields: ['path', 'text'], required: ['path', 'text'], pathField: 'path' },
-    write_file: { fields: ['path', 'text'], required: ['path', 'text'], pathField: 'path' },
+    list: { fields: ['path', 'file_order', 'file_order_by', 'limit'] },
+    read: { fields: ['path', 'start_line', 'stop_line'], required: ['path'] },
+    search: { fields: ['query', 'path', 'limit', 'max_matches_per_file', 'recent_file_first'], required: ['query'] },
+    append: { fields: ['path', 'text'], required: ['path', 'text'] },
+    write: { fields: ['path', 'text'], required: ['path', 'text'] },
   },
   history: {
     list_windows: { fields: ['agent_name', 'limit', 'recent_first'] },
-    list_items: {
+    list: {
       fields: ['agent_name', 'window_id', 'role', 'tool_name', 'limit', 'max_chars_per_item', 'recent_first'],
     },
-    read_item: {
+    read: {
       fields: ['agent_name', 'window_id', 'item_id', 'offset_chars', 'limit_chars'],
       required: ['window_id', 'item_id'],
     },
-    search_contents: {
+    search: {
       fields: ['agent_name', 'window_id', 'role', 'tool_name', 'query', 'limit', 'recent_first'],
       required: ['query'],
     },
   },
 }
+/**
+ * Names from before 0.3.0, still accepted: Claude Code hands a call to the hook without checking it against the
+ * schema, and sessions in flight and copied transcripts carry these. Schemas and help show only the current names.
+ */
+const EARLIER: Record<Namespace, { actions: Record<string, string>; fields: Record<string, string> }> = {
+  notes: {
+    actions: {
+      list_files_by_prefix: 'list',
+      read_file: 'read',
+      search_contents: 'search',
+      append_to_file: 'append',
+      write_file: 'write',
+    },
+    fields: { prefix: 'path', path_prefix: 'path', max_results: 'limit', max_files: 'limit' },
+  },
+  history: { actions: { list_items: 'list', read_item: 'read', search_contents: 'search' }, fields: {} },
+}
+const currentAction = (namespace: Namespace, action: unknown) =>
+  typeof action === 'string' ? (EARLIER[namespace].actions[action] ?? action) : action
 const actionNames = (namespace: Namespace) => ['help', ...Object.keys(ACTIONS[namespace])]
 const STRING = { type: 'string' }
 const POSITIVE = { type: 'integer', minimum: 1 }
@@ -79,15 +92,12 @@ const NOTES_SCHEMA = {
   type: 'object',
   properties: {
     action: { type: 'string', enum: actionNames('notes') },
-    path: STRING,
+    path: { type: 'string', description: 'File for read, write and append; prefix for list and search' },
     text: STRING,
-    prefix: STRING,
     query: STRING,
-    path_prefix: STRING,
     start_line: POSITIVE,
     stop_line: POSITIVE,
-    max_results: POSITIVE,
-    max_files: POSITIVE,
+    limit: POSITIVE,
     max_matches_per_file: POSITIVE,
     file_order: { type: 'string', enum: ['ascending', 'descending'] },
     file_order_by: { type: 'string', enum: ['name', 'created_at', 'updated_at'] },
@@ -118,7 +128,7 @@ const TOOLS = [
   {
     name: 'notes',
     // The description carries the checkpoint guidance: prompt events do not reach this mod (see AGENTS.md).
-    description: `Persistent notes. write_file replaces; append_to_file adds. Virtual paths: relative uses current agent; cross-agent uses <agent>/notes[/path], read-only. Call with no arguments for help.\n\n${GUIDANCE}`,
+    description: `Persistent notes. write replaces; append adds. Virtual paths: relative uses current agent; cross-agent uses <agent>/notes[/path], read-only. Call with no arguments for help.\n\n${GUIDANCE}`,
     inputSchema: NOTES_SCHEMA,
     isDeferred: false,
   },
@@ -137,10 +147,22 @@ const TOOLS = [
   { name: 'get_context_remaining', description: 'Remaining context tokens', inputSchema: EMPTY_SCHEMA, isDeferred: true },
 ]
 
-/** The tool's own arguments: tool.call's input also carries reserved keys beside them. */
-function args(e: object, schema: { properties: object }): Record<string, unknown> {
-  const keys = Object.keys(schema.properties)
-  return Object.fromEntries(Object.entries(e).filter(([key]) => keys.includes(key)))
+const SCHEMAS = { notes: NOTES_SCHEMA, history: HISTORY_SCHEMA }
+
+/**
+ * The tool's own arguments under their current names: tool.call's input also carries reserved keys beside them.
+ * An earlier name fills in only where its current one is absent. For history, a query alone means search.
+ */
+function args(e: object, namespace: Namespace): Record<string, unknown> {
+  const keys = Object.keys(SCHEMAS[namespace].properties)
+  const params = Object.fromEntries(Object.entries(e).filter(([key]) => keys.includes(key)))
+  for (const [earlier, name] of Object.entries(EARLIER[namespace].fields)) {
+    const value = (e as Record<string, unknown>)[earlier]
+    if (value !== undefined && params[name] === undefined) params[name] = value
+  }
+  if ('action' in params) params['action'] = currentAction(namespace, params['action'])
+  else if (namespace === 'history' && typeof params['query'] === 'string') params['action'] = 'search'
+  return params
 }
 
 /** Help-backed tools: no arguments, or action help, lists each action's fields; optional ones end in `?`. */
@@ -167,8 +189,8 @@ function relevant(namespace: Namespace, params: Record<string, unknown>) {
   if (missing.length)
     throw new Error(
       `${namespace} ${String(params['action'])} requires ${missing.join(' and ')}` +
-        (namespace === 'history' && params['action'] === 'read_item'
-          ? '. Copy window_id and item_id from the same search_contents or list_items result'
+        (namespace === 'history' && params['action'] === 'read'
+          ? '. Copy window_id and item_id from the same search or list result'
           : ''),
     )
   const scoped = Object.fromEntries(
@@ -351,7 +373,8 @@ async function loadSession($: EngineInterface, dir: string) {
         windowNumber: markers.filter((m) => m && !m.repeated).length,
       }
     for (const use of [...messages[i]!.toolUses].reverse()) {
-      if (use.tool !== NOTES_TOOL || use.isError || !WRITE_ACTIONS.includes(use.input['action'])) continue
+      if (use.tool !== NOTES_TOOL || use.isError || !WRITE_ACTIONS.includes(currentAction('notes', use.input['action'])))
+        continue
       sawWrite = true
       const file = await revisionPath($, use.tool_use_id)
       if (!(await $.fs.exists(file))) continue
@@ -573,7 +596,7 @@ function callNotes($: EngineInterface, e: ToolCallInput): Promise<ToolCallResult
 }
 
 async function runNotes($: EngineInterface, e: ToolCallInput): Promise<ToolCallResult> {
-  const params = args(e, NOTES_SCHEMA)
+  const params = args(e, 'notes')
   const isWrite = WRITE_ACTIONS.includes(params['action'])
   const main = e.agentId === undefined
   try {
@@ -581,15 +604,14 @@ async function runNotes($: EngineInterface, e: ToolCallInput): Promise<ToolCallR
     if (help) return result(help)
     const { scoped, spec } = relevant('notes', params)
     const self = agentName(e.agentId)
-    const field = spec.pathField!
-    const target = resolvePath(scoped[field], self, spec.required?.includes(field) ?? false)
+    const target = resolvePath(scoped['path'], self, spec.required?.includes('path') ?? false)
     if (isWrite && target.agent !== self)
       throw new Error(`Write only your own notes, with a relative path. ${target.agent}'s notes are read-only here.`)
     if (!(await isSessionAgent($, self, target.agent)))
       throw new Error(`${target.agent} is not an agent of this session. Use a relative path for your own notes.`)
     const dir = await notesDir($, target.agent)
-    const notes = params['action'] === 'read_file' ? await readNote($, dir, target.path) : await readNotes($, dir)
-    const { payload, write } = useNotes(notes, { ...scoped, [field]: target.path }, await $.clock.now(), target.agent)
+    const notes = params['action'] === 'read' ? await readNote($, dir, target.path) : await readNotes($, dir)
+    const { payload, write } = useNotes(notes, { ...scoped, path: target.path }, await $.clock.now(), target.agent)
     if (!write) return result(payload)
     const { dir: sessionDir, state } = await session($)
     // The revision is the receipt a fork rebuilds root notes from. Subagent notes need none: they
@@ -616,7 +638,7 @@ async function runNotes($: EngineInterface, e: ToolCallInput): Promise<ToolCallR
         await $.fs.write(await revisionPath($, e.tool_use_id!), revision)
       } catch {
         throw new Error(
-          `${payload['path']} was saved, but forks of this session will not see it. Read it back and save it again with write_file.`,
+          `${payload['path']} was saved, but forks of this session will not see it. Read it back and save it again with write.`,
         )
       }
     if (!main && !state.agents?.includes(self)) {
@@ -640,7 +662,7 @@ async function runNotes($: EngineInterface, e: ToolCallInput): Promise<ToolCallR
 }
 
 async function callHistory($: EngineInterface, e: ToolCallInput): Promise<ToolCallResult> {
-  const params = args(e, HISTORY_SCHEMA)
+  const params = args(e, 'history')
   try {
     const help = discovery('history', params)
     if (help) return result(help)

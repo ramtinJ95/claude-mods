@@ -22,7 +22,7 @@ export interface SessionState {
 }
 
 export const GUIDANCE = `<context_window_guidance>
-Notes are recovery state, not a diary, kept in virtual storage, not on disk: reach them only through this tool. Keep one concise, authoritative note per task or topic at a stable relative path. Task checkpoints cover request, constraints, decisions, status and how it was verified, next steps and identifiers needed to act (history IDs too). Use write_file to replace stale state and mark completion. Link to existing notes instead of copying or summarising their contents. Recording isn't permission to implement.
+Notes are recovery state, not a diary, kept in virtual storage, not on disk: reach them only through this tool. Keep one concise, authoritative note per task or topic at a stable relative path. Task checkpoints cover request, constraints, decisions, status and how it was verified, next steps and identifiers needed to act (history IDs too). Use write to replace stale state and mark completion. Link to existing notes instead of copying or summarising their contents. Recording isn't permission to implement.
 
 Near the end of a substantive turn, before replying, save the recovery state that changed. Skip routine turns and unchanged state, and don't save between ordinary tool calls. Reminders and handoffs still call for a save. Save immediately before new_context or a handoff and wait for success; include the checkpoint path in handoffs.
 

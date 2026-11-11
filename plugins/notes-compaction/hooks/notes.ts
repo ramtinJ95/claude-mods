@@ -9,7 +9,7 @@ export interface Note {
 export const ROOT = '/root'
 const AGENT_ID = '[A-Za-z0-9_-]+'
 
-export const WRITE_ACTIONS: readonly unknown[] = ['write_file', 'append_to_file']
+export const WRITE_ACTIONS: readonly unknown[] = ['write', 'append']
 
 export function agentName(agentId: string | undefined): string {
   return agentId === undefined ? ROOT : `${ROOT}/${agentId}`
@@ -88,7 +88,7 @@ export function useNotes(
   if (WRITE_ACTIONS.includes(action)) {
     const path = String(params['path'])
     const previous = notes.get(path)
-    const next = action === 'append_to_file' ? (previous?.text ?? '') + String(params['text']) : String(params['text'])
+    const next = action === 'append' ? (previous?.text ?? '') + String(params['text']) : String(params['text'])
     if (new TextEncoder().encode(next).length > 1_000_000)
       throw new Error('Note exceeds 1 MB. Split it into separate paths.')
     return {
@@ -96,7 +96,7 @@ export function useNotes(
       write: { path, text: next, createdAt: previous?.createdAt ?? now, updatedAt: now },
     }
   }
-  if (action === 'read_file') {
+  if (action === 'read') {
     const path = String(params['path'])
     const note = notes.get(path)
     if (!note) return { payload: { path: root + path, file: null } }
@@ -125,8 +125,8 @@ export function useNotes(
       },
     }
   }
-  if (action === 'list_files_by_prefix') {
-    const prefix = String(params['prefix'] ?? '')
+  if (action === 'list') {
+    const prefix = String(params['path'] ?? '')
     const files = [...notes.values()].filter((note) => note.path.startsWith(prefix))
     const by = params['file_order_by']
     files.sort((a, b) =>
@@ -137,7 +137,7 @@ export function useNotes(
           : a.path.localeCompare(b.path),
     )
     if (params['file_order'] === 'descending') files.reverse()
-    const maximum = integer(params['max_results'], 100, 100)
+    const maximum = integer(params['limit'], 100, 100)
     return {
       payload: {
         files: files
@@ -147,9 +147,9 @@ export function useNotes(
       },
     }
   }
-  // search_contents
+  // search
   const query = String(params['query'])
-  const prefix = String(params['path_prefix'] ?? '')
+  const prefix = String(params['path'] ?? '')
   const files = [...notes.values()].filter((note) => note.path.startsWith(prefix))
   if (params['recent_file_first'] === true) files.sort((a, b) => b.updatedAt - a.updatedAt)
   const found: { path: string; matches: { line: number; text: string }[]; truncated: boolean }[] = []
@@ -162,7 +162,7 @@ export function useNotes(
     if (!all.length) continue
     const matches = all.slice(0, integer(params['max_matches_per_file'], 10, 100))
     const size = JSON.stringify(matches).length
-    if (found.length >= integer(params['max_files'], 20, 100) || chars + size > RESULT_LIMIT) {
+    if (found.length >= integer(params['limit'], 20, 100) || chars + size > RESULT_LIMIT) {
       truncated = true
       break
     }
