@@ -42,7 +42,7 @@ Keep implementation details out of the map unless a trap depends on them. Name o
 ## Features
 
 - [Notes checkpoints](./notes-checkpoint.md) (notes-compaction) covers saving, reading and listing notes and the `/notes` panel. Driven end to end on 2026-10-17 with Claude Code 2.1.302: `checkpoint-write` and `checkpoint-panel` passed.
-- [New context windows](./notes-window.md) (notes-compaction) covers `new_context`, `/compact` rollover and `history` across windows. Not driven yet.
+- [New context windows](./notes-window.md) (notes-compaction) covers `new_context`, `/compact` rollover and `history` across windows. Driven on 2026-11-11 with Claude Code 2.1.322: `window-guard` (all four guard steps) and `window-request` passed, and `/compact` opened a waiting window at once after a turn that saved notes; `/compact` asking for a checkpoint first and `window-history` were not driven.
 - [Shepherdr agents](./shepherdr-agents.md) (shepherdr) covers `/shepherdr`, spawning a Claude Code worker, its pushed result and closing it. Not driven yet.
 - [Review a response](./review-response.md) (review-pane) covers `/review-response`, pane navigation, annotations, questions and finishing into the prompt. Not driven yet.
 - [Review a diff in Neovim](./review-diff.md) (review-pane) covers `/review-diff`, annotating in Neovim and finishing into the prompt. Not driven yet.
