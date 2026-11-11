@@ -15,16 +15,19 @@ import {
 	closeTerminal,
 	coreIdentity,
 	getAgent,
+	isCoreError,
 	localAgents,
 	ownTerminal,
 	request,
 } from "./core.mjs";
 import { catalog, remoteCall, resolveMachine } from "./machines.mjs";
 import {
+	initialProfile,
 	listProfiles,
 	loadProfile,
 	prepareMessage,
 	profileArgs,
+	startsFreshSession,
 } from "./profiles.mjs";
 import { check, wait } from "./settle.mjs";
 import { awaitWorker, launch, launchTarget } from "./spawn.mjs";
@@ -110,11 +113,71 @@ const MACHINE_OPS = {
 			})),
 		};
 	},
-	/** Waits for a launched worker, then delivers its first task. */
-	async "machine.started"({ address, kind, cwd, message }) {
-		const { agent, notice } = await awaitWorker(address, kind, cwd);
-		const delivered = await deliver(agent.terminal_id, message, "task");
-		return notice ? { ...delivered, notice } : delivered;
+	/**
+	 * Waits for a launched worker, then delivers its message: a spawn's first
+	 * task, or what reopened a saved `session`. `saved` names the session a
+	 * later resume reopens.
+	 */
+	async "machine.started"({ address, kind, cwd, message, messageKind = "task", session }) {
+		const agent = await awaitWorker(address, kind, cwd);
+		const saved = workerOfKind(kind).savedSession(agent);
+		if (session !== undefined && saved !== session)
+			throw new Error(
+				"the reopened worker did not open its saved session; open that session yourself before retrying",
+			);
+		return { ...(await deliver(agent.terminal_id, message, messageKind)), saved };
+	},
+	/**
+	 * Where a spawned worker (`terminalId`, `launch`) is now: `live` names the
+	 * terminal to deliver to, when its own still runs, another hosts its
+	 * session, or a live terminal answers to `target`. Otherwise the directory,
+	 * program and names a relaunch needs.
+	 */
+	async "machine.revive"({ terminalId, launch: saved, target }) {
+		const agents = await localAgents();
+		if (agents.some((agent) => agent.terminal_id === terminalId)) return { live: terminalId };
+		const worker = workerOfKind(saved.kind);
+		const hosting = agents.filter(
+			(agent) => agent.agent === saved.kind && worker.savedSession(agent) === saved.session,
+		);
+		if (hosting.length > 1)
+			throw new Error(
+				`the worker's session is open in ${hosting.map((agent) => agent.pane_id).join(" and ")}; close the extra one before sending`,
+			);
+		if (hosting[0]) return { live: hosting[0].terminal_id };
+		// A live terminal now answering to that address or name is not this worker.
+		if (agents.some((agent) => agent.pane_id === target || agent.name === target))
+			return { live: target };
+		return {
+			...(await launchTarget({ cwd: saved.cwd }, saved.kind)),
+			agents: agents.map(({ name, workspace_id }) => ({
+				...(name ? { name } : {}),
+				...(workspace_id ? { workspace_id } : {}),
+			})),
+		};
+	},
+	/**
+	 * Closes each spawned worker that is idle on the session it was spawned
+	 * with; the adapter decides idleness. Workers already gone are left out.
+	 */
+	"machine.closeIdle"({ children }) {
+		return Promise.all(
+			children.map(async ({ terminalId, launch: saved }) => {
+				try {
+					const agent = await getAgent(terminalId);
+					if (!agent.live) return { terminalId, gone: true };
+					const worker = workerOfKind(saved.kind);
+					if (agent.agent !== saved.kind || worker.savedSession(agent) !== saved.session)
+						return { terminalId, skipped: "runs another session" };
+					await worker.closeIfIdle(agent);
+					return { terminalId, closed: true };
+				} catch (error) {
+					return isCoreError(error, "not_found")
+						? { terminalId, gone: true }
+						: { terminalId, skipped: error.message };
+				}
+			}),
+		);
 	},
 	"machine.deliver"({ target, message, kind }) {
 		return deliver(target, message, kind);
@@ -144,14 +207,13 @@ const MACHINE_OPS = {
 		const { agent, worker } = await resolveWorker(target);
 		const prior = await worker.answerStatus(agent, askId, answers);
 		if (prior) return { agent: agentSummary(agent), status: prior };
-		const [record, { status, background, session }] = await Promise.all([
+		const [record, { status, session }] = await Promise.all([
 			recordFor(agent, worker, true),
 			worker.answer(agent, askId, answers),
 		]);
 		return {
 			agent: agentSummary(agent),
 			...(session ? { session } : { status: status ?? "unknown" }),
-			background,
 			record,
 		};
 	},
@@ -236,7 +298,11 @@ async function controller() {
 	return { pane, core };
 }
 
-function attribute({ pane, core }, text, kind) {
+/**
+ * A message as its worker reads it. `profile` is a Pi profile's prompt, which
+ * briefs the first task only, as pi-shepherdr's own controller does.
+ */
+function attribute({ pane, core }, text, kind, profile) {
 	const source = {
 		kind,
 		host: hostname(),
@@ -250,11 +316,32 @@ function attribute({ pane, core }, text, kind) {
 	const attributes = Object.entries(source)
 		.map(([key, value]) => `${key}="${xml(value)}"`)
 		.join(" ");
+	const context = [
+		...(profile ? [`<initial_worker_profile>\n${profile}\n</initial_worker_profile>`] : []),
+		...(kind === "task" ? [DELEGATED_WORKER_GUIDANCE] : []),
+	].join("\n\n");
 	return {
 		sender: `<herdr_sender ${attributes} />`,
 		text,
-		...(kind === "task" ? { context: DELEGATED_WORKER_GUIDANCE } : {}),
+		...(context ? { context } : {}),
 	};
+}
+
+/**
+ * Hands a launched worker its message on its own machine; a worker that never
+ * took it is closed again, so a failed launch leaves nothing behind.
+ */
+async function started(machine, address, params, deadline) {
+	try {
+		return await onMachine(machine, "machine.started", { address, ...params }, deadline);
+	} catch (error) {
+		try {
+			await closeTerminal(machine ? `${machine.id}/${address}` : address);
+		} catch (cleanup) {
+			throw new Error(`${error.message}; closing its terminal also failed: ${cleanup.message}`);
+		}
+		throw error;
+	}
 }
 
 const CONTROLLER_OPS = {
@@ -333,7 +420,7 @@ const CONTROLLER_OPS = {
 				deadline,
 			),
 		]);
-		const [task, args] = await Promise.all([
+		const [task, args, prompt] = await Promise.all([
 			prepareMessage(profile, {
 				cwd: target.cwd,
 				message: params.message,
@@ -341,55 +428,93 @@ const CONTROLLER_OPS = {
 				local: !machine,
 			}),
 			profileArgs(profile),
+			initialProfile(profile),
 		]);
 		const { address } = await launch({
 			params,
 			agent: profile.agent,
-			args,
+			argv: workerOfKind(profile.agent).launchArgs(params.label.trim(), args),
 			target,
 			machine,
 			existing: target.agents,
 			controllerSpace: context.pane.workspace_id,
 		});
-		let delivery;
-		try {
-			delivery = await onMachine(
-				machine,
-				"machine.started",
-				{
-					address,
-					kind: profile.agent,
-					cwd: target.cwd,
-					message: attribute(context, task, "task"),
-				},
-				deadline,
-			);
-		} catch (error) {
-			try {
-				await closeTerminal(machine ? `${machine.id}/${address}` : address);
-			} catch (cleanup) {
-				throw new Error(`${error.message}; closing its terminal also failed: ${cleanup.message}`);
-			}
-			throw error;
-		}
+		const { saved, ...delivery } = await started(
+			machine,
+			address,
+			{ kind: profile.agent, cwd: target.cwd, message: attribute(context, task, "task", prompt) },
+			deadline,
+		);
 		return {
 			...delivery,
 			...(profile.blocking === undefined
 				? {}
 				: { profileBlocking: profile.blocking }),
+			// What reopens this worker once it has closed; a profile that
+			// opened an existing session did not make it this controller's.
+			...(saved && startsFreshSession(profile)
+				? { launch: { kind: profile.agent, session: saved, cwd: target.cwd, args } }
+				: {}),
 		};
 	},
-	async deliver({ machine, target, message, kind }, deadline) {
+	/**
+	 * Delivers to a live agent. `child` is the target as a worker this
+	 * controller spawned: once closed it is reopened on its saved session
+	 * first, except for `/quit`.
+	 */
+	async deliver({ machine, target, message, kind, child }, deadline) {
 		const [entry, context] = await Promise.all([
 			machineEntry(machine),
 			controller(),
 		]);
-		return onMachine(
+		const attributed = attribute(context, message, kind);
+		const send = (to) =>
+			onMachine(entry, "machine.deliver", { target: to, message: attributed, kind }, deadline);
+		if (!child) return send(target);
+		const state = await onMachine(entry, "machine.revive", { ...child, target }, deadline);
+		if (state.live) return send(state.live);
+		if (/^\/quit\s*$/.test(message.trim()))
+			throw new Error(`${target} is already closed; nothing was resumed`);
+		const saved = child.launch;
+		const worker = workerOfKind(saved.kind);
+		if (entry && worker.localOnly) throw new Error(REMOTE_CLAUDE);
+		const { address } = await launch({
+			params: { label: child.name ?? "worker" },
+			agent: saved.kind,
+			argv: worker.resumeArgs(saved.args, saved.session),
+			target: state,
+			machine: entry,
+			existing: state.agents,
+			controllerSpace: context.pane.workspace_id,
+		});
+		const { saved: _session, ...delivery } = await started(
 			entry,
-			"machine.deliver",
-			{ target, message: attribute(context, message, kind), kind },
+			address,
+			{ kind: saved.kind, cwd: state.cwd, message: attributed, messageKind: kind, session: saved.session },
 			deadline,
 		);
+		return { ...delivery, resumed: true };
+	},
+	/** Closes the idle ones among `children`, workers this controller spawned, machine by machine. */
+	async closeIdle({ children }, deadline) {
+		const machines = [...new Set(children.map((child) => child.machine))];
+		const results = await Promise.all(
+			machines.map(async (machine) => {
+				const own = children.filter((child) => child.machine === machine);
+				try {
+					const closed = await onMachine(
+						await machineEntry(machine),
+						"machine.closeIdle",
+						{ children: own },
+						deadline,
+					);
+					return closed.map((result) => ({ ...result, ...(machine ? { machine } : {}) }));
+				} catch (error) {
+					return own.map(({ terminalId }) => ({ terminalId, machine, skipped: error.message }));
+				}
+			}),
+		);
+		return results.flat();
 	},
 	async watch({ machine, target }, deadline) {
 		return onMachine(await machineEntry(machine), "machine.watch", { target }, deadline);

@@ -30,8 +30,8 @@ function deliveryError(message, rejected) {
 
 /**
  * The worker's Shepherdr receiver: its descriptor and session file, after
- * checking the pane still hosts the expected Pi session. Undefined when the
- * worker publishes none.
+ * checking the pane still hosts the expected Pi session. A worker that
+ * publishes none is an error: nothing is typed into its terminal instead.
  */
 async function resolveReceiver(peer, expected, { allowBlocked }) {
 	const agent = await peer.terminal(expected.terminal_id);
@@ -57,7 +57,11 @@ async function resolveReceiver(peer, expected, { allowBlocked }) {
 	try {
 		raw = await readFile(peerInboxPath(sessionFile, agent.terminal_id), "utf8");
 	} catch (error) {
-		if (error.code === "ENOENT") return undefined;
+		if (error.code === "ENOENT")
+			throw deliveryError(
+				`${agent.pane_id} has no Shepherdr receiver; install or update @howaboua/pi-shepherdr in that Pi, or reload it`,
+				true,
+			);
 		throw deliveryError(
 			`Could not read target Shepherdr receiver: ${error.message}`,
 			true,
@@ -96,22 +100,23 @@ function peerFrame(receiver, fields) {
 }
 
 /**
- * Sends one message frame. Resolves undefined when the worker publishes no
- * receiver, so the caller can choose another route.
+ * Sends one message frame.
  * @param {{ terminal(address: string): Promise<object>, closeTerminal(address: string): Promise<void> }} peer Core identity of the worker's terminal
  * @param {{ pane_id: string, terminal_id: string, agent_session?: { kind: string, value: string } | null }} expected
  * @param {{ text: string, sender: string, context?: string }} message
- * @param {{ commands?: boolean }} [options] commands asks for the slash
- *   commands the worker accepts instead of delivering text; it works while blocked.
- * @returns {Promise<{ command: boolean, commands?: { name: string, description: string }[] } | undefined>}
+ * @param {{ commands?: boolean, closeIfIdle?: boolean }} [options] commands
+ *   asks for the slash commands the worker accepts instead of delivering text;
+ *   it works while blocked. closeIfIdle sends `/quit` for the receiver to run
+ *   only if the worker is idle at that moment, rejecting otherwise.
+ * @returns {Promise<{ command: boolean, closed?: true, commands?: { name: string, description: string }[] }>}
+ *   closed: Pi quit and its terminal was closed
  */
 export async function sendPeerMessage(peer, expected, message, options = {}) {
 	const receiver = await resolveReceiver(peer, expected, {
 		allowBlocked: options.commands === true,
 	});
-	if (!receiver) return undefined;
 	const { id, frame } = peerFrame(receiver, {
-		kind: options.commands ? "commands" : "message",
+		kind: options.closeIfIdle ? "close-idle" : options.commands ? "commands" : "message",
 		text: message.text,
 		sender: message.sender,
 		context: message.context,
@@ -123,13 +128,11 @@ export async function sendPeerMessage(peer, expected, message, options = {}) {
  * Hands a reply to the extension that published a pending extension message
  * (`shepherdr-extension-message`). It reaches a blocked worker without a
  * turn and resolves once the extension accepted it; a refusal rejects with
- * its reason. Resolves false when the worker publishes no receiver.
+ * its reason.
  * @param {{ extension: string, id: string, message: string }} reply
- * @returns {Promise<boolean>}
  */
 export async function sendPeerExtensionReply(peer, expected, reply) {
 	const receiver = await resolveReceiver(peer, expected, { allowBlocked: true });
-	if (!receiver) return false;
 	const { id, frame } = peerFrame(receiver, {
 		kind: "extension-reply",
 		extension: reply.extension,
@@ -137,7 +140,6 @@ export async function sendPeerExtensionReply(peer, expected, reply) {
 		message: reply.message,
 	});
 	await deliverFrame(peer, expected, { text: "" }, receiver.descriptor.port, receiver.sessionFile, id, frame, EXTENSION_REPLY_TIMEOUT_MS);
-	return true;
 }
 
 function deliverFrame(peer, expected, message, port, sessionFile, id, frame, timeoutMs = 10_000) {
@@ -172,7 +174,7 @@ function deliverFrame(peer, expected, message, port, sessionFile, id, frame, tim
 			if (settled) return;
 			if (!closing) return failed();
 			void closeExitedTerminal(peer, expected, sessionFile).then(
-				() => finish(undefined, { command: true }),
+				() => finish(undefined, { command: true, closed: true }),
 				(error) =>
 					finish(
 						deliveryError(
