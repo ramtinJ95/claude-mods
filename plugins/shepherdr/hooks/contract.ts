@@ -15,7 +15,7 @@ const FIELDS: Record<Action, readonly string[]> = {
   spawn: ['machine', 'agent_type', 'label', 'name', 'placement', 'workspace', 'cwd', 'message', 'base', 'blocking'],
   send: ['machine', 'target', 'message'],
   assign: ['machine', 'target', 'message', 'blocking'],
-  answer: ['machine', 'target', 'ask_id', 'answers', 'blocking'],
+  answer: ['machine', 'target', 'ask_id', 'answers'],
   read: ['machine', 'target', 'source', 'lines'],
   watch: ['machine', 'target'],
   unwatch: ['machine', 'target'],
@@ -136,8 +136,8 @@ export function orchestrationGuidance(enabled: boolean, general: boolean): strin
   const ownership = "Own a scope or delegate it; don't do both."
   if (!enabled) return `Work normally. Delegate only when useful or requested. ${ownership}`
   const guidance = general
-    ? 'Your main goal from now on is to orchestrate general agents with separate scopes. Integrate their results, validate the combined outcome and report it. Work directly only when asked or for routine local tasks.'
-    : 'Your main goal from now on is to orchestrate agents with separate scopes. Integrate their results, validate the combined outcome and report it. Work directly only when asked or for routine local tasks.'
+    ? 'Orchestrate general agents with separate scopes. Integrate their results, validate the combined outcome and report it. Work directly only when asked or for routine local tasks.'
+    : 'Orchestrate agents with separate scopes. Integrate their results, validate the combined outcome and report it. Work directly only when asked or for routine local tasks.'
   return `${guidance} ${ownership}`
 }
 
@@ -154,6 +154,7 @@ export type ProfileSummary = {
 }
 
 export function helpText(profiles: { sources: Record<string, string>; profiles: ProfileSummary[] }): string {
+  const general = profiles.profiles.map(profile => profile.name).filter(name => /(^|-)general$/.test(name))
   return JSON.stringify({
     profiles: profiles.profiles,
     profile_sources: profiles.sources,
@@ -163,23 +164,26 @@ export function helpText(profiles: { sources: Record<string, string>; profiles: 
       spawn: '{action:"spawn", agent_type, label (short, 2 words when useful), message, cwd?, placement?: new_tab|new_workspace|terminal, workspace?, name?, base?, blocking?} — a new tab beside this session by default, in workspace (a space ID from list) when given; terminal runs it in the background',
       send: '{action:"send", target, message}',
       assign: '{action:"assign", target, message, blocking?}',
-      answer: '{action:"answer", target, ask_id, answers: [{selections?: [choice label], other?, comment?}] one per prompt in order, blocking?}',
+      answer: '{action:"answer", target, ask_id, answers: [{selections?: [choice label], other?, comment?}] one per prompt in order}',
       read: '{action:"read", target, source?: latest|visible|recent, lines?}',
       watch: '{action:"watch", target}',
       unwatch: '{action:"unwatch", target}',
     },
     rules: [
-      'spawn, assign and answer block until the worker settles unless blocking:false; a profile blocking setting overrides spawn',
-      'Non-blocking work and watched agents report completion, questions and blockage as agent_report messages; never poll',
+      'spawn and assign return once the task is delivered, and its result arrives as an agent_report message. blocking:true waits for the result in the call instead; a profile blocking setting overrides spawn. Blocking calls made together wait together',
+      'Reports of completion, questions and blockage arrive on their own, for delegated work and watched agents: do other work or end the turn; never poll or sleep for them',
       'send delivers input without waiting or watching; use assign only for work whose result you need',
-      'Give each worker a distinct scope, desired outcome, relevant project context and issue references. Describe success rather than lists of forbidden investigations',
-      'Reuse an agent only for the same investigation; keep reviews independent; a new scope gets a new agent',
+      'Give the task and the context it needs, and trust the agent to choose its approach; avoid unnecessary restrictions and overly narrow scope',
+      'Keep each agent until its task is verified complete and return corrections to it before closing it; use separate agents for unrelated work and independent reviews',
+      'Messages wake idle agents: send only what changes the recipient\'s next action, never acknowledgements, status-only updates or standby reminders. Close a finished worker with "/quit" alone',
       'Delegation and watch keep reporting later work until unwatch or the terminal closes',
-      'A question report carries its ask_id and prompts; answer it with answer, asking the user first when the choice is theirs. A background question does not stop the worker, and answering it does not wait for its task',
+      'send or assign to a closed worker this session spawned reopens its saved session first and returns resumed:true with its current target; "/quit" never reopens one',
+      'A question report carries its ask_id and prompts; answer it with answer, asking the user first when the choice is theirs. answer returns once the worker took it; the work it resumes reports on its own',
       'Messages starting with / run as the worker\'s slash commands without a watch; list them first with commands:true',
       'Agents on another machine need its machine name or ID from list with every request; omit machine for this one. Claude Code agents work on this machine only',
+      'Use agents for every operation it supports, even after a failure: report the blocker instead of driving agents with hc or shell commands',
       'For work in this repository, create a dedicated worktree and pass it as cwd',
-      'Close finished workers by sending "/quit"; do not send acknowledgements',
+      ...(general.length ? [`Use ${general.join(' and ')} only when asked or while orchestrating`] : []),
     ],
   })
 }

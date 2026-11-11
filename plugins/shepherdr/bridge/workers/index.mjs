@@ -1,12 +1,15 @@
 // Worker adapters by agent kind. Each exports kind, program (its display
-// name), executable (its command), localOnly?, launchArgs(label, profileArgs), launchLabels?(args)
-// (Core labels spawn sets on the worker's terminal), sessionPath(agent),
-// isReady(agent), view(agent) -> SessionView, deliver(agent, message),
-// commands(agent), answer(agent, askId, answers) -> { status?, background?,
+// name), executable (its command), localOnly?, launchArgs(label, profileArgs),
+// resumeArgs(profileArgs, session) (the arguments that reopen a spawned
+// worker's saved session), launchLabels?(argv) (Core labels a launch sets on
+// the worker's terminal), sessionPath(agent), savedSession(agent) (what
+// resumeArgs takes), isReady(agent), view(agent) -> SessionView,
+// deliver(agent, message), commands(agent), closeIfIdle(agent) (rejects
+// unless the worker is idle), answer(agent, askId, answers) -> { status?,
 // session? }, answerStatus(agent, askId, answers) and optional
-// awaitStartup(agent) -> { notice? }, which spawn awaits before delivering the
-// first task; a notice says why that task may take a fallback route. Optional
-// startupFailure(screen) -> message? explains a terminal where a spawn failed.
+// awaitStartup(agent), which a launch awaits before delivering anything.
+// Optional startupFailure(screen) -> message? explains a terminal where a
+// launch failed.
 // view().ask is { toolCallId, delivery?: "steer", prompts: [{ title, body?,
 // multiple, choices }] }, where "steer" marks a question asked while the worker
 // continues; answers are [{ selections?, other?, comment? }] in prompt order,

@@ -57,7 +57,7 @@ export function callSummary(input: Input): string {
 }
 
 export function CallRow({ Box, Text }: Draw, input: Input, state: { isRunning: boolean; isErrored: boolean }) {
-  const blocking = input['blocking'] !== false && ['spawn', 'assign', 'answer'].includes(str(input['action']) ?? '')
+  const blocking = input['blocking'] === true && ['spawn', 'assign'].includes(str(input['action']) ?? '')
   return (
     <Box>
       <Text bold color="claude">shepherdr </Text>
@@ -196,14 +196,8 @@ export function ResultRow(draw: Draw, output: string) {
   if (reports.length && !value) return ReportRows(draw, reports)
   if (!value) return undefined
   const line = (text: string) => <Text dimColor>{text}</Text>
-  // An answer's status, then the worker's settlement when it waited for one.
   if ('ask_id' in value)
-    return (
-      <Box flexDirection="column">
-        {line(`answer ${String(value['status'])}${value['input_sent'] === false ? ' (already recorded; nothing sent)' : ''}`)}
-        {reports.length > 0 && ReportRows(draw, reports)}
-      </Box>
-    )
+    return line(`answer ${String(value['status'])}${value['input_sent'] === false ? ' (already recorded; nothing sent)' : ''}`)
   if (Array.isArray(value['agents'])) {
     const agents = value['agents'] as Agent[]
     const unavailable = (value['unavailable'] as { machine_name?: string; machine?: string; error: string }[] | undefined) ?? []
@@ -228,10 +222,11 @@ export function ResultRow(draw: Draw, output: string) {
   // Help is reference text: the default row keeps all of it.
   if (Array.isArray(value['profiles'])) return undefined
   if ('watching' in value) return line(`${value['watching'] ? 'watching' : 'stopped watching'} ${String(value['target'])}`)
-  if ('commandSubmitted' in value) return line(`command sent to ${String(value['target'])} (${String(value['delivery'])})`)
+  const resumed = value['resumed'] ? ' · reopened' : ''
+  if ('commandSubmitted' in value) return line(`command sent to ${String(value['target'])} (${String(value['delivery'])})${resumed}`)
   if ('delivery' in value)
     return line(
-      `${value['status'] === 'working' ? 'working in the background' : 'delivered'} · ${String(value['name'] ?? value['target'])} ${String(value['target'])} (${String(value['delivery'])})`,
+      `${value['status'] === 'working' ? 'working in the background' : 'delivered'} · ${String(value['name'] ?? value['target'])} ${String(value['target'])} (${String(value['delivery'])})${resumed}`,
     )
   if ('reply' in value || 'text' in value || 'ask' in value) {
     const agent = value['agent'] as Agent | undefined
