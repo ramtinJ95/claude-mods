@@ -490,11 +490,11 @@ export class Fleet {
     const records = [...this.records.values()]
     const stopped = [...this.watchers.values()].find(watcher => watcher.error)?.error
     const mode = this.orchestration?.enabled ? 'orchestrating' : undefined
-    if (stopped) this.io.status(`shepherdr: monitoring stopped (${stopped}); run /shepherdr`)
-    else if (!records.length) this.io.status(mode && `shepherdr: ${mode}`)
+    if (stopped) this.io.status(`monitoring stopped (${stopped}); run /shepherdr`)
+    else if (!records.length) this.io.status(mode)
     else {
       const working = records.filter(record => record.status === 'working').length
-      this.io.status(`shepherdr: ${records.length} watched, ${working} working${mode ? `, ${mode}` : ''}`)
+      this.io.status(`${records.length} watched, ${working} working${mode ? `, ${mode}` : ''}`)
     }
   }
 }
