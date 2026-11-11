@@ -90,6 +90,53 @@ async function appendAll($: EngineInterface, texts: readonly string[]): Promise<
   for (const text of texts) await $.session.append({ message: { type: 'user', content: [{ type: 'text', text }] } })
 }
 
+const isQuit = (text: string) => /^\/quit\s*$/.test(text.trim())
+
+/** What a delivery says of where its message went. */
+function deliverySummary(delivery: Delivery) {
+  return {
+    target: delivery.agent.target,
+    ...(delivery.record?.machine ? { machine: delivery.record.machine } : {}),
+    ...(delivery.agent.name ? { name: delivery.agent.name } : {}),
+    delivery: delivery.delivery,
+    ...(delivery.resumed ? { resumed: true } : {}),
+  }
+}
+
+/**
+ * Delivers a message or task to an agent. One this session spawned is
+ * reopened first when it has closed; a /quit that closes a watched worker
+ * ends its watch without a report.
+ */
+async function deliverTo(bridge: Bridge, current: Fleet, request: AgentsRequest, kind: 'message' | 'task'): Promise<Delivery> {
+  const text = request.message!
+  const child = current.child(request.target!, request.machine)
+  const closed = isQuit(text) ? current.quitting(request.target!, request.machine) : undefined
+  let delivery: Delivery
+  try {
+    delivery = await call<Delivery>(
+      bridge,
+      'deliver',
+      {
+        machine: child ? child.machine : request.machine,
+        target: child?.terminalId ?? request.target,
+        message: text,
+        kind,
+        ...(child ? { child: { terminalId: child.terminalId, name: child.name, launch: child.launch } } : {}),
+      },
+      // Reopening a closed worker is a launch.
+      child ? 240_000 : 90_000,
+    )
+  } catch (error) {
+    closed?.(false)
+    throw error
+  }
+  closed?.(delivery.closed === true)
+  if (child && delivery.resumed) current.reopened(child, delivery.agent)
+  await sendRoute(bridge, delivery.session)
+  return delivery
+}
+
 function dispatchWork(
   bridge: Bridge,
   current: Fleet,
@@ -98,19 +145,14 @@ function dispatchWork(
   blocking: boolean,
   signal: AbortSignal,
 ): Promise<string> | string {
-  const summary = {
-    target: delivery.agent.target,
-    ...(delivery.record?.machine ? { machine: delivery.record.machine } : {}),
-    ...(delivery.agent.name ? { name: delivery.agent.name } : {}),
-    delivery: delivery.delivery,
-    ...(delivery.notice ? { notice: delivery.notice } : {}),
-  }
+  const summary = deliverySummary(delivery)
   if (delivery.command || !delivery.record) return JSON.stringify({ ...summary, commandSubmitted: true })
   const record = current.track({ agent: delivery.agent, record: delivery.record }, task)
-  if (!blocking) return JSON.stringify({ ...summary, status: 'working' })
+  if (!blocking)
+    return JSON.stringify({ ...summary, status: 'working', next: 'Its report arrives on its own; do other work or end the turn' })
   const settled = current.waitFor(bridge, record, signal)
-  const { notice } = delivery
-  return notice ? settled.then(report => `${report}\n${notice}`) : settled
+  // The report names the worker's new terminal; say why it changed.
+  return delivery.resumed ? settled.then(report => `${report}\nReopened from its saved session for this task.`) : settled
 }
 
 async function handle(bridge: Bridge, current: Fleet, cwd: string, request: AgentsRequest, signal: AbortSignal): Promise<string> {
@@ -142,14 +184,13 @@ async function handle(bridge: Bridge, current: Fleet, cwd: string, request: Agen
           `${worker} started but did not receive its task: ${message(error)}. Assign the task to ${worker}, or close it with send "/quit"`,
         )
       }
-      const blocking = delivery.profileBlocking ?? request.blocking ?? true
+      current.own(delivery)
+      const blocking = delivery.profileBlocking ?? request.blocking ?? false
       return dispatchWork(bridge, current, delivery, request.message!, blocking, signal)
     }
     case 'assign': {
-      const params = { machine, target: request.target, message: request.message, kind: 'task' }
-      const delivery = await call<Delivery>(bridge, 'deliver', params, 90_000)
-      await sendRoute(bridge, delivery.session)
-      return dispatchWork(bridge, current, delivery, request.message!, request.blocking ?? true, signal)
+      const delivery = await deliverTo(bridge, current, request, 'task')
+      return dispatchWork(bridge, current, delivery, request.message!, request.blocking ?? false, signal)
     }
     case 'answer': {
       const askId = request.ask_id!
@@ -164,23 +205,16 @@ async function handle(bridge: Bridge, current: Fleet, cwd: string, request: Agen
         }
         const result = { target: answered.agent.target, ask_id: askId, status }
         if (!answered.record) return JSON.stringify({ ...result, input_sent: false })
-        const record = current.track({ agent: answered.agent, record: answered.record }, undefined, true)
-        // A background Ask never stopped its worker: there is nothing to wait for.
-        if (answered.background || request.blocking === false) return JSON.stringify(result)
-        return `${JSON.stringify(result)}\n${await current.waitFor(bridge, record, signal)}`
+        // The work it resumes reports through its watch.
+        current.track({ agent: answered.agent, record: answered.record }, undefined, true)
+        return JSON.stringify(result)
       } finally {
         end()
       }
     }
     case 'send': {
-      const params = { machine, target: request.target, message: request.message, kind: 'message' }
-      const delivery = await call<Delivery>(bridge, 'deliver', params, 90_000)
-      await sendRoute(bridge, delivery.session)
-      return JSON.stringify({
-        target: delivery.agent.target,
-        delivery: delivery.delivery,
-        ...(delivery.command ? { commandSubmitted: true } : {}),
-      })
+      const delivery = await deliverTo(bridge, current, request, 'message')
+      return JSON.stringify({ ...deliverySummary(delivery), ...(delivery.command ? { commandSubmitted: true } : {}) })
     }
     case 'read':
       return JSON.stringify(
@@ -218,7 +252,7 @@ async function publishSession($: EngineInterface): Promise<void> {
   }
 }
 
-/** /shepherdr: status and restart; `orchestrate` or `normal` switches the guidance. */
+/** /shepherdr: status and restart; `orchestrate` or `normal` switches the guidance; `close-idle` closes idle spawned workers. */
 async function runCommand(
   $: EngineInterface,
   args: string,
@@ -233,7 +267,8 @@ async function runCommand(
     current.orchestrate(enabled, guidance)
     return { text: `Orchestration ${enabled ? 'on' : 'off'}.`, context: [guidance] }
   }
-  if (choice) return { text: 'Use /shepherdr, /shepherdr orchestrate or /shepherdr normal.' }
+  if (choice === 'close-idle') return { text: await current.closeIdle() }
+  if (choice) return { text: 'Use /shepherdr, /shepherdr orchestrate, /shepherdr normal or /shepherdr close-idle.' }
   return { text: current.inspect(await call<Machine[]>(bridge, 'machines')) }
 }
 
@@ -243,7 +278,8 @@ export const register: Register = on => {
       $.tool.register(TOOL_SPEC),
       $.command.register({
         name: COMMAND,
-        description: 'Show Shepherdr agents and machines, restart monitoring, or switch orchestration (orchestrate|normal)',
+        description:
+          'Show Shepherdr agents and machines, restart monitoring, switch orchestration (orchestrate|normal) or close idle spawned agents (close-idle)',
       }),
     ])
     const started = await next(e)
