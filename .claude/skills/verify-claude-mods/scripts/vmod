@@ -11,7 +11,8 @@ die() { echo "vmod: $*" >&2; exit 1; }
 
 usage() {
 	cat <<'EOF'
-vmod launch <mod>             start a Claude Code instance with plugins/<mod> loaded; prints the run ID
+vmod launch <mod> [--managed] start a Claude Code instance with plugins/<mod> loaded; prints the run ID
+                              --managed: under a managed-settings folder of its own (the mods' reduced mode)
 vmod doctor <run>             read-only health check of a run's instance
 vmod screen <run> [lines]     print the screen, with <lines> of history above it when given
 vmod snap <run> <name>        save the screen to the run's evidence as <name>.txt
@@ -59,7 +60,12 @@ send_text() {
 
 cmd_launch() {
 	need_core
-	local mod=${1:?mod name required}
+	local mod=${1:?mod name required} managed=0
+	case ${2:-} in
+		'') ;;
+		--managed) managed=1 ;;
+		*) die "unknown launch option: $2" ;;
+	esac
 	[ -f "$REPO/plugins/$mod/.claude-plugin/plugin.json" ] || die "no mod at plugins/$mod"
 	local suffix; suffix=$(od -An -N2 -tx1 /dev/urandom | tr -d ' \n')
 	local id; id="$mod-$(date +%Y%m%d-%H%M%S)-$suffix"
@@ -96,9 +102,25 @@ cmd_launch() {
 	# DISABLE_AUTOUPDATER stops Claude Code from installing itself into that data
 	# dir and repointing the launcher. --no-notify keeps Core's notes about the
 	# instance out of this session.
+	# --managed gives this instance alone a managed-settings folder, as a machine
+	# under an organization's policy has: Claude Code then seats its built-in
+	# security plugin outermost, which keeps installed plugins out of compaction.
+	# Claude Code reads that folder only at /etc/claude-code (2.1.322 ignores
+	# CLAUDE_CODE_MANAGED_SETTINGS_PATH), so the instance runs in a mount
+	# namespace where the run's own folder sits there; the machine's /etc is
+	# untouched. The one setting in it is an env var nothing reads.
+	local policy=()
+	if [ $managed = 1 ]; then
+		command -v bwrap >/dev/null || die "--managed needs bwrap (bubblewrap) on PATH"
+		[ ! -e /etc/claude-code ] || die "--managed is pointless here: this machine already has /etc/claude-code"
+		mkdir "$base/managed"
+		printf '{"env":{"VMOD_MANAGED":"1"}}\n' >"$base/managed/managed-settings.json"
+		policy=(bwrap --dev-bind / / --overlay-src /etc --tmp-overlay /etc --bind "$base/managed" /etc/claude-code --)
+	fi
+
 	local terminal
 	terminal=$(hc run --json --bg --no-notify --name "$name" --cwd "$base/scratch" "${placement[@]}" -- \
-		env "XDG_DATA_HOME=$base/data" DISABLE_AUTOUPDATER=1 claude \
+		env "XDG_DATA_HOME=$base/data" DISABLE_AUTOUPDATER=1 "${policy[@]}" claude \
 		--plugin-dir "$REPO/plugins/$mod" --settings "$settings" --session-id "$session" \
 		--debug-file "$ev/debug.log" | jq -r '.address // empty')
 	[ -n "$terminal" ] || die "Core started no terminal for the instance"
@@ -107,7 +129,7 @@ cmd_launch() {
 	{
 		printf '%s=%q\n' RUN_ID "$id" MOD "$mod" MOD_VERSION "$version" NAME "$name" TERMINAL "$terminal" \
 			SESSION "$session" SCRATCH "$base/scratch" DATA "$base/data" BASE "$base" \
-			EVIDENCE "$ev" LAUNCHER "$launcher"
+			EVIDENCE "$ev" LAUNCHER "$launcher" MANAGED "$managed"
 	} >"$ev/run.env"
 
 	TERMINAL=$terminal
@@ -142,6 +164,8 @@ cmd_doctor() {
 	check "plugin.json version still $MOD_VERSION" '[ "$(jq -r .version "$REPO/plugins/$MOD/.claude-plugin/plugin.json")" = "$MOD_VERSION" ]'
 	check "claude launcher unchanged ($LAUNCHER)" '[ "$(launcher_target)" = "$LAUNCHER" ]'
 	check "Claude Code did not install into the run's data dir" '[ ! -e "$DATA/claude" ]'
+	[ "${MANAGED:-0}" = 0 ] || check "managed settings seated the built-in security plugin outermost (debug log)" \
+		'grep -q "cc-plugin-sec-default@builtin seated outermost" "$EVIDENCE/debug.log"'
 	[ $ok = 1 ] || exit 1
 }
 

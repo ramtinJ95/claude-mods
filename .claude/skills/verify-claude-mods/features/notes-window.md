@@ -20,7 +20,7 @@ notes-compaction lets the agent start a fresh context window that carries only a
 Preconditions:
 
 - `RUN=$($V launch notes-compaction)` and `$V doctor "$RUN"` pass.
-- Run `$V type "$RUN" /notes` and `$V snap "$RUN" window-mode-01` first. If the panel shows `Claude Code keeps plugins out of compaction here`, the account runs the reduced mode: expect a short Claude Code summary ahead of each new window, and record that in the report.
+- Run `$V type "$RUN" /notes` and `$V snap "$RUN" window-mode-01` first. If the panel shows `Claude Code keeps plugins out of compaction here`, the account runs the reduced mode: expect a short Claude Code summary ahead of each new window, and record that in the report. To drive that mode on purpose, use [Reduced mode](./notes-reduced.md).
 - The same panel shows `[ Normal compaction before new windows: off ]`. That setting lives in your real Claude Code config, not the run's data dir. If it reads `on`, `/compact` is Claude Code's own and the **Compact** step cannot pass: report the journey as failed on that precondition. Do not toggle it, since that changes the user's setting for every session.
 
 - **Seed context.** Run `$V prompt "$RUN" "Remember the codeword PLUM-42 for later. Reply with exactly: noted"`.
