@@ -14,7 +14,7 @@ Never drive the session you are running in, and never let the instance under tes
 ## Requirements
 
 - This session runs inside a Herdr Core terminal (`HC_TERMINAL_ID` set), from the Herdr app or `hc`. The helper refuses otherwise. Outside Core there is no supported driver; say so instead of improvising. A tmux pane would inherit your shell's sandbox, and Claude Code cannot run inside it. The older Herdr TUI (`herdr`, `HERDR_ENV`) is not supported: shepherdr itself needs Core.
-- `claude`, `hc`, `jq`, `git`, `uuidgen` on `PATH`. review-pane's `/review-diff` also needs `nvim` 0.10+. shepherdr's Pi features need `pi` with pi-shepherdr; its Claude worker features do not.
+- `claude`, `hc`, `jq`, `git`, `uuidgen` on `PATH`. review-pane's `/review-diff` also needs `nvim` 0.10+. notes-compaction's reduced mode (`launch --managed`) needs `bwrap` (bubblewrap). shepherdr's Pi features need `pi` with pi-shepherdr; its Claude worker features do not.
 - Your logged-in Claude Code account. The instance uses your real `~/.claude` (auth, settings, other installed plugins), and each journey costs real model turns.
 
 ## Helper
@@ -28,7 +28,7 @@ $V help
 
 | Command | Does |
 | --- | --- |
-| `$V launch <mod>` | Creates the run, starts the instance, accepts the trust prompt for its own scratch folder, waits until idle, prints the run ID |
+| `$V launch <mod> [--managed]` | Creates the run, starts the instance, accepts the trust prompt for its own scratch folder, waits until idle, prints the run ID. `--managed` starts it as on a machine with managed settings (see Launch) |
 | `$V doctor <run>` | Read-only health check (below) |
 | `$V prompt <run> "<text>"` | Submits a prompt and waits for the turn to settle (5 min cap); prints `"done"`, `"idle"` or `"blocked"`, or fails when no turn starts within 30 s |
 | `$V type <run> "<text>"` | Types text and Enter without waiting: slash commands, pane `Input`s |
@@ -58,6 +58,10 @@ $V doctor "$RUN"
 6. Ready means Claude Code reports `idle` to Core and its banner is on screen.
 
 Both environment variables are load-bearing. Setting `XDG_DATA_HOME` on a whole shell makes its tools follow it (atuin started a daemon in the scratch dir). Without `DISABLE_AUTOUPDATER=1`, Claude Code installs itself into `<data>/claude/versions/` and repoints the user's `claude` launcher symlink there, and deleting the scratch dir then breaks `claude` for the user. The doctor checks for both.
+
+### Managed settings (`--managed`)
+
+On a machine with managed settings, and for Team and Enterprise organizations, Claude Code seats its built-in security plugin outermost, which keeps installed plugins out of compaction; notes-compaction then runs its reduced mode. `launch <mod> --managed` gives one instance that state without touching the machine. The run gets a `managed/` folder holding a `managed-settings.json` whose one setting is an env var nothing reads, and the instance starts under `bwrap` in a mount namespace where that folder sits at `/etc/claude-code`. Claude Code 2.1.322 reads the folder only there and ignores `CLAUDE_CODE_MANAGED_SETTINGS_PATH`. The rest of the filesystem is the real one, so auth, settings and the run's data dir behave as in a plain launch. The launch refuses when the machine already has `/etc/claude-code`. `MANAGED=1` in `run.env` marks such a run, and the doctor then also checks that the debug log reads `cc-plugin-sec-default@builtin seated outermost`.
 
 ## Doctor
 
