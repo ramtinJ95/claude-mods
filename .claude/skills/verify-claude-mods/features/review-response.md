@@ -31,7 +31,7 @@ Preconditions:
 - **Question.** Run `$V keys "$RUN" b a`, then `$V type "$RUN" "Why three lines?"`. `Asking…` shows under the question, then an answer replaces it (`$V wait "$RUN" "Asking…"` then wait for it to disappear by re-reading `$V screen "$RUN"`).
 - **Dim key.** Run `$V keys "$RUN" n`. A notice says `n answers the question q asks before discarding.` and nothing changes.
 - **Resume.** Run `$V keys "$RUN" esc`, then `$V type "$RUN" /review-response` and `$V wait "$RUN" "Resumed the open review."`. Both annotations and the answer are still there.
-- **Finish.** Run `$V keys "$RUN" y`, `$V wait "$RUN" "Review loaded into the prompt."`, `$V snap "$RUN" response-finish-01`. The prompt holds the prepared review: the issue and the comment with their quoted lines, and no question. Nothing was submitted: Herdr still reports the agent `idle` (`herdr agent get "$PANE"`).
+- **Finish.** Run `$V keys "$RUN" y`, `$V wait "$RUN" "Review loaded into the prompt."`, `$V snap "$RUN" response-finish-01`. The prompt holds the prepared review: the issue and the comment with their quoted lines, and no question. Nothing was submitted: Core still reports the instance `idle` (`hc get "$TERMINAL" --json | jq -r .status.state`, with `.verify/$RUN/run.env` sourced).
 - **Proof.** Run `$V screen "$RUN" 120 > "$EVIDENCE/response-finish-prompt.txt"`, clear the prompt with `$V keys "$RUN" ctrl+c`, then `$V cleanup "$RUN"`.
 
 ## Gotchas

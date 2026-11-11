@@ -4,7 +4,7 @@ review-pane opens the uncommitted changes (or everything since the merge-base) a
 
 ## Sub-features
 
-- `diff-open` opens `/review-diff` in a Herdr split to the right with the changes in the quickfix list, untracked files included.
+- `diff-open` opens `/review-diff` in Neovim with the changes in the quickfix list, untracked files included: in a split under tmux, kitty or the older Herdr TUI, else by printing the script to run.
 - `diff-base` opens `/review-diff base` against the merge-base with the default branch.
 - `diff-annotate` adds comments, suggestions, issues and an overall comment with `:Review` subcommands.
 - `diff-ask` asks a question answered in Neovim.
@@ -23,21 +23,21 @@ Preconditions:
 
 - `RUN=$($V launch review-pane)` and `$V doctor "$RUN"` pass. The scratch repo has `notes.txt` edited (`beta` became `BETA changed`) and `new.txt` untracked.
 - `nvim --version` is 0.10 or newer.
+- `. ".verify/$RUN/run.env"` is sourced, for `$TERMINAL`, `$SCRATCH` and `$EVIDENCE`.
 
 - **Usage error.** Run `$V type "$RUN" "/review-diff nonsense"` and `$V wait "$RUN" "Usage: /review-diff [base]"`.
-- **Open.** Run `$V type "$RUN" /review-diff`, `$V wait "$RUN" "Opened the review in Neovim beside this pane."`. Find the Neovim pane: `herdr pane list --workspace "$HERDR_WORKSPACE_ID" | jq -r --arg t "$TAB" '.result.panes[] | select(.tab_id == $t and .pane_id != "'"$PANE"'") | .pane_id'` (call it `NV`). Run `herdr pane read "$NV" --source visible > "$EVIDENCE/diff-open-01.txt"`. Neovim shows `notes.txt` at the changed line.
-- **Quickfix.** In Neovim, run `herdr pane send-text "$NV" ":Review files"` and `herdr pane send-keys "$NV" enter`. The quickfix list holds a stop in `new.txt` and one in `notes.txt`, in git's path order.
-- **Comment.** Go to the edited line explicitly (`herdr pane send-text "$NV" ":edit notes.txt | 2"`, `enter`; never `:cfirst`, which lands in `new.txt`), then `:Review comment`, `enter`, type `Use lowercase like the other lines`, `enter`. The line shows the annotation.
-- **Finish.** Send `:Review finish` and `enter`. Neovim closes and its pane goes away. In the instance, `$V wait "$RUN" "Review loaded into the prompt."` and `$V snap "$RUN" diff-finish-01`. The prompt starts `I reviewed the uncommitted changes. Please address these annotations.` and lists the comment on `notes.txt` line 2 with the quoted line `BETA changed`.
-- **Not submitted.** `herdr agent get "$PANE"` still reports `idle`. Clear the prompt with `$V keys "$RUN" ctrl+c`.
-- **No changes.** Commit everything in the scratch repo (`git -C "$SCRATCH" add -A && git -C "$SCRATCH" -c user.name=verify -c user.email=verify@localhost commit -qm all`), run `$V type "$RUN" /review-diff`; the reply starts `No ` and names the uncommitted changes.
-- **Proof.** Run `$V cleanup "$RUN"`.
+- **Open.** Run `$V type "$RUN" /review-diff` and `$V wait "$RUN" "in a terminal to open the review"`. Under Core the mod opens no split: the row reads ``Run `sh '<dir>/open.sh'` in a terminal to open the review in Neovim.`` Take `<dir>` from `$V screen "$RUN" 60` (call it `DIR`), then open the script in a terminal of its own: `NV=$(hc run --json --bg --no-notify --name "vm-review-nvim-${RUN##*-}" --cwd "$SCRATCH" -- sh "$DIR/open.sh" | jq -r .address)`. Run `hc read "$NV" > "$EVIDENCE/diff-open-01.txt"`. Neovim shows the first stop, `new.txt`, a `Review` notice, and the quickfix list with `new.txt|1|` and `notes.txt|2|`, in git's path order.
+- **Comment.** Go to the edited line explicitly (`nvim --server "$DIR/nvim.sock" --remote-send ':edit notes.txt | 2<CR>'`; never `:cfirst`, which lands in `new.txt`), then send `':Review comment<CR>'`. `hc read "$NV"` shows a `Comment on notes.txt line 2` input. Send `'Use lowercase like the other lines<CR>'`. The line shows `• Comment: Use lowercase like the other lines` beneath it.
+- **Finish.** Send `':Review finish<CR>'`. Neovim exits (`hc get "$NV" --json` reads `"state":"finished"`, exit code 0) and `<dir>` is removed. In the instance, `$V wait "$RUN" "Review loaded into the prompt."` and `$V snap "$RUN" diff-finish-01`. The prompt starts `I reviewed the uncommitted changes. Please address these annotations.` and lists the comment on `notes.txt` line 2 with the quoted line `BETA changed`.
+- **Not submitted.** `hc get "$TERMINAL" --json | jq -r .status.state` still reports `idle`. Clear the prompt with `$V keys "$RUN" ctrl+c`.
+- **No changes.** Commit everything in the scratch repo (`git -C "$SCRATCH" add -A && git -C "$SCRATCH" -c user.name=verify -c user.email=verify@localhost commit -qm all`), run `$V type "$RUN" /review-diff`; the row reads `review-pane: No uncommitted changes.`
+- **Proof.** Run `hc rm "$NV"` (`hc kill "$NV"` first if Neovim is still open), then `$V cleanup "$RUN"`.
 
 ## Gotchas
 
-- Herdr opens Neovim with focus, which can switch your Herdr view to the run's tab. Switch back yourself; keystrokes sent by pane ID still land correctly.
-- The split belongs to the run's tab, so `cleanup` closes a Neovim left open. A review closed with annotations keeps its directory under the system temp dir for `/review-diff` to reopen; finish or discard every review a journey opens.
-- `:Review` prompts for the annotation text in Neovim's command line. Wait for the prompt before typing; read the pane with `herdr pane read "$NV" --source visible`.
+- The mod opens a split only under tmux, kitty or the older Herdr TUI. Under Core it prints the script, and the journey opens it itself. The Neovim terminal is a child of this session, not of the run: `cleanup` neither closes nor lists it.
+- `hc keys` has no name for `:` and `hc send` pastes, which Neovim's normal mode puts into the buffer. Type into Neovim through its own socket (`nvim --server "$DIR/nvim.sock" --remote-send`), and read it with `hc read "$NV"`. A sandboxed shell that cannot reach the socket has no way to drive this journey: report that.
+- A review closed with annotations keeps its directory under the system temp dir for `/review-diff` to reopen; finish or discard every review a journey opens.
+- `:Review` prompts for the annotation text in a floating input. Wait for it on `hc read "$NV"` before sending the text.
 - The scratch repo has no remote, so `/review-diff base` reports `No default branch found (origin/HEAD, main or master) to diff against.` unless the branch is `main` or `master`. Check `git -C "$SCRATCH" branch --show-current` before treating that message as a failure.
 - Your Neovim config loads too. A config that maps a `<leader>r…` key wins over the mod's; drive with `:Review` commands, which always work.
-- A sandboxed shell cannot reach Neovim's socket. Drive Neovim only through Herdr keys.
