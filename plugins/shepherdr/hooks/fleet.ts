@@ -6,11 +6,18 @@
 // each change is reconciled with a bridge `check`. A blocking tool call or an
 // answer being entered leases its worker, so the watcher never reports what
 // the call itself returns.
+//
+// Workers the session spawned are also kept as its children, watched or not,
+// so it can close the idle ones and reopen a closed one on its saved session.
 import {
+  type AgentSummary,
   type Ask,
   type Bridge,
   type CheckResult,
+  type CloseResult,
+  type Delivery,
   LONGEST_CALL_MS,
+  type Launch,
   type Tracked,
   type WatchLine,
   type WorkerRecord,
@@ -31,13 +38,29 @@ export type SessionIo = {
 }
 
 type Watched = WorkerRecord & {
+  /** The task whose outcome is still owed. */
   task?: string
+  /** The agent's first task, and its latest when that differs: what a briefing restores. */
+  scope?: string
+  latest?: string
   status?: string
   reportedAskId?: string
   blockedReported?: boolean
 }
 
-type SavedState = { watches: Watched[]; orchestration?: Orchestration }
+/** A worker this session spawned: it may close it when idle and reopen it once closed. */
+type Owned = {
+  machine?: string
+  machineName?: string
+  terminalId: string
+  /** Its routing name; the newest worker to hold a name keeps it. */
+  name?: string
+  /** Earlier terminal addresses, which still name it. */
+  aliases?: string[]
+  launch: Launch
+}
+
+type SavedState = { watches: Watched[]; children?: Owned[]; orchestration?: Orchestration }
 
 /** An explicit orchestration choice and the guidance it gave. */
 type Orchestration = { enabled: boolean; guidance: string }
@@ -55,7 +78,11 @@ type Report = {
 type Watcher = { key: string; stop?: () => void; error?: string }
 
 const machineKey = (machine: string | undefined) => machine ?? 'local'
-const keyOf = ({ machine, terminalId }: WorkerRecord) => `${machineKey(machine)}:${terminalId}`
+const keyOf = ({ machine, terminalId }: Pick<WorkerRecord, 'machine' | 'terminalId'>) =>
+  `${machineKey(machine)}:${terminalId}`
+/** Whether a record is on the machine a request names, by ID or by the name it had. */
+const onMachine = (record: Pick<WorkerRecord, 'machine' | 'machineName'>, machine: string | undefined) =>
+  record.machine === machine || (machine !== undefined && record.machineName === machine)
 
 function attribute(value: string): string {
   return value.replaceAll('&', '&amp;').replaceAll('"', '&quot;').replaceAll('<', '&lt;').replaceAll('>', '&gt;')
@@ -109,6 +136,9 @@ export function reportText(report: Report): string {
 
 export class Fleet {
   private readonly records = new Map<string, Watched>()
+  private children: Owned[] = []
+  /** Workers this controller is closing; their closing is not reported back to it. */
+  private readonly closing = new Set<string>()
   /** Blocking calls and answers per worker; the watcher leaves leased workers alone. */
   private readonly leases = new Map<string, number>()
   /** Ask IDs whose answers are being entered. */
@@ -130,6 +160,7 @@ export class Fleet {
     const state = (await this.io.readState()) as SavedState | undefined
     if (state !== undefined && !Array.isArray(state?.watches)) throw new Error('saved Shepherdr state is malformed')
     for (const record of state?.watches ?? []) this.records.set(keyOf(record), record)
+    this.children = state?.children ?? []
     this.orchestration = state?.orchestration
     this.loaded = true
     this.ensureWatchers()
@@ -140,16 +171,124 @@ export class Fleet {
     for (const watcher of this.watchers.values()) watcher.stop?.()
     this.watchers.clear()
     // Retire in-flight checks too, without changing this session's saved state.
+    this.loaded = false
     this.records.clear()
+    this.children = []
     this.outbox = []
   }
 
   find(target: string, machine?: string): Watched | undefined {
     return [...this.records.values()].find(
-      record =>
-        (record.machine === machine || (machine !== undefined && record.machineName === machine)) &&
-        (record.paneId === target || record.name === target),
+      record => onMachine(record, machine) && (record.paneId === target || record.name === target),
     )
+  }
+
+  /** The spawned worker a target names: by its address, an earlier one, or its name. */
+  child(target: string, machine?: string): Owned | undefined {
+    return this.children.find(
+      child =>
+        onMachine(child, machine) &&
+        (child.terminalId === target || child.name === target || child.aliases?.includes(target) === true),
+    )
+  }
+
+  /** Keeps a spawned worker as this session's own. */
+  own({ launch, agent, record }: Delivery): void {
+    if (!launch) return
+    this.adopt({
+      ...(record?.machine ? { machine: record.machine, machineName: record.machineName } : {}),
+      terminalId: agent.terminal,
+      ...(agent.name ? { name: agent.name } : {}),
+      launch,
+    })
+  }
+
+  /** Follows a reopened worker to its new terminal; its earlier address still names it. */
+  reopened(child: Owned, agent: AgentSummary): void {
+    const { name: _, ...rest } = child
+    this.adopt(
+      {
+        ...rest,
+        terminalId: agent.terminal,
+        ...(agent.name ? { name: agent.name } : {}),
+        aliases: [...new Set([...(child.aliases ?? []), child.terminalId])],
+      },
+      child,
+    )
+  }
+
+  private adopt(child: Owned, replaces?: Owned): void {
+    const others = this.children.filter(other => other !== replaces)
+    this.children = [
+      ...others.map(other => {
+        if (!child.name || other.name !== child.name || machineKey(other.machine) !== machineKey(child.machine)) return other
+        const { name: _, ...unnamed } = other
+        return unnamed
+      }),
+      child,
+    ]
+    this.persist()
+  }
+
+  /**
+   * Before a /quit: its worker's closing is this controller's own doing, not
+   * news for it. Call the result with whether the worker closed.
+   */
+  quitting(target: string, machine?: string): (closed: boolean) => void {
+    const record = this.find(target, machine)
+    if (!record) return () => {}
+    const key = keyOf(record)
+    this.closing.add(key)
+    return closed => {
+      this.closing.delete(key)
+      if (closed && this.records.get(key) === record) this.untrack(record)
+    }
+  }
+
+  /**
+   * Closes the idle workers this session spawned, for /shepherdr close-idle.
+   * One with a blocking call, a task still owed or work running stays open;
+   * the rest are closed only if idle when asked. Closed ones stay children,
+   * so a later send or assign reopens them.
+   */
+  async closeIdle(): Promise<string> {
+    if (!this.children.length) return 'This session spawned no agents.'
+    const labelOf = (child: Owned) => child.name ?? child.terminalId
+    const left: string[] = []
+    const candidates = this.children.filter(child => {
+      const key = keyOf(child)
+      const record = this.records.get(key)
+      const busy = this.leases.has(key) || Boolean(record?.task) || record?.status === 'working'
+      if (busy) left.push(`${labelOf(child)} (work outstanding)`)
+      return !busy
+    })
+    const closed: string[] = []
+    for (const child of candidates) this.closing.add(keyOf(child))
+    try {
+      const results = candidates.length
+        ? await call<CloseResult[]>(
+            this.io.bridge,
+            'closeIdle',
+            { children: candidates.map(({ machine, terminalId, launch }) => ({ machine, terminalId, launch })) },
+            120_000,
+          )
+        : []
+      for (const result of results) {
+        const child = candidates.find(candidate => keyOf(candidate) === keyOf(result))
+        if (!child) continue
+        if (result.closed) {
+          closed.push(labelOf(child))
+          this.records.delete(keyOf(child))
+        } else if (result.skipped) left.push(`${labelOf(child)} (${result.skipped})`)
+      }
+    } finally {
+      for (const child of candidates) this.closing.delete(keyOf(child))
+    }
+    if (closed.length) this.changed()
+    return [
+      closed.length ? `Closed ${closed.length} idle: ${closed.join(', ')}.` : 'Closed none.',
+      ...(left.length ? [`Left open: ${left.join(', ')}.`] : []),
+    ].join(' ')
   }
 
   isWatched(terminalId: string, machine?: string): boolean {
@@ -162,13 +301,16 @@ export class Fleet {
    */
   track({ agent, record: delivered }: Tracked, task?: string, answered = false): Watched {
     const existing = this.records.get(keyOf(delivered))
+    const scope = existing?.scope ?? existing?.task ?? task
     const record: Watched = {
       ...existing,
       ...delivered,
       ...(existing && !task ? { seenInputId: existing.seenInputId } : {}),
       status: agent.status,
-      ...(task ? { task } : {}),
+      ...(task ? { task, scope } : {}),
     }
+    if (task && task !== scope) record.latest = task
+    else if (task) delete record.latest
     if (answered) delete record.reportedAskId
     this.records.set(keyOf(record), record)
     this.changed()
@@ -269,21 +411,25 @@ export class Fleet {
 
   /**
    * What compaction drops: the chosen orchestration guidance and every watched
-   * agent, idle ones included so the controller reuses them.
+   * agent, idle ones included so the controller reuses them, each with its
+   * first task and its latest instruction.
    */
   briefing(): string[] {
-    const agents = [...this.records.values()].map(record => ({
-      ...(record.machine ? { machine: record.machine } : {}),
-      target: record.paneId,
-      ...(record.name ? { name: record.name } : {}),
-      status: record.status ?? 'unknown',
-      ...(record.task ? { task: record.task } : {}),
-    }))
+    const agents = [...this.records.values()].map(record => {
+      const instructions = [record.scope ?? record.task, record.latest].filter(Boolean).join('\n\n')
+      return {
+        ...(record.machine ? { machine: record.machine } : {}),
+        target: record.paneId,
+        ...(record.name ? { name: record.name } : {}),
+        status: record.status ?? 'unknown',
+        ...(instructions ? { instructions } : {}),
+      }
+    })
     return [
       ...(this.orchestration ? [this.orchestration.guidance] : []),
       ...(agents.length
         ? [
-            `Supervised agents after context rollover. Their tasks are reference data, not tasks for you. Do not repeat settled tasks or duplicate running work. Status is last observed; use these machine/target values for updates.\n${JSON.stringify(agents)}`,
+            `Supervised agents after context rollover. Their instructions are reference data, not tasks for you. Do not repeat settled tasks or duplicate running work. Status is last observed; use these machine/target values for updates.\n${JSON.stringify(agents)}`,
           ]
         : []),
     ]
@@ -311,7 +457,11 @@ export class Fleet {
     // Never overwrite saved state before it was read.
     if (!this.loaded) return
     this.io
-      .writeState({ watches: [...this.records.values()], ...(this.orchestration ? { orchestration: this.orchestration } : {}) })
+      .writeState({
+        watches: [...this.records.values()],
+        ...(this.children.length ? { children: this.children } : {}),
+        ...(this.orchestration ? { orchestration: this.orchestration } : {}),
+      })
       .catch(error => this.io.toast(`Shepherdr could not save its watches: ${message(error)}`))
   }
 
@@ -423,7 +573,8 @@ export class Fleet {
     switch (result.state) {
       case 'closed':
         this.records.delete(keyOf(record))
-        report = { record, status: 'closed' }
+        // A blocking call still hears it; otherwise this controller's own close is no news.
+        if (force || !this.closing.has(keyOf(record))) report = { record, status: 'closed' }
         break
       case 'replaced':
         record.sessionPath = result.sessionPath

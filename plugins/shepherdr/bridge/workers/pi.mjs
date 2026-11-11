@@ -1,9 +1,8 @@
 // Pi workers: transcripts through the session reader; delivery through the
-// worker's Shepherdr receiver when it publishes one, else Core's terminal
-// input.
+// worker's Shepherdr receiver, which pi-shepherdr publishes.
 import { stat } from "node:fs/promises";
 import { setTimeout as sleep } from "node:timers/promises";
-import { getAgent, request, terminalPeer } from "../core.mjs";
+import { getAgent, terminalPeer } from "../core.mjs";
 import { workerTrigger } from "../trigger.mjs";
 import {
 	peerInboxPath,
@@ -14,7 +13,6 @@ import {
 	ASK_EXTENSION,
 	readSessionView,
 } from "../vendor/shepherdr-session.mjs";
-import { envelopeText } from "./envelope.mjs";
 
 // Core reports the worker unblocked within moments of the Ask's UI closing.
 const UNBLOCK_TIMEOUT_MS = 15_000;
@@ -36,6 +34,25 @@ export function launchArgs(label, args) {
 			"spawn requires a persistent Pi session; remove --no-session from the profile",
 		);
 	return ["--shepherdr-worker", "--name", label, ...args];
+}
+
+// Pi restores these from the saved session; a profile's defaults must not reset them.
+const RESTORED_FLAGS = ["--model", "--provider", "--thinking", "--name", "-n"];
+
+/** Launch arguments that reopen a spawned worker's saved session. */
+export function resumeArgs(args, session) {
+	const kept = [];
+	for (let index = 0; index < args.length; index += 1) {
+		const arg = args[index];
+		if (RESTORED_FLAGS.includes(arg)) index += 1;
+		else if (!RESTORED_FLAGS.some((flag) => arg.startsWith(`${flag}=`))) kept.push(arg);
+	}
+	return ["--shepherdr-worker", ...kept, "--session", session];
+}
+
+/** What names the worker's saved session: its session file. */
+export function savedSession(agent) {
+	return sessionPath(agent);
 }
 
 /** Pi refuses flags no extension registered: the worker's pi-shepherdr is missing or too old. */
@@ -64,8 +81,7 @@ const RECEIVER_WAIT_MS = 30_000;
 /**
  * Waits for a spawned worker's Shepherdr receiver, which pi-shepherdr
  * publishes only after Pi's startup hooks, later than Core reports it ready.
- * A Pi without one is left to `deliver`'s terminal route once the wait ends,
- * with a notice saying why.
+ * A Pi that never publishes one cannot take a task.
  */
 export async function awaitStartup(agent) {
 	const inbox = peerInboxPath(sessionPath(agent), agent.terminal_id);
@@ -79,9 +95,9 @@ export async function awaitStartup(agent) {
 		}
 		await sleep(100);
 	}
-	return {
-		notice: `No Shepherdr receiver within ${RECEIVER_WAIT_MS / 1000} s of Pi starting; delivery shows the route the task took. Is @howaboua/pi-shepherdr installed in that Pi?`,
-	};
+	throw new Error(
+		`Pi published no Shepherdr receiver within ${RECEIVER_WAIT_MS / 1000} s of starting; install or update @howaboua/pi-shepherdr in that Pi`,
+	);
 }
 
 /** Whether Pi recorded exactly these answers. */
@@ -144,19 +160,12 @@ export async function commands(agent) {
 		{ text: "", sender: "" },
 		{ commands: true },
 	);
-	if (!receipt?.commands) throw noReceiver(agent, "list its commands");
-	return receipt.commands;
-}
-
-function noReceiver(agent, purpose) {
-	return new Error(
-		`${agent.pane_id} has no Shepherdr receiver to ${purpose}; install @howaboua/pi-shepherdr in that Pi`,
-	);
+	return receipt.commands ?? [];
 }
 
 /**
- * Answers through Pi Ask's extension reply. Resolves the status Pi recorded
- * and whether the Ask ran in the background.
+ * Answers through Pi Ask's extension reply; resolves once Ask accepted the
+ * answers and, for a blocking Ask, Core stopped reporting the worker blocked.
  */
 export async function answer(agent, askId, answers) {
 	const open = (await view(agent)).openAsks?.[askId];
@@ -176,12 +185,11 @@ export async function answer(agent, askId, answers) {
 	try {
 		// Ask validates the answers and resolves only once it accepted them;
 		// a refusal rejects with its reason.
-		const sent = await sendPeerExtensionReply(terminalPeer, agent, {
+		await sendPeerExtensionReply(terminalPeer, agent, {
 			extension: ASK_EXTENSION,
 			id: askId,
 			message: JSON.stringify(answers),
 		});
-		if (!sent) throw noReceiver(agent, "take the answer");
 		if (trigger)
 			await unblockedAfterAnswer(agent, sessionPath(agent), askId, trigger);
 	} finally {
@@ -189,20 +197,30 @@ export async function answer(agent, askId, answers) {
 	}
 	// Ask's acceptance is the outcome. A Code Mode cell records the Ask
 	// only when the whole cell ends, so there may be no record to wait for.
-	return { status: "accepted", background };
+	return { status: "accepted" };
 }
 
-/** @returns {Promise<{ delivery: "peer" | "terminal", command?: true }>} */
+/** @returns {Promise<{ delivery: "peer", command?: true, closed?: true }>} */
 export async function deliver(agent, message) {
 	if (!sessionPath(agent))
 		throw new Error(`${agent.pane_id} has no saved Pi session`);
-	// Rejects a blocked or replaced worker before either route sends anything.
 	const receipt = await sendPeerMessage(terminalPeer, agent, message);
-	if (receipt)
-		return { delivery: "peer", ...(receipt.command ? { command: true } : {}) };
-	// Slash commands must reach Pi's editor bare to expand.
-	const command = message.text.trimStart().startsWith("/");
-	const text = command ? message.text : envelopeText(message);
-	await request("terminal.send", { terminal: agent.terminal_id, text }, 30_000);
-	return { delivery: "terminal", ...(command ? { command: true } : {}) };
+	return {
+		delivery: "peer",
+		...(receipt.command ? { command: true } : {}),
+		...(receipt.closed ? { closed: true } : {}),
+	};
+}
+
+/**
+ * Quits the worker only if it is idle when its receiver takes the request,
+ * then closes its terminal; a busy or blocked worker rejects.
+ */
+export async function closeIfIdle(agent) {
+	await sendPeerMessage(
+		terminalPeer,
+		agent,
+		{ text: "/quit", sender: '<herdr_sender kind="idle-close" />' },
+		{ closeIfIdle: true },
+	);
 }

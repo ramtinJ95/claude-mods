@@ -69,17 +69,27 @@ export type CheckResult = {
   ask?: Ask
 }
 
+/** What reopens a spawned worker's saved session; only the bridge reads it. */
+export type Launch = Record<string, unknown>
+
 export type Delivery = {
   agent: AgentSummary
   /** Present for tasks: the watch that reports the outcome. */
   record?: WorkerRecord
   delivery: 'peer' | 'terminal' | 'session'
   command?: true
+  /** The command was /quit and the worker's terminal is closed. */
+  closed?: true
   profileBlocking?: boolean
   session?: SessionRoute
-  /** Why a spawned worker's first task may have taken a fallback route. */
-  notice?: string
+  /** From spawn, for a worker this controller may reopen. */
+  launch?: Launch
+  /** The worker had closed and was reopened on its saved session for this delivery. */
+  resumed?: true
 }
+
+/** One spawned worker's outcome from `closeIdle`: closed now, already gone, or why it stays open. */
+export type CloseResult = { machine?: string; terminalId: string; closed?: true; gone?: true; skipped?: string }
 
 export type Tracked = { agent: AgentSummary; record: WorkerRecord }
 
@@ -90,8 +100,6 @@ export type AnswerResult = {
   /** Absent while a `session` route is unsent; `answered` reads it afterwards. */
   status?: AnswerStatus['status']
   session?: SessionRoute
-  /** A background Ask: the worker never stopped, so there is no settlement to wait for. */
-  background?: boolean
   /** Present only when answers were entered; a recorded retry sends nothing. */
   record?: WorkerRecord
 }

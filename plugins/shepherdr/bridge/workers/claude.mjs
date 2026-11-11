@@ -26,11 +26,27 @@ export function launchArgs(_label, args) {
 	return args;
 }
 
-/** Labels spawn sets on the worker's terminal, so the session is known before Claude Code starts. */
+/** Labels a launch sets on the worker's terminal, so the session is known before Claude Code starts. */
 export function launchLabels(args) {
-	const index = args.indexOf("--session-id");
+	const index = args.findIndex((arg) => arg === "--session-id" || arg === "--resume");
 	const id = index >= 0 ? args[index + 1] : undefined;
 	return id ? { [CLAUDE_SESSION_LABEL]: id } : {};
+}
+
+/**
+ * Launch arguments that reopen a spawned worker's session under its own ID.
+ * Claude Code restores the conversation only: the profile's model, effort,
+ * permission mode, prompt and settings are passed again.
+ */
+export function resumeArgs(args, session) {
+	const index = args.indexOf("--session-id");
+	if (index < 0) throw new Error("the saved launch names no Claude Code session");
+	return [...args.slice(0, index), "--resume", session, ...args.slice(index + 2)];
+}
+
+/** What names the worker's saved session: its session ID. */
+export function savedSession(agent) {
+	return sessionId(agent);
 }
 
 // Claude Code exits within moments of /exit.
@@ -209,10 +225,10 @@ async function command(agent, text) {
 		30_000,
 	);
 	if (quit) await closeAfterExit(agent);
-	return { delivery: "terminal", command: true };
+	return { delivery: "terminal", command: true, ...(quit ? { closed: true } : {}) };
 }
 
-/** @returns {Promise<{ delivery: "session" | "terminal", command?: true, session?: { sessionId: string, text: string } }>} */
+/** @returns {Promise<{ delivery: "session" | "terminal", command?: true, closed?: true, session?: { sessionId: string, text: string } }>} */
 export async function deliver(agent, message) {
 	const id = sessionId(agent);
 	if (!id)
@@ -225,4 +241,16 @@ export async function deliver(agent, message) {
 		delivery: "session",
 		session: { sessionId: id, text: envelopeText(message) },
 	};
+}
+
+/**
+ * Exits an idle worker with no open question and closes its terminal. Claude
+ * Code has no receiver to decide this at one moment, so a message arriving
+ * between the check and `/exit` is lost with the session; it can be resumed.
+ */
+export async function closeIfIdle(agent) {
+	if (!["idle", "done"].includes(agent.agent_status))
+		throw new Error(`${agent.pane_id} is ${agent.agent_status}`);
+	if ((await view(agent)).ask) throw new Error(`${agent.pane_id} has an open question`);
+	await command(agent, "/quit");
 }

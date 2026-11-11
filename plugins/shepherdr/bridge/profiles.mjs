@@ -186,11 +186,16 @@ async function workerSettings(name, claudeArgs) {
 	return [...args, "--settings", JSON.stringify({ crossSessionInbound: "accept", ...settings })];
 }
 
-/**
- * The worker's launch arguments. A Pi worker's prompt travels as JSON text
- * for pi-shepherdr's profile flag, which keeps its whitespace through Core on
- * any machine and places it after the shared project context.
- */
+/** Arguments that open an existing session, which spawn would not own. */
+const EXISTING_SESSION = /^(?:--(?:session(?:-id)?|continue|resume|no-session|fork(?:-session)?)(?:=|$)|-[cr]$)/;
+
+/** Whether the profile's own arguments start a fresh session, one a spawn owns and can reopen. */
+export function startsFreshSession(profile) {
+	const own = profile.agent === "claude" ? profile.claudeArgs : profile.piArgs;
+	return !own.some((arg) => EXISTING_SESSION.test(arg));
+}
+
+/** The worker's launch arguments. A Pi profile's prompt travels with the first task instead (`initialProfile`). */
 export async function profileArgs(profile) {
 	if (profile.agent === "claude")
 		return [
@@ -207,17 +212,17 @@ export async function profileArgs(profile) {
 				: []),
 			...(await workerSettings(profile.name, profile.claudeArgs)),
 		];
-	const prompt = profile.promptPath
-		? await readFile(profile.promptPath, "utf8")
-		: undefined;
-	return [
-		"--model",
-		profile.model,
-		"--thinking",
-		profile.thinking,
-		...(prompt ? ["--shepherdr-profile-prompt", JSON.stringify(prompt)] : []),
-		...profile.piArgs,
-	];
+	return ["--model", profile.model, "--thinking", profile.thinking, ...profile.piArgs];
+}
+
+/**
+ * A Pi profile's prompt, which briefs the first task only, as pi-shepherdr
+ * does, so the worker can take other work later.
+ */
+export async function initialProfile(profile) {
+	return profile.agent === "claude" || !profile.promptPath
+		? undefined
+		: readFile(profile.promptPath, "utf8");
 }
 
 /** The worker's task; `local` tells the profile's preparation whether it runs on the worker's machine. */

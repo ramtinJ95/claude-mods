@@ -110,14 +110,14 @@ function placementLabels(params, spaces, controllerSpace) {
 
 /**
  * Runs the worker's terminal through this machine's Core: on `machine` (a
- * Core machine entry) or here. `existing` are the target machine's live
- * agents. Returns the terminal's address on its own machine.
+ * Core machine entry) or here. `argv` are the program's arguments, from the
+ * adapter's `launchArgs` or `resumeArgs`; `existing` are the target machine's
+ * live agents. Returns the terminal's address on its own machine.
  */
-export async function launch({ params, agent, args, target, machine, existing, controllerSpace }) {
-	const label = params.label.trim();
+export async function launch({ params, agent, argv, target, machine, existing, controllerSpace }) {
 	const name = allocateName(
 		new Set(existing.map((item) => item.name).filter(Boolean)),
-		label,
+		params.label.trim(),
 		params.name,
 	);
 	const worker = workerOfKind(agent);
@@ -126,7 +126,7 @@ export async function launch({ params, agent, args, target, machine, existing, c
 	const started = await request(
 		"terminal.run",
 		{
-			argv: [target.program, ...worker.launchArgs(label, args)],
+			argv: [target.program, ...argv],
 			name,
 			cwd: target.cwd,
 			...(machine ? { on: machine.id } : {}),
@@ -138,7 +138,7 @@ export async function launch({ params, agent, args, target, machine, existing, c
 			outlive_parent: true,
 			labels: {
 				...placementLabels(params, spaces, machine ? undefined : controllerSpace),
-				...(worker.launchLabels?.(args) ?? {}),
+				...(worker.launchLabels?.(argv) ?? {}),
 			},
 		},
 		30_000,
@@ -217,15 +217,15 @@ async function startupError(address, cwd, worker, error) {
 
 /**
  * Waits on this machine for a launched worker to become ready, then for the
- * adapter's `awaitStartup`. Returns `{ agent, notice? }`; a failure is
- * explained from the worker's screen, for the controller to roll back.
+ * adapter's `awaitStartup`. A failure is explained from the worker's screen,
+ * for the controller to roll back.
  */
 export async function awaitWorker(address, kind, cwd) {
 	const worker = workerOfKind(kind);
 	try {
 		const agent = await ready(address);
-		const startup = await worker.awaitStartup?.(agent);
-		return { agent, ...(startup?.notice ? { notice: startup.notice } : {}) };
+		await worker.awaitStartup?.(agent);
+		return agent;
 	} catch (error) {
 		throw await startupError(address, cwd, worker, error);
 	}
