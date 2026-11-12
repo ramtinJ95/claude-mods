@@ -119,8 +119,9 @@ cmd_launch() {
 	fi
 
 	local terminal
-	terminal=$(hc run --json --bg --no-notify --name "$name" --cwd "$base/scratch" "${placement[@]}" -- \
-		env "XDG_DATA_HOME=$base/data" DISABLE_AUTOUPDATER=1 "${policy[@]}" claude \
+	# macOS ships bash 3.2, where "${empty[@]}" is an unbound variable under set -u.
+	terminal=$(hc run --json --bg --no-notify --name "$name" --cwd "$base/scratch" ${placement[@]+"${placement[@]}"} -- \
+		env "XDG_DATA_HOME=$base/data" DISABLE_AUTOUPDATER=1 ${policy[@]+"${policy[@]}"} claude \
 		--plugin-dir "$REPO/plugins/$mod" --settings "$settings" --session-id "$session" \
 		--debug-file "$ev/debug.log" | jq -r '.address // empty')
 	[ -n "$terminal" ] || die "Core started no terminal for the instance"

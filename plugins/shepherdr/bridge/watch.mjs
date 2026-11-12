@@ -144,10 +144,14 @@ async function watchTerminals(targets, machine) {
 	const byAddress = new Map(
 		targets.map(({ terminalId }) => [machine ? `${machine.id}/${terminalId}` : terminalId, terminalId]),
 	);
-	/** The watched address an event names, rereading the machine's name when it may have changed. */
+	/**
+	 * The watched address an event names, if any: the stream carries every
+	 * terminal of this Core and its machines. Rereads the machine's name when it
+	 * may have changed.
+	 */
 	const watchedAddress = async (terminal) => {
-		if (byAddress.has(own(terminal)) || !machine) return own(terminal);
-		const local = terminal.split("/")[1];
+		if (byAddress.has(own(terminal))) return own(terminal);
+		const local = machine && terminal.split("/")[1];
 		if (!local || !byAddress.has(`${machine.id}/${local}`)) return undefined;
 		const current = (await catalog()).find(({ id }) => id === machine.id);
 		if (current) machineName = current.name;
