@@ -39,7 +39,8 @@ export function callSummary(input: Input): string {
     }
     case 'spawn': {
       const machine = str(input['machine'])
-      return `spawn ${str(input['agent_type'])} "${str(input['label'])}"${machine ? ` on ${machineLabel(machine)}` : ''}: ${firstLine(str(input['message']) ?? '', 60)}`
+      const model = str(input['model'])
+      return `spawn ${str(input['agent_type'])}${model ? ` (${model})` : ''} "${str(input['label'])}"${machine ? ` on ${machineLabel(machine)}` : ''}: ${firstLine(str(input['message']) ?? '', 60)}`
     }
     case 'assign':
     case 'send':

@@ -25,6 +25,7 @@ import {
 	initialProfile,
 	listProfiles,
 	loadProfile,
+	onModel,
 	prepareMessage,
 	profileArgs,
 	startsFreshSession,
@@ -405,7 +406,7 @@ const CONTROLLER_OPS = {
 	},
 	async spawn(params, deadline) {
 		const machine = await machineEntry(params.machine);
-		const profile = await loadProfile(params.agent_type.trim());
+		const profile = onModel(await loadProfile(params.agent_type.trim()), params.model?.trim());
 		if (machine && workerOfKind(profile.agent).localOnly) throw new Error(REMOTE_CLAUDE);
 		const [context, target] = await Promise.all([
 			controller(),

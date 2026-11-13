@@ -13,7 +13,7 @@ const PROFILE_NAME = /^[a-z][a-z0-9_-]{0,31}$/;
 const SHARED_FIELDS = ["accepts", "blocking", "description", "model", "prepare", "prompt"];
 const FIELDS = {
 	pi: new Set([...SHARED_FIELDS, "pi_args", "share_context", "thinking"]),
-	claude: new Set([...SHARED_FIELDS, "claude_args", "effort", "permission_mode"]),
+	claude: new Set([...SHARED_FIELDS, "claude_args", "effort", "other_models", "permission_mode"]),
 };
 
 async function isDirectory(path) {
@@ -96,6 +96,7 @@ async function readProfile(name, directory, agent) {
 	return {
 		...common,
 		effort: text(parsed.effort, `${name}.effort`, true),
+		otherModels: strings(parsed.other_models, `${name}.other_models`),
 		permissionMode: text(parsed.permission_mode, `${name}.permission_mode`, true),
 		claudeArgs: strings(parsed.claude_args, `${name}.claude_args`),
 	};
@@ -124,6 +125,22 @@ export async function loadProfile(name) {
 	return readProfile(name, join(directory, name), agent);
 }
 
+/**
+ * The profile on the model a spawn asks for: its own, or one of the
+ * `other_models` it lists. It keeps the profile's other settings.
+ */
+export function onModel(profile, model) {
+	if (model === undefined || model === profile.model) return profile;
+	const others = profile.otherModels ?? [];
+	if (!others.includes(model))
+		throw new Error(
+			others.length
+				? `${profile.name} runs on ${profile.model}, or with model: ${others.join(", ")}`
+				: `${profile.name} runs on ${profile.model} only; omit model`,
+		);
+	return { ...profile, model };
+}
+
 export async function listProfiles() {
 	const profiles = [];
 	const sources = {};
@@ -139,6 +156,7 @@ export async function listProfiles() {
 				...(profile.agent === "pi"
 					? { thinking: profile.thinking }
 					: { effort: profile.effort }),
+				...(profile.otherModels?.length ? { other_models: profile.otherModels } : {}),
 				...(profile.accepts.length ? { accepts: profile.accepts } : {}),
 				...(profile.blocking === undefined ? {} : { blocking: profile.blocking }),
 			});

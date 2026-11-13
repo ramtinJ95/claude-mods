@@ -12,7 +12,7 @@ export type Action = (typeof ACTIONS)[number]
 const FIELDS: Record<Action, readonly string[]> = {
   help: ['commands', 'target', 'machine'],
   list: ['machine', 'query', 'status'],
-  spawn: ['machine', 'agent_type', 'label', 'name', 'placement', 'workspace', 'cwd', 'message', 'base', 'blocking'],
+  spawn: ['machine', 'agent_type', 'model', 'label', 'name', 'placement', 'workspace', 'cwd', 'message', 'base', 'blocking'],
   send: ['machine', 'target', 'message'],
   assign: ['machine', 'target', 'message', 'blocking'],
   answer: ['machine', 'target', 'ask_id', 'answers'],
@@ -47,6 +47,7 @@ export const TOOL_SPEC = {
       machine: { type: 'string', description: 'Machine name or ID from list; omit for this machine' },
       commands: { type: 'boolean' },
       agent_type: { type: 'string' },
+      model: { type: 'string', description: "One of the profile's other_models; only when the user asks for that model" },
       label: { type: 'string', description: 'Tab label, short; required for spawn' },
       name: { type: 'string' },
       placement: { type: 'string', enum: PLACEMENTS },
@@ -83,6 +84,7 @@ export type AgentsRequest = {
   machine?: string
   commands?: boolean
   agent_type?: string
+  model?: string
   label?: string
   name?: string
   placement?: (typeof PLACEMENTS)[number]
@@ -149,6 +151,7 @@ export type ProfileSummary = {
   model: string
   thinking?: string
   effort?: string
+  other_models?: string[]
   accepts?: string[]
   blocking?: boolean
 }
@@ -161,7 +164,7 @@ export function helpText(profiles: { sources: Record<string, string>; profiles: 
     requests: {
       list: '{action:"list", machine?, query?, status?} — this machine and every connected machine unless machine is given',
       commands: '{commands:true, target, machine?} — the slash commands that agent accepts',
-      spawn: '{action:"spawn", agent_type, label (short, 2 words when useful), message, cwd?, placement?: new_tab|new_workspace|terminal, workspace?, name?, base?, blocking?} — a new tab beside this session by default, in workspace (a space ID from list) when given; terminal runs it in the background',
+      spawn: '{action:"spawn", agent_type, label (short, 2 words when useful), message, cwd?, placement?: new_tab|new_workspace|terminal, workspace?, name?, base?, blocking?, model?} — a new tab beside this session by default, in workspace (a space ID from list) when given; terminal runs it in the background',
       send: '{action:"send", target, message}',
       assign: '{action:"assign", target, message, blocking?}',
       answer: '{action:"answer", target, ask_id, answers: [{selections?: [choice label], other?, comment?}] one per prompt in order}',
@@ -172,6 +175,7 @@ export function helpText(profiles: { sources: Record<string, string>; profiles: 
     rules: [
       'spawn and assign return once the task is delivered, and its result arrives as an agent_report message. blocking:true waits for the result in the call instead; a profile blocking setting overrides spawn. Blocking calls made together wait together',
       'Reports of completion, questions and blockage arrive on their own, for delegated work and watched agents: do other work or end the turn; never poll or sleep for them',
+      'A profile runs on its model. Pass spawn model, one of that profile\'s other_models, only when the user explicitly asks for that model for the worker; never choose it yourself',
       'send delivers input without waiting or watching; use assign only for work whose result you need',
       'Give the task and the context it needs, and trust the agent to choose its approach; avoid unnecessary restrictions and overly narrow scope',
       'Keep each agent until its task is verified complete and return corrections to it before closing it; use separate agents for unrelated work and independent reviews',
