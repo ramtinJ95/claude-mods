@@ -75,6 +75,7 @@ Claude Code profiles are separate, since pi-shepherdr does not read their fields
 {
 	"description": "General implementation",
 	"model": "claude-opus-5-5",
+	"other_models": ["claude-fable-5-2"],
 	"effort": "high",
 	"permission_mode": "auto",
 	"prompt": "prompt.md",
@@ -83,6 +84,8 @@ Claude Code profiles are separate, since pi-shepherdr does not read their fields
 ```
 
 `prompt` is appended to Claude Code's system prompt; `blocking`, `accepts` and `prepare` work as in Pi profiles, and `claude_args` are passed to `claude` as given.
+
+A worker runs on its profile's `model`. `other_models` lists the models a `spawn` may name instead with its `model` field, which the agent is told to pass only when you explicitly ask for that model; any other name is refused. The worker keeps the profile's effort and other settings, and a reopened worker keeps the model it was spawned with. The bundled profiles offer Claude Fable 5.2 this way.
 
 ## Sessions and storage
 
