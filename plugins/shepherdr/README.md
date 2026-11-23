@@ -27,7 +27,7 @@ One tool, `agents`. Called with `{}` it returns the available profiles, request 
 | `list` | Agents on this machine and every enabled remote machine, or on one `machine`, optionally filtered by `query` or `status`; watched ones are marked and unreachable machines listed |
 | `spawn` | Start a profiled Pi or Claude Code worker in a new Core terminal and give it a task: a new tab beside this session, in another `workspace` (a Herdr space ID from `list`), a `new_workspace`, or a background `terminal` |
 | `assign` | Give an existing Pi or Claude Code agent a task whose result is needed; a closed worker this session spawned is reopened first |
-| `send` | Deliver a message without waiting or watching; it reopens a closed spawned worker too |
+| `send` | Deliver input that needs no report of its own, such as a correction mid-task or a slash command; it starts no watch, so only an existing watch reports what follows. It reopens a closed spawned worker too |
 | `answer` | Answer a worker's question (Pi Ask or Claude Code's `AskUserQuestion`) by its `ask_id`; returns once the worker took the answer |
 | `read` | The worker's latest reply, or its `visible` or `recent` terminal output |
 | `watch` / `unwatch` | Start or stop reporting an agent's work |

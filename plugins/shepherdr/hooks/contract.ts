@@ -36,7 +36,7 @@ const REQUIRED: Record<Action, readonly string[]> = {
 export const TOOL_SPEC = {
   name: TOOL_NAME,
   description:
-    'Spawn, delegate to and monitor Pi and Claude Code agents running in Herdr Core terminals. Call with {} first for profiles and rules.',
+    'Spawn, delegate to and monitor Pi and Claude Code agents running in Herdr Core terminals. assign gives an agent a task and reports its result; send only delivers input and starts no watch. Call with {} first for profiles and rules.',
   isDeferred: false,
   inputSchema: {
     type: 'object',
@@ -176,11 +176,11 @@ export function helpText(profiles: { sources: Record<string, string>; profiles: 
       'spawn and assign return once the task is delivered, and its result arrives as an agent_report message. blocking:true waits for the result in the call instead; a profile blocking setting overrides spawn. Blocking calls made together wait together',
       'Reports of completion, questions and blockage arrive on their own, for delegated work and watched agents: do other work or end the turn; never poll or sleep for them',
       'A profile runs on its model. Pass spawn model, one of that profile\'s other_models, only when the user explicitly asks for that model for the worker; never choose it yourself',
-      'send delivers input without waiting or watching; use assign only for work whose result you need',
+      'Use assign for every task whose result you need. Use send only for input that needs no reply of its own, such as a correction mid-task or a slash command; it starts no watch, so only an existing one reports what follows',
       'Give the task and the context it needs, and trust the agent to choose its approach; avoid unnecessary restrictions and overly narrow scope',
       'Keep each agent until its task is verified complete and return corrections to it before closing it; use separate agents for unrelated work and independent reviews',
       'Messages wake idle agents: send only what changes the recipient\'s next action, never acknowledgements, status-only updates or standby reminders. Close a finished worker with "/quit" alone',
-      'Delegation and watch keep reporting later work until unwatch or the terminal closes',
+      'Delegation and watch keep reporting later work until unwatch or the terminal closes. watch does not turn an earlier send into a tracked task: assign it instead',
       'send or assign to a closed worker this session spawned reopens its saved session first and returns resumed:true with its current target; "/quit" never reopens one',
       'A question report carries its ask_id and prompts; answer it with answer, asking the user first when the choice is theirs. answer returns once the worker took it; the work it resumes reports on its own',
       'Messages starting with / run as the worker\'s slash commands without a watch; list them first with commands:true',
