@@ -21,6 +21,8 @@ import { watchSessions } from "./vendor/shepherdr-session-watch.mjs";
 const REMOTE_WAIT_MS = 540_000;
 // Writes that land together are reported together.
 const COALESCE_MS = 200;
+// How long a lost Core subscription is retried before monitoring stops.
+const RESUBSCRIBE_MS = 60_000;
 
 const emit = (value) => process.stdout.write(`${JSON.stringify(value)}\n`);
 const shutdown = (code) => {
@@ -158,6 +160,8 @@ async function watchTerminals(targets, machine) {
 		return byAddress.has(own(terminal)) ? own(terminal) : undefined;
 	};
 	const states = new Map();
+	let unsubscribe;
+	let resubscribing = false;
 	const report = async (address) => {
 		let state;
 		try {
@@ -180,9 +184,39 @@ async function watchTerminals(targets, machine) {
 					terminal === undefined ? [...byAddress.keys()] : [await watchedAddress(terminal)];
 				for (const address of addresses) if (address) await report(address);
 			})
-			.catch((error) => fail(error.message));
+			// Core's own refusals stop monitoring; a lost connection is retried.
+			.catch((error) => (error.coreResponse ? fail(error.message) : resubscribe(error)));
 	};
-	const { terminals } = await subscribe({}, queue, (error) => fail(error.message));
+	const connect = async () => {
+		const subscription = await subscribe({}, queue, resubscribe);
+		unsubscribe = subscription.close;
+		return subscription.terminals;
+	};
+	/**
+	 * Core ends every subscription when it restarts or drops a connection; a new
+	 * one rechecks every target, since changes in the gap were not streamed, and
+	 * says `ready` again, so the fleet retries a check that failed meanwhile.
+	 */
+	async function resubscribe(cause) {
+		if (resubscribing) return;
+		resubscribing = true;
+		unsubscribe?.();
+		const deadline = Date.now() + RESUBSCRIBE_MS;
+		for (let wait = 500; ; wait = Math.min(wait * 2, 8_000)) {
+			await new Promise((resolve) => setTimeout(resolve, wait));
+			try {
+				await connect();
+				break;
+			} catch (error) {
+				if (Date.now() + wait >= deadline)
+					return fail(`${cause.message}; no new subscription within ${RESUBSCRIBE_MS / 1000} s: ${error.message}`);
+			}
+		}
+		resubscribing = false;
+		queue(undefined);
+		emit({ type: "ready" });
+	}
+	const terminals = await connect();
 	for (const record of terminals) {
 		const address = own(record.address);
 		if (byAddress.has(address)) states.set(address, JSON.stringify(stateOf(terminalAgent(record))));

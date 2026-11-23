@@ -214,7 +214,14 @@ async function handle(bridge: Bridge, current: Fleet, cwd: string, request: Agen
     }
     case 'send': {
       const delivery = await deliverTo(bridge, current, request, 'message')
-      return JSON.stringify({ ...deliverySummary(delivery), ...(delivery.command ? { commandSubmitted: true } : {}) })
+      if (delivery.command) return JSON.stringify({ ...deliverySummary(delivery), commandSubmitted: true })
+      // Only an existing watch reports what a send starts.
+      if (current.isWatched(delivery.agent.terminal, delivery.machine)) return JSON.stringify(deliverySummary(delivery))
+      return JSON.stringify({
+        ...deliverySummary(delivery),
+        untracked: true,
+        next: 'Nothing watches this agent, so nothing reports on this send; use assign for work whose result you need',
+      })
     }
     case 'read':
       return JSON.stringify(

@@ -86,6 +86,8 @@ export type Delivery = {
   launch?: Launch
   /** The worker had closed and was reopened on its saved session for this delivery. */
   resumed?: true
+  /** The worker's machine ID, from `deliver`; absent for this machine. */
+  machine?: string
 }
 
 /** One spawned worker's outcome from `closeIdle`: closed now, already gone, or why it stays open. */

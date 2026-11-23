@@ -225,10 +225,12 @@ export function ResultRow(draw: Draw, output: string) {
   if ('watching' in value) return line(`${value['watching'] ? 'watching' : 'stopped watching'} ${String(value['target'])}`)
   const resumed = value['resumed'] ? ' · reopened' : ''
   if ('commandSubmitted' in value) return line(`command sent to ${String(value['target'])} (${String(value['delivery'])})${resumed}`)
-  if ('delivery' in value)
+  if ('delivery' in value) {
+    const outcome = value['status'] === 'working' ? 'working in the background' : value['untracked'] ? 'sent, no report' : 'delivered'
     return line(
-      `${value['status'] === 'working' ? 'working in the background' : 'delivered'} · ${String(value['name'] ?? value['target'])} ${String(value['target'])} (${String(value['delivery'])})${resumed}`,
+      `${outcome} · ${String(value['name'] ?? value['target'])} ${String(value['target'])} (${String(value['delivery'])})${resumed}`,
     )
+  }
   if ('reply' in value || 'text' in value || 'ask' in value) {
     const agent = value['agent'] as Agent | undefined
     const ask = value['ask'] as { toolCallId: string; prompts: Prompt[] } | undefined

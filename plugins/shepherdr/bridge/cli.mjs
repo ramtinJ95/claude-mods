@@ -469,8 +469,12 @@ const CONTROLLER_OPS = {
 			controller(),
 		]);
 		const attributed = attribute(context, message, kind);
-		const send = (to) =>
-			onMachine(entry, "machine.deliver", { target: to, message: attributed, kind }, deadline);
+		// The machine's ID, which a request may have named by a newer name.
+		const where = entry ? { machine: entry.id } : {};
+		const send = async (to) => ({
+			...(await onMachine(entry, "machine.deliver", { target: to, message: attributed, kind }, deadline)),
+			...where,
+		});
 		if (!child) return send(target);
 		const state = await onMachine(entry, "machine.revive", { ...child, target }, deadline);
 		if (state.live) return send(state.live);
@@ -494,7 +498,7 @@ const CONTROLLER_OPS = {
 			{ kind: saved.kind, cwd: state.cwd, message: attributed, messageKind: kind, session: saved.session },
 			deadline,
 		);
-		return { ...delivery, resumed: true };
+		return { ...delivery, resumed: true, ...where };
 	},
 	/** Closes the idle ones among `children`, workers this controller spawned, machine by machine. */
 	async closeIdle({ children }, deadline) {
