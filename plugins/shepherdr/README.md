@@ -61,7 +61,7 @@ Each machine needs Herdr Core, Node.js and Pi with pi-shepherdr. Core runs every
 
 ## Status
 
-`/shepherdr` lists watched agents, Core's machines and their connection state, and the orchestration mode, and restarts monitoring that stopped on any machine. The status line shows how many agents are watched and working.
+`/shepherdr` lists watched agents, Core's machines and their connection state, and the orchestration mode, and restarts monitoring that stopped on any machine. A watcher whose Core subscription drops (Core restarted, or the connection was lost) subscribes again and rechecks its agents on its own; monitoring stops only when no new subscription succeeds within a minute. The status line shows how many agents are watched and working.
 
 `/shepherdr close-idle` closes the idle workers this session spawned and says which it left open and why. A worker with a blocking call waiting on it, a task whose result is still owed, or work running stays open, as does one that moved to another session; attached and merely watched agents are never touched. A Pi worker quits only if it is idle when its receiver takes the request. A Claude Code worker is checked, then sent `/exit`, so a message arriving in between is lost with the session. Closed workers send no report and can be reopened by `send` or `assign`.
 
